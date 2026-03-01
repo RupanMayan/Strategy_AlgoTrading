@@ -327,8 +327,10 @@ def process_symbol(symbol):
         trend = "BULLISH" if ema20_latest > ema50_latest else "BEARISH"
 
         last_close = float(latest["close"])
-        print(f"{symbol} | Close: {round(last_close, 2)} | EMA20: {ema20_latest} | EMA50: {ema50_latest} | Trend: {trend}")
-
+        last_close_time = df.index[-1]
+        last_close_time_text = (
+            last_close_time.isoformat() if hasattr(last_close_time, "isoformat") else str(last_close_time)
+        )
         signal = None
 
         # =============================
@@ -370,7 +372,8 @@ def process_symbol(symbol):
         holding_qty = get_holding_qty(symbol)
         has_exitable = (current_qty > 0) or (holding_qty > 0)
 
-        print(f"{symbol} | Current Position: {current_qty} | Holdings: {holding_qty}")
+        signal_text = signal if signal else "NONE"
+        order_status = "NO_SIGNAL" if signal is None else "PENDING"
         # Restart-safe memory sync
         if has_exitable:
             last_signal_memory[symbol] = "BUY"
@@ -381,11 +384,25 @@ def process_symbol(symbol):
         if signal == "BUY" and current_qty == 0:
             if last_close >= MAX_BUY_PRICE:
                 print(f"{symbol} | BUY Skipped (Close {round(last_close, 2)} >= {MAX_BUY_PRICE})")
+                order_status = "INVALID_PRICE"
+                print(
+                    f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
+                    f"ema20={ema20_latest} ema50={ema50_latest} "
+                    f"trend={trend} signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
+                    flush=True,
+                )
                 return
         
             # Prevent duplicate BUY
             if last_signal_memory.get(symbol) == "BUY":
                 print(f"{symbol} | BUY Skipped (Duplicate Signal)")
+                order_status = "DUPLICATE_SIGNAL"
+                print(
+                    f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
+                    f"ema20={ema20_latest} ema50={ema50_latest} "
+                    f"trend={trend} signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
+                    flush=True,
+                )
                 return
 
             response = client.placeorder(
@@ -402,6 +419,9 @@ def process_symbol(symbol):
 
             if response.get("status") == "success":
                 last_signal_memory[symbol] = "BUY"
+                order_status = "TRIGGERED"
+            else:
+                order_status = "FAILED"
 
 
         elif signal == "EXIT" and has_exitable:
@@ -409,6 +429,13 @@ def process_symbol(symbol):
             # Prevent duplicate EXIT
             if last_signal_memory.get(symbol) == "EXIT":
                 print(f"{symbol} | EXIT Skipped (Duplicate Signal)")
+                order_status = "DUPLICATE_SIGNAL"
+                print(
+                    f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
+                    f"ema20={ema20_latest} ema50={ema50_latest} "
+                    f"trend={trend} signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
+                    flush=True,
+                )
                 return
 
             if current_qty > 0:
@@ -433,6 +460,20 @@ def process_symbol(symbol):
 
             if response.get("status") == "success":
                 last_signal_memory[symbol] = "EXIT"
+                order_status = "TRIGGERED"
+            else:
+                order_status = "FAILED"
+        elif signal == "BUY" and current_qty > 0:
+            order_status = "ALREADY_IN_POSITION"
+        elif signal == "EXIT" and not has_exitable:
+            order_status = "NO_POSITION_TO_EXIT"
+
+        print(
+            f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
+            f"ema20={ema20_latest} ema50={ema50_latest} "
+            f"trend={trend} signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
+            flush=True,
+        )
 
         time.sleep(0.05)
 
