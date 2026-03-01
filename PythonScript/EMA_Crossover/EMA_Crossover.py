@@ -491,10 +491,19 @@ JOB_ID = "hourly_nifty200_scan"
 
 def print_next_run():
     job = scheduler.get_job(JOB_ID) if "scheduler" in globals() else None
-    if not job or not job.next_run_time:
+    if not job:
         print("🕒 Next Run: unavailable")
         return
-    next_run_ist = job.next_run_time.astimezone(ist)
+    next_run = getattr(job, "next_run_time", None)
+    if next_run is None and hasattr(job, "trigger"):
+        try:
+            next_run = job.trigger.get_next_fire_time(None, datetime.now(ist))
+        except Exception:
+            next_run = None
+    if not next_run:
+        print("🕒 Next Run: unavailable")
+        return
+    next_run_ist = next_run.astimezone(ist)
     print(f"🕒 Next Run: {next_run_ist.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
 
