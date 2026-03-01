@@ -170,6 +170,18 @@ def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 
+def interval_to_timedelta(value):
+    """Convert interval like 1m/1h/1d into timedelta."""
+    text = str(value).strip().lower()
+    if text.endswith("m") and text[:-1].isdigit():
+        return timedelta(minutes=int(text[:-1]))
+    if text.endswith("h") and text[:-1].isdigit():
+        return timedelta(hours=int(text[:-1]))
+    if text.endswith("d") and text[:-1].isdigit():
+        return timedelta(days=int(text[:-1]))
+    return timedelta(hours=1)
+
+
 def get_holding_qty(symbol):
     """
     Best-effort holding quantity resolver.
@@ -527,15 +539,20 @@ def run_strategy():
 
 ist = pytz.timezone("Asia/Kolkata")
 scheduler = BlockingScheduler(timezone=ist)
+SCHEDULE_DELAY_MINUTES = 1
 
+schedule_interval = interval_to_timedelta(INTERVAL)
+now_ist = datetime.now(ist).replace(second=0, microsecond=0)
+first_scheduled_run = now_ist + schedule_interval + timedelta(minutes=SCHEDULE_DELAY_MINUTES)
 scheduler.add_job(
     run_strategy,
-    trigger="cron",
-    minute=1,
+    trigger="interval",
+    seconds=int(schedule_interval.total_seconds()),
+    next_run_time=first_scheduled_run,
     id=JOB_ID,
 )
 
-print("🕒 Scheduler Running – Every Hour at HH:01 IST")
+print(f"🕒 Scheduler Running – Every {INTERVAL} (+{SCHEDULE_DELAY_MINUTES}m after each run)")
 print_next_run()
 run_strategy() 
 scheduler.start()
