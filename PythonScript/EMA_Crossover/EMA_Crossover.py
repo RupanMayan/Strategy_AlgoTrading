@@ -374,26 +374,59 @@ def process_symbol(symbol):
         signal = None
 
         # =============================
-        # BUY LOGIC
+        # DYNAMIC DELAY CROSS LOGIC
         # =============================
-        if (
-            not recent_window.empty and
-            recent_window["bull_cross"].iloc[0] and
-            recent_window["bear_cross"].sum() == 0 and
-            latest["ema20"] > latest["ema50"]
-        ):
-            print(f"{symbol} | Bull Cross at {cross_candle}")
-            print(f"{symbol} | BUY Signal Confirmed")
-            signal = "BUY"
 
-        # =============================
-        # EXIT LOGIC
-        # =============================
-        if latest["bear_cross"]:
-            bear_cross_time = df.index[-1]
-            print(f"{symbol} | Bear Cross at {bear_cross_time}")
-            print(f"{symbol} | EXIT Signal Confirmed")
-            signal = "EXIT"
+        signal = None
+
+        # ---------------------------------
+        # DELAY = 0 → Immediate Crossover
+        # ---------------------------------
+        if DELAY_BARS == 0:
+        
+            # BUY → current candle bull cross
+            if latest["bull_cross"]:
+                print(f"{symbol} | Immediate Bull Cross")
+                signal = "BUY"
+
+            # EXIT → current candle bear cross
+            elif latest["bear_cross"]:
+                print(f"{symbol} | Immediate Bear Cross")
+                signal = "EXIT"
+
+        # ---------------------------------
+        # DELAY >= 1 → Confirmed Crossover
+        # ---------------------------------
+        else:
+        
+            # Index of cross candle
+            cross_index = -(DELAY_BARS + 1)
+
+            cross_row = df.iloc[cross_index]
+            candles_after_cross = df.iloc[cross_index + 1:]
+
+            # ===== BUY CONDITION =====
+            if cross_row["bull_cross"]:
+            
+                # Ensure no bear cross after original cross
+                no_opposite_after = candles_after_cross["bear_cross"].sum() == 0
+
+                # Ensure trend still bullish
+                trend_valid = latest["ema20"] > latest["ema50"]
+
+                if no_opposite_after and trend_valid:
+                    print(f"{symbol} | Bull Cross {DELAY_BARS} candle(s) ago")
+                    signal = "BUY"
+
+            # ===== EXIT CONDITION =====
+            if cross_row["bear_cross"]:
+            
+                no_opposite_after = candles_after_cross["bull_cross"].sum() == 0
+                trend_valid = latest["ema20"] < latest["ema50"]
+
+                if no_opposite_after and trend_valid:
+                    print(f"{symbol} | Bear Cross {DELAY_BARS} candle(s) ago")
+                    signal = "EXIT"
 
         # =============================
         # POSITION CHECK
