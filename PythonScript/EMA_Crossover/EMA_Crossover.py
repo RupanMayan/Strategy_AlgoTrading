@@ -329,7 +329,9 @@ def process_symbol(symbol):
         last_close = float(latest["close"])
         last_close_time = df.index[-1]
         last_close_time_text = (
-            last_close_time.isoformat() if hasattr(last_close_time, "isoformat") else str(last_close_time)
+            last_close_time.strftime("%Y-%m-%dT%H:%M:%S")
+            if hasattr(last_close_time, "strftime")
+            else str(last_close_time)
         )
         signal = None
 
@@ -388,7 +390,7 @@ def process_symbol(symbol):
                 print(
                     f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
                     f"ema20={ema20_latest} ema50={ema50_latest} "
-                    f"trend={trend} signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
+                    f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
                     flush=True,
                 )
                 return
@@ -400,7 +402,7 @@ def process_symbol(symbol):
                 print(
                     f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
                     f"ema20={ema20_latest} ema50={ema50_latest} "
-                    f"trend={trend} signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
+                    f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
                     flush=True,
                 )
                 return
@@ -433,7 +435,7 @@ def process_symbol(symbol):
                 print(
                     f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
                     f"ema20={ema20_latest} ema50={ema50_latest} "
-                    f"trend={trend} signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
+                    f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
                     flush=True,
                 )
                 return
@@ -471,7 +473,7 @@ def process_symbol(symbol):
         print(
             f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
             f"ema20={ema20_latest} ema50={ema50_latest} "
-            f"trend={trend} signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
+            f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
             flush=True,
         )
 
@@ -483,6 +485,18 @@ def process_symbol(symbol):
 # ==============================
 # MAIN STRATEGY
 # ==============================
+
+JOB_ID = "hourly_nifty200_scan"
+
+
+def print_next_run():
+    job = scheduler.get_job(JOB_ID) if "scheduler" in globals() else None
+    if not job or not job.next_run_time:
+        print("🕒 Next Run: unavailable")
+        return
+    next_run_ist = job.next_run_time.astimezone(ist)
+    print(f"🕒 Next Run: {next_run_ist.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
 
 def run_strategy():
 
@@ -496,6 +510,7 @@ def run_strategy():
             pass
 
     print("\n✅ Scan Completed\n")
+    print_next_run()
 
 # ==============================
 # SCHEDULER (IST)
@@ -508,8 +523,10 @@ scheduler.add_job(
     run_strategy,
     trigger="cron",
     minute=1,
+    id=JOB_ID,
 )
 
 print("🕒 Scheduler Running – Every Hour at HH:01 IST")
+print_next_run()
 run_strategy() 
 scheduler.start()
