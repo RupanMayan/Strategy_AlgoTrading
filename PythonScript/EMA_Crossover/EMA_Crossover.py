@@ -119,6 +119,13 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import time
+import requests
+
+
+
+TELEGRAM_ENABLED = True
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ==============================
 # CONFIGURATION
@@ -152,6 +159,25 @@ if not API_KEY:
 if not HOST:
     print("❌ HOST_SERVER not set")
     exit(1)
+
+def send_telegram_message(message):
+    if not TELEGRAM_ENABLED:
+        return
+        
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram credentials not set")
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print("Telegram Error:", e)
 
 # ==============================
 # SIGNAL MEMORY (Prevent Duplicate Signals)
@@ -521,6 +547,15 @@ def print_next_run():
 
 def run_strategy():
 
+    start_time = datetime.now(ist)
+
+    send_telegram_message(
+        f"🚀 <b>EMA 20 / EMA 50 LONG Strategy Started</b>\n"
+        f"⏰ Time: {start_time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+        f"📊 Universe: NIFTY 200\n"
+        f"🕐 Timeframe: {INTERVAL}"
+    )
+
     print("\n=======================================")
     print("⚡ Starting NIFTY 200 Scan")
     print("=======================================\n")
@@ -529,7 +564,14 @@ def run_strategy():
         futures = [executor.submit(process_symbol, s) for s in NIFTY_200]
         for _ in as_completed(futures):
             pass
+    job = scheduler.get_job(JOB_ID)
+    next_run = job.next_run_time.astimezone(ist)
+    completion_message = (
+        f"✅ <b>EMA 20 / EMA 50 LONG Strategy Completed</b>\n"
+        f"🕒 Next Run: {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+    )
 
+    send_telegram_message(completion_message)
     print("\n✅ Scan Completed\n")
     print_next_run()
 
