@@ -21,7 +21,7 @@ Runs Every Hour at HH:01 IST
 
 # STEP 1 → FETCH DATA
 # ----------------------------------------
-# • Pull last 60 days of 1H candles
+# • Pull last 15 days of 1H candles
 # • Remove current forming candle
 # • Ensure minimum bars > (50 EMA + Delay)
 
@@ -138,14 +138,14 @@ PRICE_TYPE = "MARKET"
 HOLDING_PRODUCT = os.getenv("HOLDING_PRODUCT", PRODUCT)
 
 QUANTITY = 1
-LOOKBACK_DAYS = 30
+LOOKBACK_DAYS = 15
 MAX_BUY_PRICE = 2000
 
 SHORT_EMA = 20
 LONG_EMA = 50
 DELAY_BARS = 1
 
-MAX_WORKERS = 8
+MAX_WORKERS = 5
 STRATEGY_NAME = "EMA_CROSS_DELAY"
 print("🔁 OpenAlgo Python Bot is running.")
 
@@ -191,16 +191,45 @@ holdings_cache = {}
 
 client = api(api_key=API_KEY, host=HOST)
 
-def load_holdings_cache():
-    """
-    Fetch holdings once and cache them in memory.
-    """
-    global holdings_cache
+positions_cache = {}
 
-    holdings_cache = {}
+def load_positions_cache():
 
-    if not hasattr(client, "holdings"):
+    global positions_cache
+    positions_cache = {}
+
+    try:
+        resp = client.positionbook()
+    except Exception as e:
+        print("⚠️ Error fetching positions:", e)
         return
+
+    rows = []
+
+    if isinstance(resp, dict):
+        rows = resp.get("data", [])
+
+    elif isinstance(resp, list):
+        rows = resp
+
+    for row in rows:
+
+        symbol = row.get("symbol")
+
+        if not symbol:
+            continue
+
+        qty = int(float(row.get("quantity", 0)))
+
+        positions_cache[symbol] = qty
+
+    symbols = list(positions_cache.keys())
+    print(f"📊 Positions cached: {len(symbols)} symbols -> {symbols}")
+
+def load_holdings_cache():
+
+    global holdings_cache
+    holdings_cache = {}
 
     try:
         resp = client.holdings()
@@ -208,49 +237,34 @@ def load_holdings_cache():
         print("⚠️ Error fetching holdings:", e)
         return
 
+    rows = []
+
     if isinstance(resp, dict):
-        rows = resp.get("data", [])
+
+        data = resp.get("data", {})
+
+        if isinstance(data, dict):
+            rows = data.get("holdings", [])
+
+        elif isinstance(data, list):
+            rows = data
+
     elif isinstance(resp, list):
         rows = resp
-    else:
-        return
 
     for row in rows:
-        if not isinstance(row, dict):
-            continue
 
-        symbol = (
-            row.get("symbol")
-            or row.get("tradingsymbol")
-            or row.get("trading_symbol")
-            or row.get("tsym")
-            or row.get("scrip")
-        )
+        symbol = row.get("symbol")
 
         if not symbol:
             continue
 
-        qty = 0
-
-        for key in ("quantity", "qty", "net_qty", "holdingqty", "holding_qty"):
-            if key in row:
-                try:
-                    qty = max(qty, int(float(row.get(key, 0))))
-                except:
-                    pass
-
-        if qty == 0:
-            try:
-                t1 = float(row.get("t1_quantity", 0))
-                pledged = float(row.get("pledged_quantity", 0))
-                qty = max(qty, int(max(t1 - pledged, 0)))
-            except:
-                pass
+        qty = int(float(row.get("quantity", 0)))
 
         holdings_cache[symbol] = qty
 
-    print(f"📦 Holdings cached: {len(holdings_cache)} symbols")
-
+    symbols = list(holdings_cache.keys())
+    print(f"📦 Holdings cached: {len(symbols)} symbols -> {symbols}")
 
 def compute_ema(series, period):
     """Compute EMA with OpenAlgo TA when available; fallback to pandas."""
@@ -346,7 +360,7 @@ def process_symbol(symbol):
             source="db"
         )
 
-        if not isinstance(df, pd.DataFrame) or df.empty:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
             print(f"{symbol} | No Data")
             return
 
@@ -361,10 +375,6 @@ def process_symbol(symbol):
         if len(df) > 1:
             df = df.iloc[:-1]
         
-        if df.empty:
-            print(f"{symbol} | No usable candles")
-            return
-
         # =============================
         # CALCULATE EMAs
         # =============================
@@ -393,7 +403,6 @@ def process_symbol(symbol):
             if hasattr(last_close_time, "strftime")
             else str(last_close_time)
         )
-        signal = None
 
         # =============================
         # DYNAMIC DELAY CROSS LOGIC
@@ -453,16 +462,7 @@ def process_symbol(symbol):
         # =============================
         # POSITION CHECK
         # =============================
-        pos = client.openposition(
-            strategy=STRATEGY_NAME,
-            symbol=symbol,
-            exchange=EXCHANGE,
-            product=PRODUCT,
-        )
-
-        current_qty = 0
-        if pos and pos.get("status") == "success":
-            current_qty = abs(int(pos.get("quantity", 0)))
+        current_qty = abs(int(positions_cache.get(symbol, 0)))
 
         holding_qty = get_holding_qty(symbol)
         has_exitable = (current_qty > 0) or (holding_qty > 0)
@@ -471,7 +471,7 @@ def process_symbol(symbol):
         order_status = "NO_SIGNAL" if signal is None else "PENDING"
         # Restart-safe memory sync
         if has_exitable:
-            last_signal_memory[symbol] = "BUY"
+            last_signal_memory.setdefault(symbol, "BUY")
 
         # =============================
         # EXECUTION
@@ -570,7 +570,7 @@ def process_symbol(symbol):
             flush=True,
         )
 
-        time.sleep(0.12)
+        time.sleep(0.15)
 
     except Exception as e:
         print(f"{symbol} | ERROR: {e}")
@@ -617,6 +617,10 @@ def run_strategy():
 
     # Load holdings once
     load_holdings_cache()
+    load_positions_cache()
+
+    for sym in set(list(holdings_cache.keys()) + list(positions_cache.keys())):
+        last_signal_memory[sym] = "BUY"
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_symbol, s) for s in NIFTY_200]
