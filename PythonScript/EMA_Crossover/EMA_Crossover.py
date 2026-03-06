@@ -120,7 +120,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import time
 import requests
+import threading
 
+print_lock = threading.Lock()
+
+def safe_print(*args, **kwargs):
+    with print_lock:
+        print(*args, **kwargs)
 
 
 TELEGRAM_ENABLED = True
@@ -147,17 +153,17 @@ DELAY_BARS = 1
 
 MAX_WORKERS = 5
 STRATEGY_NAME = "EMA_CROSS_DELAY"
-print("🔁 OpenAlgo Python Bot is running.")
+safe_print("🔁 OpenAlgo Python Bot is running.")
 
 API_KEY = os.getenv("OPENALGO_APIKEY")
 HOST = os.getenv("HOST_SERVER")
 
 if not API_KEY:
-    print("❌ OPENALGO_APIKEY not set")
+    safe_print("❌ OPENALGO_APIKEY not set")
     exit(1)
 
 if not HOST:
-    print("❌ HOST_SERVER not set")
+    safe_print("❌ HOST_SERVER not set")
     exit(1)
 
 def send_telegram_message(message):
@@ -165,7 +171,7 @@ def send_telegram_message(message):
         return
         
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram credentials not set")
+        safe_print("⚠️ Telegram credentials not set")
         return
 
     try:
@@ -177,7 +183,7 @@ def send_telegram_message(message):
         }
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print("Telegram Error:", e)
+        safe_print("Telegram Error:", e)
 
 # ==============================
 # SIGNAL MEMORY (Prevent Duplicate Signals)
@@ -201,7 +207,7 @@ def load_positions_cache():
     try:
         resp = client.positionbook()
     except Exception as e:
-        print("⚠️ Error fetching positions:", e)
+        safe_print("⚠️ Error fetching positions:", e)
         return
 
     rows = []
@@ -224,7 +230,7 @@ def load_positions_cache():
         positions_cache[symbol] = qty
 
     symbols = list(positions_cache.keys())
-    print(f"📊 Positions cached: {len(symbols)} symbols -> {symbols}")
+    safe_print(f"📊 Positions cached: {len(symbols)} symbols -> {symbols}")
 
 def load_holdings_cache():
 
@@ -234,7 +240,7 @@ def load_holdings_cache():
     try:
         resp = client.holdings()
     except Exception as e:
-        print("⚠️ Error fetching holdings:", e)
+        safe_print("⚠️ Error fetching holdings:", e)
         return
 
     rows = []
@@ -264,7 +270,7 @@ def load_holdings_cache():
         holdings_cache[symbol] = qty
 
     symbols = list(holdings_cache.keys())
-    print(f"📦 Holdings cached: {len(symbols)} symbols -> {symbols}")
+    safe_print(f"📦 Holdings cached: {len(symbols)} symbols -> {symbols}")
 
 def compute_ema(series, period):
     """Compute EMA with OpenAlgo TA when available; fallback to pandas."""
@@ -361,14 +367,14 @@ def process_symbol(symbol):
         )
 
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            print(f"{symbol} | No Data")
+            safe_print(f"{symbol} | No Data")
             return
 
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
 
         if len(df) <= LONG_EMA + DELAY_BARS + 5:
-            print(f"{symbol} | Not Enough Bars")
+            safe_print(f"{symbol} | Not Enough Bars")
             return
 
         # Remove current forming candle safely
@@ -417,12 +423,12 @@ def process_symbol(symbol):
         
             # BUY → current candle bull cross
             if latest["bull_cross"]:
-                print(f"{symbol} | Immediate Bull Cross")
+                safe_print(f"{symbol} | Immediate Bull Cross")
                 signal = "BUY"
 
             # EXIT → current candle bear cross
             elif latest["bear_cross"]:
-                print(f"{symbol} | Immediate Bear Cross")
+                safe_print(f"{symbol} | Immediate Bear Cross")
                 signal = "EXIT"
 
         # ---------------------------------
@@ -446,7 +452,7 @@ def process_symbol(symbol):
                 trend_valid = latest["ema20"] > latest["ema50"]
 
                 if no_opposite_after and trend_valid:
-                    print(f"{symbol} | Bull Cross {DELAY_BARS} candle(s) ago")
+                    safe_print(f"{symbol} | Bull Cross {DELAY_BARS} candle(s) ago")
                     signal = "BUY"
 
             # ===== EXIT CONDITION =====
@@ -456,7 +462,7 @@ def process_symbol(symbol):
                 trend_valid = latest["ema20"] < latest["ema50"]
 
                 if no_opposite_after and trend_valid:
-                    print(f"{symbol} | Bear Cross {DELAY_BARS} candle(s) ago")
+                    safe_print(f"{symbol} | Bear Cross {DELAY_BARS} candle(s) ago")
                     signal = "EXIT"
 
         # =============================
@@ -478,25 +484,23 @@ def process_symbol(symbol):
         # =============================
         if signal == "BUY" and current_qty == 0:
             if last_close >= MAX_BUY_PRICE:
-                print(f"{symbol} | BUY Skipped (Close {round(last_close, 2)} >= {MAX_BUY_PRICE})")
+                safe_print(f"{symbol} | BUY Skipped (Close {round(last_close, 2)} >= {MAX_BUY_PRICE})")
                 order_status = "INVALID_PRICE"
-                print(
+                safe_print(
                     f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
                     f"ema20={ema20_latest} ema50={ema50_latest} "
-                    f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
-                    flush=True,
+                    f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}"
                 )
                 return
         
             # Prevent duplicate BUY
             if last_signal_memory.get(symbol) == "BUY":
-                print(f"{symbol} | BUY Skipped (Duplicate Signal)")
+                safe_print(f"{symbol} | BUY Skipped (Duplicate Signal)")
                 order_status = "DUPLICATE_SIGNAL"
-                print(
+                safe_print(
                     f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
                     f"ema20={ema20_latest} ema50={ema50_latest} "
-                    f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
-                    flush=True,
+                    f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}"
                 )
                 return
 
@@ -510,7 +514,7 @@ def process_symbol(symbol):
                 quantity=QUANTITY,
             )
 
-            print(f"{symbol} | BUY | {response}")
+            safe_print(f"{symbol} | BUY | {response}")
 
             if response.get("status") == "success":
                 last_signal_memory[symbol] = "BUY"
@@ -523,13 +527,12 @@ def process_symbol(symbol):
         
             # Prevent duplicate EXIT
             if last_signal_memory.get(symbol) == "EXIT":
-                print(f"{symbol} | EXIT Skipped (Duplicate Signal)")
+                safe_print(f"{symbol} | EXIT Skipped (Duplicate Signal)")
                 order_status = "DUPLICATE_SIGNAL"
-                print(
+                safe_print(
                     f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
                     f"ema20={ema20_latest} ema50={ema50_latest} "
-                    f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
-                    flush=True,
+                    f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}"
                 )
                 return
 
@@ -551,7 +554,7 @@ def process_symbol(symbol):
                     quantity=holding_qty,
                 )
 
-            print(f"{symbol} | EXIT | {response}")
+            safe_print(f"{symbol} | EXIT | {response}")
 
             if response.get("status") == "success":
                 last_signal_memory[symbol] = "EXIT"
@@ -563,17 +566,16 @@ def process_symbol(symbol):
         elif signal == "EXIT" and not has_exitable:
             order_status = "NO_POSITION_TO_EXIT"
 
-        print(
+        safe_print(
             f"{symbol} | close_time={last_close_time_text} close={round(last_close, 2)} "
             f"ema20={ema20_latest} ema50={ema50_latest} "
-            f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}",
-            flush=True,
+            f"signal={signal_text} position={current_qty} holdings={holding_qty} order_status={order_status}"
         )
 
         time.sleep(0.15)
 
     except Exception as e:
-        print(f"{symbol} | ERROR: {e}")
+        safe_print(f"{symbol} | ERROR: {e}")
 
 # ==============================
 # MAIN STRATEGY
@@ -585,7 +587,7 @@ JOB_ID = "hourly_nifty200_scan"
 def print_next_run():
     job = scheduler.get_job(JOB_ID) if "scheduler" in globals() else None
     if not job:
-        print("🕒 Next Run: unavailable")
+        safe_print("🕒 Next Run: unavailable")
         return
     next_run = getattr(job, "next_run_time", None)
     if next_run is None and hasattr(job, "trigger"):
@@ -594,10 +596,10 @@ def print_next_run():
         except Exception:
             next_run = None
     if not next_run:
-        print("🕒 Next Run: unavailable")
+        safe_print("🕒 Next Run: unavailable")
         return
     next_run_ist = next_run.astimezone(ist)
-    print(f"🕒 Next Run: {next_run_ist.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    safe_print(f"🕒 Next Run: {next_run_ist.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
 
 def run_strategy():
@@ -611,9 +613,9 @@ def run_strategy():
         f"🕐 Timeframe: {INTERVAL}"
     )
 
-    print("\n=======================================")
-    print("⚡ Starting NIFTY 200 Scan")
-    print("=======================================\n")
+    safe_print("\n=======================================")
+    safe_print("⚡ Starting NIFTY 200 Scan")
+    safe_print("=======================================\n")
 
     # Load holdings once
     load_holdings_cache()
@@ -634,7 +636,7 @@ def run_strategy():
     )
 
     send_telegram_message(completion_message)
-    print("\n✅ Scan Completed\n")
+    safe_print("\n✅ Scan Completed\n")
     print_next_run()
 
 # ==============================
@@ -656,7 +658,7 @@ scheduler.add_job(
     id=JOB_ID,
 )
 
-print(f"🕒 Scheduler Running – Every {INTERVAL} (+{SCHEDULE_DELAY_MINUTES}m after each run)")
+safe_print(f"🕒 Scheduler Running – Every {INTERVAL} (+{SCHEDULE_DELAY_MINUTES}m after each run)")
 print_next_run()
 run_strategy()
 scheduler.start()
