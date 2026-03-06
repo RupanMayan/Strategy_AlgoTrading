@@ -145,7 +145,7 @@ SHORT_EMA = 20
 LONG_EMA = 50
 DELAY_BARS = 1
 
-MAX_WORKERS = min(8, (os.cpu_count() or 4) * 2)
+MAX_WORKERS = 8
 STRATEGY_NAME = "EMA_CROSS_DELAY"
 print("🔁 OpenAlgo Python Bot is running.")
 
@@ -184,7 +184,72 @@ def send_telegram_message(message):
 # ==============================
 last_signal_memory = {}
 
+# ==============================
+# HOLDINGS CACHE
+# ==============================
+holdings_cache = {}
+
 client = api(api_key=API_KEY, host=HOST)
+
+def load_holdings_cache():
+    """
+    Fetch holdings once and cache them in memory.
+    """
+    global holdings_cache
+
+    holdings_cache = {}
+
+    if not hasattr(client, "holdings"):
+        return
+
+    try:
+        resp = client.holdings()
+    except Exception as e:
+        print("⚠️ Error fetching holdings:", e)
+        return
+
+    if isinstance(resp, dict):
+        rows = resp.get("data", [])
+    elif isinstance(resp, list):
+        rows = resp
+    else:
+        return
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        symbol = (
+            row.get("symbol")
+            or row.get("tradingsymbol")
+            or row.get("trading_symbol")
+            or row.get("tsym")
+            or row.get("scrip")
+        )
+
+        if not symbol:
+            continue
+
+        qty = 0
+
+        for key in ("quantity", "qty", "net_qty", "holdingqty", "holding_qty"):
+            if key in row:
+                try:
+                    qty = max(qty, int(float(row.get(key, 0))))
+                except:
+                    pass
+
+        if qty == 0:
+            try:
+                t1 = float(row.get("t1_quantity", 0))
+                pledged = float(row.get("pledged_quantity", 0))
+                qty = max(qty, int(max(t1 - pledged, 0)))
+            except:
+                pass
+
+        holdings_cache[symbol] = qty
+
+    print(f"📦 Holdings cached: {len(holdings_cache)} symbols")
 
 
 def compute_ema(series, period):
@@ -210,56 +275,9 @@ def interval_to_timedelta(value):
 
 def get_holding_qty(symbol):
     """
-    Best-effort holding quantity resolver.
-    Returns 0 when holdings API is unavailable or symbol not found.
+    Return cached holdings quantity.
     """
-    if not hasattr(client, "holdings"):
-        return 0
-
-    try:
-        resp = client.holdings()
-    except Exception:
-        return 0
-
-    if isinstance(resp, dict):
-        rows = resp.get("data", [])
-    elif isinstance(resp, list):
-        rows = resp
-    else:
-        return 0
-
-    qty = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-
-        row_symbol = (
-            row.get("symbol")
-            or row.get("tradingsymbol")
-            or row.get("trading_symbol")
-            or row.get("tsym")
-            or row.get("scrip")
-        )
-        if row_symbol != symbol:
-            continue
-
-        for key in ("quantity", "qty", "net_qty", "holdingqty", "holding_qty"):
-            if key in row:
-                try:
-                    qty = max(qty, int(float(row.get(key, 0))))
-                except Exception:
-                    pass
-
-        # Fallback for APIs that split long/short or available qty fields
-        if qty == 0:
-            try:
-                t1 = float(row.get("t1_quantity", 0))
-                pledged = float(row.get("pledged_quantity", 0))
-                qty = max(qty, int(max(t1 - pledged, 0)))
-            except Exception:
-                pass
-
-    return qty
+    return holdings_cache.get(symbol, 0)
 
 # ==============================
 # FULL NIFTY 200 LIST
@@ -552,7 +570,7 @@ def process_symbol(symbol):
             flush=True,
         )
 
-        time.sleep(0.05)
+        time.sleep(0.12)
 
     except Exception as e:
         print(f"{symbol} | ERROR: {e}")
@@ -596,6 +614,9 @@ def run_strategy():
     print("\n=======================================")
     print("⚡ Starting NIFTY 200 Scan")
     print("=======================================\n")
+
+    # Load holdings once
+    load_holdings_cache()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_symbol, s) for s in NIFTY_200]
