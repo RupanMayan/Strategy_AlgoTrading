@@ -138,14 +138,14 @@ PRICE_TYPE = "MARKET"
 HOLDING_PRODUCT = os.getenv("HOLDING_PRODUCT", PRODUCT)
 
 QUANTITY = 1
-LOOKBACK_DAYS = 60
+LOOKBACK_DAYS = 30
 MAX_BUY_PRICE = 2000
 
 SHORT_EMA = 20
 LONG_EMA = 50
 DELAY_BARS = 1
 
-MAX_WORKERS = 8
+MAX_WORKERS = min(8, (os.cpu_count() or 4) * 2)
 STRATEGY_NAME = "EMA_CROSS_DELAY"
 print("🔁 OpenAlgo Python Bot is running.")
 
@@ -316,7 +316,6 @@ def process_symbol(symbol):
     try:
         global client
 
-        ist = pytz.timezone("Asia/Kolkata")
         end_date = datetime.now(ist)
         start_date = end_date - timedelta(days=LOOKBACK_DAYS)
 
@@ -326,6 +325,7 @@ def process_symbol(symbol):
             interval=INTERVAL,
             start_date=start_date.strftime("%Y-%m-%d"),
             end_date=end_date.strftime("%Y-%m-%d"),
+            source="db"
         )
 
         if not isinstance(df, pd.DataFrame) or df.empty:
@@ -339,7 +339,13 @@ def process_symbol(symbol):
             print(f"{symbol} | Not Enough Bars")
             return
 
-        df = df.iloc[:-1]
+        # Remove current forming candle safely
+        if len(df) > 1:
+            df = df.iloc[:-1]
+        
+        if df.empty:
+            print(f"{symbol} | No usable candles")
+            return
 
         # =============================
         # CALCULATE EMAs
@@ -358,13 +364,9 @@ def process_symbol(symbol):
         )
 
         latest = df.iloc[-1]
-        recent_window = df.iloc[-DELAY_BARS-1:-1]
-        cross_candle = recent_window.index[0] if not recent_window.empty else None
 
         ema20_latest = round(latest["ema20"], 2)
         ema50_latest = round(latest["ema50"], 2)
-
-        trend = "BULLISH" if ema20_latest > ema50_latest else "BEARISH"
 
         last_close = float(latest["close"])
         last_close_time = df.index[-1]
@@ -631,5 +633,5 @@ scheduler.add_job(
 
 print(f"🕒 Scheduler Running – Every {INTERVAL} (+{SCHEDULE_DELAY_MINUTES}m after each run)")
 print_next_run()
-run_strategy() 
+run_strategy()
 scheduler.start()
