@@ -146,6 +146,7 @@ HOLDING_PRODUCT = os.getenv("HOLDING_PRODUCT", PRODUCT)
 QUANTITY = 1
 LOOKBACK_DAYS = 15
 MAX_BUY_PRICE = 2000
+CANDLE_BUFFER_MINUTES = 5
 
 SHORT_EMA = 20
 LONG_EMA = 50
@@ -284,13 +285,73 @@ def compute_ema(series, period):
 def interval_to_timedelta(value):
     """Convert interval like 1m/1h/1d into timedelta."""
     text = str(value).strip().lower()
+    if text == "d":
+        return timedelta(days=1)
     if text.endswith("m") and text[:-1].isdigit():
         return timedelta(minutes=int(text[:-1]))
     if text.endswith("h") and text[:-1].isdigit():
         return timedelta(hours=int(text[:-1]))
     if text.endswith("d") and text[:-1].isdigit():
         return timedelta(days=int(text[:-1]))
-    return timedelta(hours=1)
+    raise ValueError(f"Unsupported interval: {value}")
+
+
+def get_market_session_start(ts):
+    """Return NSE market session anchor for the day: 09:15 IST."""
+    return ts.replace(hour=9, minute=15, second=0, microsecond=0)
+
+
+def get_current_candle_start(now_ist, interval_td):
+    """
+    Return active intraday candle start in IST, bucketed from 09:15 IST.
+    Returns None before market open.
+    """
+    session_start = get_market_session_start(now_ist)
+    if now_ist < session_start:
+        return None
+
+    elapsed = now_ist - session_start
+    bucket_count = int(elapsed.total_seconds() // interval_td.total_seconds())
+    return session_start + (bucket_count * interval_td)
+
+
+def drop_incomplete_candle(df, interval, now_ist):
+    """
+    Drop only the last currently-forming candle.
+    Intraday candles are aligned from 09:15 IST.
+    Daily candles are dropped only during market hours for same-day bars.
+    """
+    if df is None or df.empty or len(df) < 2:
+        return df, False
+
+    ist_tz = pytz.timezone("Asia/Kolkata")
+    interval_text = str(interval).strip().lower()
+    latest_ts = df.index[-1]
+
+    if latest_ts.tzinfo is None:
+        latest_ts = latest_ts.tz_localize(ist_tz)
+    else:
+        latest_ts = latest_ts.tz_convert(ist_tz)
+
+    if now_ist.tzinfo is None:
+        now_ist = ist_tz.localize(now_ist)
+    else:
+        now_ist = now_ist.astimezone(ist_tz)
+
+    if interval_text == "d":
+        market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+        in_market_hours = market_open <= now_ist < market_close
+        if latest_ts.date() == now_ist.date() and in_market_hours:
+            return df.iloc[:-1], True
+        return df, False
+
+    interval_td = interval_to_timedelta(interval_text)
+    current_bucket_start = get_current_candle_start(now_ist, interval_td)
+    if current_bucket_start is not None and latest_ts == current_bucket_start:
+        return df.iloc[:-1], True
+
+    return df, False
 
 
 def get_holding_qty(symbol):
@@ -373,13 +434,27 @@ def process_symbol(symbol):
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
 
+        # Normalize timezone to IST
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("Asia/Kolkata")
+        else:
+            df.index = df.index.tz_convert("Asia/Kolkata")
+
+        now_ist = datetime.now(ist)
+        df, dropped_incomplete = drop_incomplete_candle(df, INTERVAL, now_ist)
+
+        if df is None or df.empty:
+            safe_print(f"{symbol} | No complete candles after filtering")
+            return
+
+        safe_print(
+            f"{symbol} | latest_ts={df.index[-1]} interval={INTERVAL} "
+            f"dropped_incomplete={dropped_incomplete} current_time={now_ist}"
+        )
+
         if len(df) <= LONG_EMA + DELAY_BARS + 5:
             safe_print(f"{symbol} | Not Enough Bars")
             return
-
-        # Remove current forming candle safely
-        if len(df) > 1:
-            df = df.iloc[:-1]
         
         # =============================
         # CALCULATE EMAs
@@ -456,7 +531,7 @@ def process_symbol(symbol):
                     signal = "BUY"
 
             # ===== EXIT CONDITION =====
-            if cross_row["bear_cross"]:
+            elif cross_row["bear_cross"]:
             
                 no_opposite_after = candles_after_cross["bull_cross"].sum() == 0
                 trend_valid = latest["ema20"] < latest["ema50"]
@@ -584,17 +659,34 @@ def process_symbol(symbol):
 JOB_ID = "hourly_nifty200_scan"
 
 
+def get_next_scheduler_run_time():
+    if "scheduler" not in globals():
+        return None
+
+    jobs = [
+        job for job in scheduler.get_jobs()
+        if job.id == JOB_ID or job.id.startswith(f"{JOB_ID}_")
+    ]
+
+    if not jobs:
+        return None
+
+    next_runs = []
+    for job in jobs:
+        next_run = getattr(job, "next_run_time", None)
+        if next_run is None and hasattr(job, "trigger"):
+            try:
+                next_run = job.trigger.get_next_fire_time(None, datetime.now(ist))
+            except Exception:
+                next_run = None
+        if next_run:
+            next_runs.append(next_run)
+
+    return min(next_runs) if next_runs else None
+
+
 def print_next_run():
-    job = scheduler.get_job(JOB_ID) if "scheduler" in globals() else None
-    if not job:
-        safe_print("🕒 Next Run: unavailable")
-        return
-    next_run = getattr(job, "next_run_time", None)
-    if next_run is None and hasattr(job, "trigger"):
-        try:
-            next_run = job.trigger.get_next_fire_time(None, datetime.now(ist))
-        except Exception:
-            next_run = None
+    next_run = get_next_scheduler_run_time()
     if not next_run:
         safe_print("🕒 Next Run: unavailable")
         return
@@ -628,11 +720,15 @@ def run_strategy():
         futures = [executor.submit(process_symbol, s) for s in NIFTY_200]
         for _ in as_completed(futures):
             pass
-    job = scheduler.get_job(JOB_ID)
-    next_run = job.next_run_time.astimezone(ist)
+    next_run = get_next_scheduler_run_time()
+    next_run_text = (
+        next_run.astimezone(ist).strftime('%Y-%m-%d %H:%M:%S %Z')
+        if next_run
+        else "unavailable"
+    )
     completion_message = (
         f"✅ <b>EMA 20 / EMA 50 LONG Strategy Completed</b>\n"
-        f"🕒 Next Run: {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+        f"🕒 Next Run: {next_run_text}"
     )
 
     send_telegram_message(completion_message)
@@ -645,20 +741,74 @@ def run_strategy():
 
 ist = pytz.timezone("Asia/Kolkata")
 scheduler = BlockingScheduler(timezone=ist)
-SCHEDULE_DELAY_MINUTES = 1
+MARKET_OPEN_HOUR = 9
+MARKET_OPEN_MINUTE = 15
+MARKET_CLOSE_HOUR = 15
+MARKET_CLOSE_MINUTE = 30
 
-schedule_interval = interval_to_timedelta(INTERVAL)
-now_ist = datetime.now(ist).replace(second=0, microsecond=0)
-first_scheduled_run = now_ist + schedule_interval + timedelta(minutes=SCHEDULE_DELAY_MINUTES)
-scheduler.add_job(
-    run_strategy,
-    trigger="interval",
-    seconds=int(schedule_interval.total_seconds()),
-    next_run_time=first_scheduled_run,
-    id=JOB_ID,
-)
 
-safe_print(f"🕒 Scheduler Running – Every {INTERVAL} (+{SCHEDULE_DELAY_MINUTES}m after each run)")
+def _next_weekday(day):
+    next_day = day + timedelta(days=1)
+    while next_day.weekday() >= 5:  # 5=Sat, 6=Sun
+        next_day += timedelta(days=1)
+    return next_day
+
+
+def get_intraday_run_slots(interval, buffer_minutes):
+    """
+    Return clock-aligned run slots (hour -> [minutes]) for intraday intervals.
+    Each run slot = candle close + buffer.
+    """
+    interval_text = str(interval).strip().lower()
+    supported = {"5m", "10m", "15m", "30m", "1h"}
+    if interval_text not in supported:
+        raise ValueError(f"Unsupported intraday interval for cron schedule: {interval}")
+
+    interval_td = interval_to_timedelta(interval_text)
+    session_start = datetime(2000, 1, 1, MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE)
+    market_close = datetime(2000, 1, 1, MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE)
+    run_time = session_start + interval_td + timedelta(minutes=buffer_minutes)
+
+    slots = {}
+    while run_time <= (market_close + timedelta(minutes=buffer_minutes)):
+        slots.setdefault(run_time.hour, set()).add(run_time.minute)
+        run_time += interval_td
+
+    return {hour: sorted(minutes) for hour, minutes in sorted(slots.items())}
+
+
+def add_intraday_cron_jobs(interval, buffer_minutes):
+    slots = get_intraday_run_slots(interval, buffer_minutes)
+    for hour, minutes in slots.items():
+        minute_expr = ",".join(str(m) for m in minutes)
+        scheduler.add_job(
+            run_strategy,
+            trigger="cron",
+            day_of_week="mon-fri",
+            hour=hour,
+            minute=minute_expr,
+            second=0,
+            id=f"{JOB_ID}_{hour:02d}",
+            replace_existing=True,
+        )
+
+
+if str(INTERVAL).strip().lower() == "d":
+    daily_run_base = datetime(2000, 1, 1, MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE) + timedelta(minutes=CANDLE_BUFFER_MINUTES)
+    scheduler.add_job(
+        run_strategy,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=daily_run_base.hour,
+        minute=daily_run_base.minute,
+        second=0,
+        id=JOB_ID,
+        replace_existing=True,
+    )
+else:
+    add_intraday_cron_jobs(INTERVAL, CANDLE_BUFFER_MINUTES)
+
+safe_print(f"🕒 Scheduler Running – Every {INTERVAL} (+{CANDLE_BUFFER_MINUTES}m after each run)")
 print_next_run()
 run_strategy()
 scheduler.start()
