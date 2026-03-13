@@ -123,7 +123,7 @@ STRATEGY_NAME = "Nifty Trending Straddle"
 #  BOT_TOKEN: from @BotFather  |  CHAT_ID: from @userinfobot
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TELEGRAM_ENABLED   = False
+TELEGRAM_ENABLED   = True
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
