@@ -52,7 +52,7 @@ STRIKE_OFFSET  = "ATM"         # ATM=straddle | OTM1..OTM50 | ITM1..ITM50
 
 ENTRY_TIME         = "09:17"  # When to place the short straddle
 EXIT_TIME          = "15:15"  # Hard square-off (always runs, regardless of P&L)
-MONITOR_INTERVAL_S = 60       # Seconds between P&L checks
+MONITOR_INTERVAL_S = 15       # Seconds between P&L checks
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 4 — TRADE DAY FILTER
