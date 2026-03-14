@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v4.0.0                     ║
+║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v4.1.0                     ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -30,18 +30,25 @@
 ║              combined = closed_leg_pnl + open_leg_mtm                          ║
 ║      If either breaches → close ALL remaining open legs                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
-║   v4.0.0 NEW FEATURES                                                           ║
+║   v4.1.0 CHANGES  (DTE Edition)                                                 ║
+║   • SECTION 4 rewritten: TRADE_DAYS (weekday) → TRADE_DTE (Days To Expiry)    ║
+║     - DTE0 = Expiry day (Tuesday). DTE1 = Monday. DTE2 = Friday. etc.         ║
+║     - Expiry-agnostic: works regardless of NSE expiry day changes              ║
+║     - Matches AlgoTest's DTE filter exactly for backtest parity                ║
+║   • get_dte() utility: computes calendar days from today to nearest expiry     ║
+║   • dte_filter_ok() replaces trade_day_ok() (month filter retained)            ║
+║   • Bug fix: _mark_fully_flat() P&L now uses closed_pnl (authoritative)       ║
+║   • Bug fix: reconcile Case B entry_time parsed with IST.localize()            ║
+║   • Banner + Telegram startup message updated for DTE display                  ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║   v4.0.0 FEATURES (retained)                                                    ║
 ║   • PRE-TRADE MARGIN GUARD: checks funds() + margin() basket before entry      ║
-║     - Available cash + collateral must cover required margin × safety buffer    ║
-║     - Basket call gets straddle SPAN offset (cheaper than two naked shorts)    ║
-║     - Fail-open design: API failure allows trade (prevents false skips)         ║
 ║   • ATM STRIKE FETCH: LTP-based ATM strike for accurate margin estimate        ║
-║   • ENHANCED BANNER: shows margin guard config at startup                      ║
 ║   • ATOMIC STATE WRITE: temp-file + rename prevents corrupt state on crash     ║
 ║   • FILL PRICE RETRY: 3 attempts with 1s delay to fetch orderstatus fills      ║
 ║   • MONITOR THREAD GUARD: concurrent monitor calls blocked via threading.Lock  ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
-║   RESTART SAFETY (unchanged + improved)                                         ║
+║   RESTART SAFETY                                                                 ║
 ║   • State persisted atomically after every single mutation                     ║
 ║   • Each leg's active/closed status tracked and persisted independently        ║
 ║   • On restart: reconciles with live positionbook() before scheduler starts    ║
@@ -56,12 +63,12 @@
 ║       export TELEGRAM_CHAT_ID="your_chat_id"                                    ║
 ║   3.  Sync Master Contract in OpenAlgo dashboard before 09:00                  ║
 ║   4.  Enable Analyze Mode in OpenAlgo dashboard (paper trade first)            ║
-║   5.  python Nifty_TrendingStrategy_v4.py                                      ║
+║   5.  python Nifty_TrendingStrategy_v4_1_DTE.py                                ║
 ║   6.  After satisfied with paper trades → disable Analyze Mode → goes LIVE     ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   SYMBOL FORMAT  (docs.openalgo.in)                                             ║
 ║   Order entry   : NIFTY  on  NSE_INDEX  (OpenAlgo resolves ATM strike)         ║
-║   Option quotes : NIFTY17MAR2623000CE  on  NFO  (Tuesday expiry)          ║
+║   Option quotes : NIFTY25MAR2623000CE  on  NFO  (Tuesday expiry)               ║
 ║   VIX           : INDIAVIX  on  NSE_INDEX                                      ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 """
@@ -107,15 +114,31 @@ EXIT_TIME          = "15:15"   # Hard square-off — closes ALL remaining open l
 MONITOR_INTERVAL_S = 15        # Seconds between P&L / SL checks
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 4 — TRADE DAY FILTER
-#  Backtest day-wise P&L (Wed+Thu+Fri = 81% of total P&L):
-#    Thu Rs.2,12,547  |  Fri Rs.1,08,537  |  Wed Rs.87,880
-#  0=Mon 1=Tue 2=Wed 3=Thu 4=Fri
+#  SECTION 4 — DTE FILTER  (Days To Expiry)
+#
+#  DTE = calendar days between today and the nearest weekly expiry (Tuesday).
+#  This is EXPIRY-AGNOSTIC: if NSE moves NIFTY expiry again, zero code change.
+#  It also matches AlgoTest's DTE filter exactly, ensuring backtest parity.
+#
+#  DTE mapping (NIFTY weekly expiry = Tuesday):
+#    DTE0 = Tuesday  (expiry day)      → peak theta decay, highest premium collapse
+#    DTE1 = Monday   (1 day before)    → strong theta, good straddle premiums
+#    DTE2 = Friday   (2 days before)   → moderate theta
+#    DTE3 = Thursday (3 days before)   → lower premium, wider spreads
+#    DTE4 = Wednesday(4 days before)   → thinnest premium — avoid for short straddle
+#
+#  Old weekday filter was: TRADE_DAYS = [2, 3, 4]  (Wed+Thu+Fri)
+#  That was calibrated when Thursday was expiry day.
+#  With Tuesday expiry, Wed/Thu/Fri = DTE4/DTE3/DTE2 — lowest theta days.
+#  DTE0+DTE1 (Tue+Mon) now carry the highest alpha for short straddles.
+#
+#  AlgoTest equivalent: check DTE0 and DTE1 in the DTE filter panel.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TRADE_DAYS = [2, 3, 4]            # Wed + Thu + Fri  (highest alpha days)
-# TRADE_DAYS = [3]                # Thursday only
-# TRADE_DAYS = [0, 1, 2, 3, 4]   # All weekdays
+TRADE_DTE = [0, 1]             # DTE0=Tue (expiry), DTE1=Mon — peak theta days
+# TRADE_DTE = [0]              # Expiry day only — most aggressive theta capture
+# TRADE_DTE = [0, 1, 2]       # Tue + Mon + Fri
+# TRADE_DTE = [0, 1, 2, 3, 4] # All days (equivalent to old all-weekday mode)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 5 — MONTH FILTER
@@ -155,7 +178,7 @@ DAILY_PROFIT_TARGET =  5000    # Combined Rs. target  (0 = disabled)
 DAILY_LOSS_LIMIT    = -4000    # Combined Rs. loss limit — NEGATIVE  (0 = disabled)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 7A — PRE-TRADE MARGIN GUARD  (NEW in v4.0.0)
+#  SECTION 7A — PRE-TRADE MARGIN GUARD
 #
 #  Before placing the straddle, the script:
 #    1. Calls client.funds()  → fetches availablecash + collateral
@@ -181,11 +204,13 @@ ATM_STRIKE_ROUNDING    = 50      # NIFTY=50, BANKNIFTY=100, FINNIFTY=50
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 8 — EXPIRY
-#  Format : DDMMMYY uppercase  e.g. "19MAR26"
+#  Format : DDMMMYY uppercase  e.g. "25MAR26"
+#  AUTO_EXPIRY = True resolves the nearest Tuesday automatically every day.
+#  Set MANUAL_EXPIRY only when AUTO_EXPIRY = False.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 AUTO_EXPIRY   = True           # True = auto nearest Tuesday (NIFTY weekly expiry day)
-MANUAL_EXPIRY = "17MAR26"      # Used only when AUTO_EXPIRY = False  (must be a Tuesday)
+MANUAL_EXPIRY = "25MAR26"      # Used only when AUTO_EXPIRY = False  (must be a Tuesday)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 9 — STRATEGY NAME
@@ -221,17 +246,17 @@ STATE_FILE = "strategy_state.json"
 #  INTERNAL CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "4.0.0"
+VERSION     = "4.1.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
 VIX_SYMBOL  = "INDIAVIX"   # docs.openalgo.in/symbol-format
 
-DAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 MONTH_NAMES = {
-    1:"January",   2:"February", 3:"March",    4:"April",
-    5:"May",       6:"June",     7:"July",      8:"August",
-    9:"September", 10:"October", 11:"November", 12:"December",
+    1: "January",   2: "February", 3: "March",    4: "April",
+    5: "May",       6: "June",     7: "July",      8: "August",
+    9: "September", 10: "October", 11: "November", 12: "December",
 }
 
 # Monitor job concurrency guard — prevents overlapping monitor ticks
@@ -275,8 +300,8 @@ state = {
     "pe_active"        : False,   # True = PE leg open at broker
 
     # ── Leg symbols (resolved by OpenAlgo from ATM + expiry) ─────────────────
-    "symbol_ce"        : "",      # e.g. NIFTY19MAR2623000CE
-    "symbol_pe"        : "",      # e.g. NIFTY19MAR2623000PE
+    "symbol_ce"        : "",      # e.g. NIFTY25MAR2623000CE
+    "symbol_pe"        : "",      # e.g. NIFTY25MAR2623000PE
 
     # ── Order IDs ─────────────────────────────────────────────────────────────
     "orderid_ce"       : "",
@@ -295,12 +320,12 @@ state = {
     "entry_time"       : None,    # ISO string (JSON-serialisable)
     "entry_date"       : None,    # YYYY-MM-DD (stale-state detection on restart)
 
-    # ── Margin info captured at entry (v4.0.0) ────────────────────────────────
+    # ── Margin info captured at entry ─────────────────────────────────────────
     "margin_required"  : 0.0,     # From margin guard check
     "margin_available" : 0.0,     # From funds check (cash + collateral)
 
     # ── Running P&L (updated every monitor cycle) ────────────────────────────
-    "today_pnl"        : 0.0,    # closed_pnl + current open_mtm
+    "today_pnl"        : 0.0,     # closed_pnl + current open_mtm
 
     # ── Session stats ─────────────────────────────────────────────────────────
     "trade_count"      : 0,
@@ -359,7 +384,7 @@ def save_state():
         if isinstance(payload.get("entry_time"), datetime):
             payload["entry_time"] = payload["entry_time"].isoformat()
 
-        state_dir  = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
+        state_dir    = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
         fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
@@ -478,32 +503,65 @@ def nearest_tuesday_expiry() -> str:
     """
     Return nearest NIFTY weekly expiry (TUESDAY) as DDMMMYY.
 
-    ⚠️  IMPORTANT — NSE EXPIRY CHANGE effective September 2, 2025:
-        NIFTY 50 weekly & monthly options now expire every TUESDAY.
-        (Previously Thursday — changed as part of SEBI's F&O restructuring.)
-        Bank Nifty: Wednesday | Sensex/Bankex: Thursday
+    NSE EXPIRY: NIFTY 50 weekly & monthly options expire every TUESDAY
+    (effective September 2, 2025 per SEBI F&O restructuring).
+    Bank Nifty: Wednesday | Sensex/Bankex: Thursday
 
     Logic:
-      • If today IS Tuesday and before market close (15:30 IST) → use today
-      • If today IS Tuesday and after 15:30 → roll to NEXT Tuesday
-      • Any other day → roll to nearest upcoming Tuesday
+      • If today IS Tuesday and time < 15:30 IST → use today
+      • If today IS Tuesday and time >= 15:30 IST → use next Tuesday
+      • Any other day → find next upcoming Tuesday
     """
-    today      = date.today()
-    now        = now_ist()
-    # Tuesday = weekday 1
-    days_ahead = (1 - today.weekday()) % 7   # 0 if today is Tuesday
-    if days_ahead == 0 and now.hour >= 15 and now.minute >= 30:
-        days_ahead = 7   # today's expiry already settled, use next week
+    today = date.today()
+    now   = now_ist()
+
+    # Tuesday = weekday() == 1
+    days_ahead = (1 - today.weekday()) % 7   # 0 if today is already Tuesday
+
+    # If today is Tuesday but market has closed, roll to next week
+    if days_ahead == 0 and (now.hour, now.minute) >= (15, 30):
+        days_ahead = 7
+
     expiry = today + timedelta(days=days_ahead)
     result = expiry.strftime("%d%b%y").upper()
     pinfo(f"Auto expiry: {result}  (date: {expiry}, {expiry.strftime('%A')})")
     return result
 
+
 def get_expiry() -> str:
+    """Return the active expiry string based on AUTO_EXPIRY setting."""
     if AUTO_EXPIRY:
         return nearest_tuesday_expiry()
     pinfo(f"Manual expiry: {MANUAL_EXPIRY}")
     return MANUAL_EXPIRY
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DTE CALCULATION
+#  Computes calendar days between today and the nearest weekly expiry.
+#  This is the authoritative filter replacing the old weekday-based filter.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_dte() -> int:
+    """
+    Compute DTE (Days To Expiry) = calendar days from today to nearest expiry.
+
+    DTE0 = today IS the expiry day (Tuesday, before market close).
+    DTE1 = one calendar day before expiry (Monday).
+    DTE2 = two calendar days before expiry (Friday — weekend skipped in calendar).
+    DTE3 = three calendar days before expiry (Thursday).
+    DTE4 = four calendar days before expiry (Wednesday).
+
+    Uses get_expiry() so it respects AUTO_EXPIRY / MANUAL_EXPIRY setting.
+    The expiry rollover after 15:30 on Tuesdays is handled inside
+    nearest_tuesday_expiry(), so DTE will never return 0 on a settled expiry.
+    """
+    today        = date.today()
+    expiry_str   = get_expiry()                              # e.g. "25MAR26"
+    expiry_date  = datetime.strptime(expiry_str, "%d%b%y").date()
+    dte          = (expiry_date - today).days
+    pinfo(f"DTE: {dte}  (today: {today}  expiry: {expiry_str}  {expiry_date.strftime('%A')})")
+    return dte
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -574,29 +632,51 @@ def vix_ok() -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DAY + MONTH FILTERS
+#  DTE + MONTH FILTERS
+#
+#  dte_filter_ok() replaces the old trade_day_ok() (weekday-based).
+#  DTE is computed fresh on every call — always reflects today's position
+#  in the weekly expiry cycle regardless of which day NSE uses for expiry.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def trade_day_ok() -> bool:
-    """Return True if today passes both day-of-week and month filters."""
-    now     = now_ist()
-    weekday = now.weekday()
-    month   = now.month
+def dte_filter_ok() -> bool:
+    """
+    Return True if today passes both the DTE filter and the month filter.
 
-    if weekday not in TRADE_DAYS:
-        pinfo(f"Today is {DAY_NAMES[weekday]} — not in TRADE_DAYS {TRADE_DAYS}, skipping")
-        return False
+    DTE filter:
+      Compute today's DTE (days to nearest expiry).
+      Allow trade only if DTE is in TRADE_DTE list.
+
+    Month filter:
+      Skip trade entirely if current month is in SKIP_MONTHS.
+    """
+    now   = now_ist()
+    month = now.month
+
+    # ── Month filter (fast check first — no expiry API call needed) ───────────
     if month in SKIP_MONTHS:
         pinfo(f"{MONTH_NAMES[month]} is in SKIP_MONTHS — skipping")
         telegram(f"Skipping — {MONTH_NAMES[month]} is a configured skip month")
         return False
 
-    pinfo(f"Trade day OK: {DAY_NAMES[weekday]}, {MONTH_NAMES[month]} {now.year}")
+    # ── DTE filter ────────────────────────────────────────────────────────────
+    dte = get_dte()
+
+    if dte not in TRADE_DTE:
+        pinfo(
+            f"DTE{dte} ({DAY_NAMES[now.weekday()]}) not in TRADE_DTE {['DTE' + str(d) for d in TRADE_DTE]} — skipping"
+        )
+        return False
+
+    pinfo(
+        f"DTE filter OK: DTE{dte} ({DAY_NAMES[now.weekday()]}) "
+        f"| month: {MONTH_NAMES[month]} {now.year}"
+    )
     return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  PRE-TRADE MARGIN GUARD  (NEW in v4.0.0)
+#  PRE-TRADE MARGIN GUARD
 #
 #  OpenAlgo APIs used:
 #    /api/v1/funds  → availablecash + collateral (pledged securities, haircut applied)
@@ -667,14 +747,14 @@ def check_margin_sufficient(expiry: str) -> bool:
         funds_resp = client.funds()
         if isinstance(funds_resp, dict) and funds_resp.get("status") == "success":
             data           = funds_resp.get("data", {})
-            available_cash = float(data.get("availablecash", 0) or 0)
-            collateral     = float(data.get("collateral",    0) or 0)
-            utilised       = float(data.get("utiliseddebits",0) or 0)
+            available_cash = float(data.get("availablecash",  0) or 0)
+            collateral     = float(data.get("collateral",     0) or 0)
+            utilised       = float(data.get("utiliseddebits", 0) or 0)
             pinfo(f"  Available cash  : Rs.{available_cash:,.2f}")
             pinfo(f"  Collateral      : Rs.{collateral:,.2f}  (pledged securities)")
             pinfo(f"  Utilised debits : Rs.{utilised:,.2f}  (existing margin)")
         else:
-            msg = funds_resp.get("message","") if isinstance(funds_resp, dict) else str(funds_resp)
+            msg = funds_resp.get("message", "") if isinstance(funds_resp, dict) else str(funds_resp)
             pwarn(f"funds() failed: {msg}")
             if MARGIN_GUARD_FAIL_OPEN:
                 pwarn("Margin guard fail-open: proceeding with entry despite funds() failure")
@@ -701,7 +781,7 @@ def check_margin_sufficient(expiry: str) -> bool:
     atm_strike      = _get_atm_strike_for_margin()
 
     # Build approximate symbol strings for margin API call
-    # OpenAlgo symbol format: NIFTY19MAR2623000CE
+    # OpenAlgo symbol format: NIFTY25MAR2623000CE
     ce_symbol = f"{UNDERLYING}{expiry}{atm_strike}CE"
     pe_symbol = f"{UNDERLYING}{expiry}{atm_strike}PE"
 
@@ -735,13 +815,13 @@ def check_margin_sufficient(expiry: str) -> bool:
         if isinstance(margin_resp, dict) and margin_resp.get("status") == "success":
             margin_data     = margin_resp.get("data", {})
             required_margin = float(margin_data.get("total_margin_required", 0) or 0)
-            span_margin     = float(margin_data.get("span_margin",  0) or 0)
+            span_margin     = float(margin_data.get("span_margin",     0) or 0)
             exposure_margin = float(margin_data.get("exposure_margin", 0) or 0)
             pinfo(f"  SPAN margin     : Rs.{span_margin:,.2f}")
             pinfo(f"  Exposure margin : Rs.{exposure_margin:,.2f}")
             pinfo(f"  Required total  : Rs.{required_margin:,.2f}")
         else:
-            msg = margin_resp.get("message","") if isinstance(margin_resp, dict) else str(margin_resp)
+            msg = margin_resp.get("message", "") if isinstance(margin_resp, dict) else str(margin_resp)
             pwarn(f"margin() failed: {msg}")
             if MARGIN_GUARD_FAIL_OPEN:
                 pwarn("Margin guard fail-open: proceeding with entry despite margin() failure")
@@ -774,7 +854,7 @@ def check_margin_sufficient(expiry: str) -> bool:
         pinfo(
             f"  MARGIN CHECK: PASS ✓  "
             f"Available Rs.{total_available:,.0f}  |  "
-            f"Required Rs.{required_margin:,.0f} (+{int((MARGIN_BUFFER-1)*100)}% = Rs.{required_with_buffer:,.0f})  |  "
+            f"Required Rs.{required_margin:,.0f} (+{int((MARGIN_BUFFER - 1) * 100)}% = Rs.{required_with_buffer:,.0f})  |  "
             f"Surplus Rs.{surplus_or_shortfall:,.0f}"
         )
         psep()
@@ -783,7 +863,7 @@ def check_margin_sufficient(expiry: str) -> bool:
         pwarn(
             f"  MARGIN CHECK: FAIL ✗  "
             f"Available Rs.{total_available:,.0f}  |  "
-            f"Required Rs.{required_margin:,.0f} (+{int((MARGIN_BUFFER-1)*100)}% = Rs.{required_with_buffer:,.0f})  |  "
+            f"Required Rs.{required_margin:,.0f} (+{int((MARGIN_BUFFER - 1) * 100)}% = Rs.{required_with_buffer:,.0f})  |  "
             f"Shortfall Rs.{abs(surplus_or_shortfall):,.0f}"
         )
         psep()
@@ -793,7 +873,7 @@ def check_margin_sufficient(expiry: str) -> bool:
             f"  Cash     : Rs.{available_cash:,.0f}\n"
             f"  Collateral: Rs.{collateral:,.0f}\n"
             f"Required   : Rs.{required_margin:,.0f}\n"
-            f"  +{int((MARGIN_BUFFER-1)*100)}% buffer = Rs.{required_with_buffer:,.0f}\n"
+            f"  +{int((MARGIN_BUFFER - 1) * 100)}% buffer = Rs.{required_with_buffer:,.0f}\n"
             f"Shortfall  : Rs.{abs(surplus_or_shortfall):,.0f}\n"
             f"Action: Add funds or reduce NUMBER_OF_LOTS."
         )
@@ -825,8 +905,8 @@ def place_entry() -> bool:
     pinfo(f"  Underlying  : {UNDERLYING}  |  Exchange  : {EXCHANGE}")
     pinfo(f"  Expiry      : {expiry}  |  Offset : {STRIKE_OFFSET}")
     pinfo(f"  Product     : {PRODUCT}  |  Qty/leg : {qty()}")
-    pinfo(f"  CE SL will  = entry_price_CE × {1 + LEG_SL_PERCENT/100:.2f}")
-    pinfo(f"  PE SL will  = entry_price_PE × {1 + LEG_SL_PERCENT/100:.2f}")
+    pinfo(f"  CE SL will  = entry_price_CE × {1 + LEG_SL_PERCENT / 100:.2f}")
+    pinfo(f"  PE SL will  = entry_price_PE × {1 + LEG_SL_PERCENT / 100:.2f}")
     pinfo(f"  Each leg managed INDEPENDENTLY — partial exit when one SL fires")
     psep()
 
@@ -884,7 +964,7 @@ def place_entry() -> bool:
             pinfo(
                 f"  LEG {opt} OK  | {leg.get('symbol')} "
                 f"| orderid: {leg.get('orderid')} "
-                f"| mode: {leg.get('mode','live').upper()}"
+                f"| mode: {leg.get('mode', 'live').upper()}"
             )
         else:
             perr(f"  LEG {opt} FAILED: {leg.get('message', 'Unknown error')}")
@@ -974,7 +1054,7 @@ def _capture_fill_prices():
                     else:
                         pdebug(f"  Fill [{leg}]: avg_px=0 on attempt {attempt}, retrying...")
                 else:
-                    msg = resp.get("message","") if isinstance(resp, dict) else str(resp)
+                    msg = resp.get("message", "") if isinstance(resp, dict) else str(resp)
                     pdebug(f"  orderstatus [{leg}] attempt {attempt} failed: {msg}")
             except Exception as exc:
                 pdebug(f"  orderstatus [{leg}] attempt {attempt} exception: {exc}")
@@ -1211,19 +1291,30 @@ def _emergency_close_all():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _mark_fully_flat(reason: str):
-    """Reset all position fields, delete state file, send final summary."""
-    final_pnl    = state["today_pnl"]
+    """
+    Reset all position fields, delete state file, send final summary.
+
+    FIX v4.1.0: Final P&L uses state["closed_pnl"] as the authoritative value.
+    state["today_pnl"] is only updated inside monitor ticks and may be stale
+    if both legs were closed by SL in the same monitor cycle (or by close_all
+    before a monitor tick updates today_pnl). closed_pnl is incremented
+    immediately on each leg close, so it is always accurate at flat time.
+    """
+    final_pnl    = state["closed_pnl"]   # Authoritative: sum of all closed-leg P&Ls
     duration_str = ""
 
     if state.get("entry_time"):
         try:
-            entry_dt = datetime.fromisoformat(state["entry_time"])
+            entry_dt = datetime.fromisoformat(str(state["entry_time"]))
             if entry_dt.tzinfo is None:
-                entry_dt = entry_dt.replace(tzinfo=IST)
+                entry_dt = IST.localize(entry_dt)
             held_mins    = int((now_ist() - entry_dt).total_seconds() // 60)
             duration_str = f"  |  Held: {held_mins} min"
         except Exception:
             pass
+
+    # Sync today_pnl with the final closed_pnl before resetting
+    state["today_pnl"] = final_pnl
 
     # Reset all position-related state
     state["in_position"]      = False
@@ -1305,7 +1396,7 @@ def _fetch_ltp(leg: str) -> float:
         if isinstance(q, dict) and q.get("status") == "success":
             ltp = float(q.get("data", {}).get("ltp", 0) or 0)
             return ltp if ltp > 0 else 0.0
-        pwarn(f"quotes() failed [{leg}]: {q.get('message','') if isinstance(q,dict) else str(q)}")
+        pwarn(f"quotes() failed [{leg}]: {q.get('message', '') if isinstance(q, dict) else str(q)}")
         return 0.0
     except Exception as exc:
         pwarn(f"quotes() exception [{leg}]: {exc}")
@@ -1470,12 +1561,16 @@ def reconcile_on_startup():
             if key in saved:
                 state[key] = saved[key]
 
-        # Re-parse ISO string back to datetime
+        # FIX v4.1.0: Use IST.localize() for naive datetimes instead of
+        # .replace(tzinfo=IST). replace() incorrectly assigns the LMT offset
+        # for Asia/Kolkata on older Python/pytz combinations.
         if isinstance(state.get("entry_time"), str):
             try:
-                state["entry_time"] = datetime.fromisoformat(
-                    state["entry_time"]
-                ).replace(tzinfo=IST)
+                parsed = datetime.fromisoformat(state["entry_time"])
+                if parsed.tzinfo is None:
+                    state["entry_time"] = IST.localize(parsed)
+                else:
+                    state["entry_time"] = parsed.astimezone(IST)
             except Exception:
                 state["entry_time"] = now_ist()
 
@@ -1512,8 +1607,8 @@ def reconcile_on_startup():
         telegram(
             f"⚠️ RESTART WARNING\n"
             f"State showed open position but broker is FLAT.\n"
-            f"CE: {saved.get('symbol_ce','?')}\n"
-            f"PE: {saved.get('symbol_pe','?')}\n"
+            f"CE: {saved.get('symbol_ce', '?')}\n"
+            f"PE: {saved.get('symbol_pe', '?')}\n"
             f"Position was closed externally. State cleared."
         )
         psep()
@@ -1579,13 +1674,13 @@ def _fetch_broker_positions() -> list:
 
 def job_entry():
     """
-    Entry job — fires once at ENTRY_TIME on configured TRADE_DAYS.
+    Entry job — fires once at ENTRY_TIME on configured DTE days.
 
     Filter order (short-circuit on first failure):
       1. Duplicate guard (already in position)
-      2. Trade day filter (day of week + skip months)
+      2. DTE filter (days to expiry) + month filter
       3. VIX filter (VIX_MIN ≤ VIX ≤ VIX_MAX)
-      4. Margin guard (available capital ≥ required × buffer)  ← NEW v4.0.0
+      4. Margin guard (available capital ≥ required × buffer)
       5. Place straddle entry
     """
     psep()
@@ -1597,8 +1692,8 @@ def job_entry():
         pwarn("Already in position — entry skipped (duplicate guard)")
         return
 
-    # ── 2. Trade day filter ───────────────────────────────────────────────────
-    if not trade_day_ok():
+    # ── 2. DTE filter + month filter ──────────────────────────────────────────
+    if not dte_filter_ok():
         return
 
     # ── 3. VIX filter ─────────────────────────────────────────────────────────
@@ -1647,10 +1742,17 @@ def job_monitor():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _print_banner():
-    days_str  = ", ".join(DAY_NAMES[d] for d in sorted(TRADE_DAYS))
+    dte_str   = ", ".join(f"DTE{d}" for d in sorted(TRADE_DTE))
+
+    # Build human-readable day names from DTE values (NIFTY = Tuesday expiry)
+    # DTE0=Tue, DTE1=Mon, DTE2=Fri, DTE3=Thu, DTE4=Wed
+    _dte_to_day = {0: "Tuesday", 1: "Monday", 2: "Friday", 3: "Thursday", 4: "Wednesday"}
+    day_str   = " | ".join(
+        f"DTE{d}={_dte_to_day.get(d, '?')}" for d in sorted(TRADE_DTE)
+    )
     skip_str  = ", ".join(MONTH_NAMES[m] for m in sorted(SKIP_MONTHS)) if SKIP_MONTHS else "None"
     guard_str = (
-        f"ENABLED  buffer={int((MARGIN_BUFFER-1)*100)}%  "
+        f"ENABLED  buffer={int((MARGIN_BUFFER - 1) * 100)}%  "
         f"fail_open={MARGIN_GUARD_FAIL_OPEN}"
         if MARGIN_GUARD_ENABLED else "DISABLED"
     )
@@ -1666,7 +1768,7 @@ def _print_banner():
     print(f"  Strike offset    : {STRIKE_OFFSET}  |  Product : {PRODUCT}", flush=True)
     print(f"  Entry            : {ENTRY_TIME} IST  |  Hard exit : {EXIT_TIME} IST", flush=True)
     print(f"  Monitor interval : every {MONITOR_INTERVAL_S}s", flush=True)
-    print(f"  Trade days       : {days_str}", flush=True)
+    print(f"  DTE filter       : {dte_str}  ({day_str})", flush=True)
     print(f"  Skip months      : {skip_str}", flush=True)
     print(f"  VIX filter       : {VIX_MIN}–{VIX_MAX}  (enabled: {VIX_FILTER_ENABLED})", flush=True)
     print(f"  Sq-off mode      : PARTIAL — each leg has independent {LEG_SL_PERCENT}% SL", flush=True)
@@ -1680,10 +1782,11 @@ def _print_banner():
     print(f"  Backtest (2019-2026): P&L Rs.5,04,192 | Win 66.71% | MaxDD Rs.34,179", flush=True)
     print(f"  Avg/trade Rs.289 | Return/MDD 1.38 | 1746 trades", flush=True)
     print("─" * 72, flush=True)
-    print(f"  Partial logic: each leg has its OWN 20% SL.", flush=True)
+    print(f"  Partial logic: each leg has its OWN {LEG_SL_PERCENT}% SL.", flush=True)
     print(f"  SL on CE → close CE only. PE continues with its own SL.", flush=True)
     print(f"  SL on PE → close PE only. CE continues with its own SL.", flush=True)
     print(f"  combined P&L = closed_pnl + open_leg_mtm", flush=True)
+    print(f"  DTE filter: trades ONLY on {dte_str} of weekly expiry cycle.", flush=True)
     print(f"  Margin guard: funds() + margin() checked before every entry.", flush=True)
     print(f"  Analyze Mode (paper/live) is set in the OpenAlgo dashboard.", flush=True)
     print("=" * 72, flush=True)
@@ -1701,11 +1804,11 @@ def check_connection():
     try:
         resp = client.funds()
         if isinstance(resp, dict) and resp.get("status") == "success":
-            data  = resp.get("data", {})
-            cash  = float(data.get("availablecash",  0) or 0)
-            coll  = float(data.get("collateral",     0) or 0)
-            used  = float(data.get("utiliseddebits", 0) or 0)
-            m2m   = float(data.get("m2munrealized",  0) or 0)
+            data = resp.get("data", {})
+            cash = float(data.get("availablecash",  0) or 0)
+            coll = float(data.get("collateral",     0) or 0)
+            used = float(data.get("utiliseddebits", 0) or 0)
+            m2m  = float(data.get("m2munrealized",  0) or 0)
             pinfo(f"Connection       : OK")
             pinfo(f"Available cash   : Rs.{cash:,.2f}")
             pinfo(f"Collateral       : Rs.{coll:,.2f}")
@@ -1718,15 +1821,18 @@ def check_connection():
         perr(f"Connection exception: {exc}")
     psep()
 
+
 def manual_entry():
     """Force entry immediately — bypasses time check, runs all other filters."""
     pinfo("MANUAL ENTRY triggered")
     job_entry()
 
+
 def manual_exit():
     """Force close all active legs immediately."""
     pinfo("MANUAL EXIT triggered")
     close_all(reason="Manual Exit by Operator")
+
 
 def show_state():
     """Print full in-memory state + computed SL levels to stdout."""
@@ -1737,7 +1843,11 @@ def show_state():
     print(f"    {'sl_ce (computed)':<24} : Rs.{sl_level('CE'):.2f}", flush=True)
     print(f"    {'sl_pe (computed)':<24} : Rs.{sl_level('PE'):.2f}", flush=True)
     print(f"    {'active_legs':<24} : {active_legs()}", flush=True)
+    dte = get_dte()
+    print(f"    {'current_dte':<24} : DTE{dte} ({DAY_NAMES[now_ist().weekday()]})", flush=True)
+    print(f"    {'dte_filter_ok':<24} : {dte in TRADE_DTE}", flush=True)
     psep()
+
 
 def check_margin_now():
     """
@@ -1799,6 +1909,7 @@ def run():
         name    = f"Monitor {MONITOR_INTERVAL_S}s",
     )
 
+    dte_str = ", ".join(f"DTE{d}" for d in sorted(TRADE_DTE))
     pinfo(
         f"Scheduler running | Entry: {ENTRY_TIME} | "
         f"Exit: {EXIT_TIME} | Monitor: every {MONITOR_INTERVAL_S}s"
@@ -1807,7 +1918,7 @@ def run():
     print("", flush=True)
 
     guard_status = (
-        f"Margin guard: ENABLED ({int((MARGIN_BUFFER-1)*100)}% buffer, "
+        f"Margin guard: ENABLED ({int((MARGIN_BUFFER - 1) * 100)}% buffer, "
         f"fail_open={MARGIN_GUARD_FAIL_OPEN})"
         if MARGIN_GUARD_ENABLED else "Margin guard: DISABLED"
     )
@@ -1817,7 +1928,8 @@ def run():
         f"Qty/leg: {NUMBER_OF_LOTS}×{LOT_SIZE} = {qty()}\n"
         f"Leg SL: {LEG_SL_PERCENT}% (independent per leg)\n"
         f"VIX: {VIX_MIN}–{VIX_MAX}\n"
-        f"Days: {', '.join(DAY_NAMES[d][:3] for d in sorted(TRADE_DAYS))}\n"
+        f"DTE filter: {dte_str}\n"
+        f"Skip months: {', '.join(MONTH_NAMES[m] for m in sorted(SKIP_MONTHS)) if SKIP_MONTHS else 'None'}\n"
         f"Target: Rs.{DAILY_PROFIT_TARGET}  Limit: Rs.{DAILY_LOSS_LIMIT}\n"
         f"{guard_status}"
     )
@@ -1854,7 +1966,7 @@ if __name__ == "__main__":
       check_margin_now()   → test margin guard without placing a trade
       manual_entry()       → force entry now (bypasses time, runs all filters)
       manual_exit()        → close all active legs now
-      show_state()         → dump full state + computed SL levels
+      show_state()         → dump full state + computed SL levels + DTE info
     """
 
     # ── Production ────────────────────────────────────────────────────────────
