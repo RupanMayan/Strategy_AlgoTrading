@@ -1,36 +1,48 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v3.0.0                     ║
+║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v4.0.0                     ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
-║   Backtest Results  (AlgoTest 2020–2026  |  1531 trades  |  PARTIAL mode)      ║
-║   Total P&L  : Rs.3,19,204                                                     ║
-║   Win Rate   : 55.31%   |  Avg/trade  : Rs.364                                 ║
-║   Max DD     : Rs.34,762 (AlgoTest reported)                                   ║
-║   Return/MDD : 1.48     |  Reward:Risk: 1.09                                   ║
+║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
+║   Total P&L  : Rs.5,04,192  (qty 65)  →  scaled ~Rs.5,81,000 at qty 75        ║
+║   Win Rate   : 66.71%   |  Avg/trade  : Rs.289                                 ║
+║   Max DD     : Rs.34,179 (AlgoTest reported)                                   ║
+║   Return/MDD : 1.38     |  Reward:Risk: 1.09                                   ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
-║   PARTIAL SQUARE OFF — EXACT LOGIC (verified from 1531-trade AlgoTest CSV)     ║
+║   PARTIAL SQUARE OFF — EXACT LOGIC (verified from 1746-trade AlgoTest CSV)     ║
 ║                                                                                  ║
-║   Key facts from data analysis:                                                 ║
-║   • 97.2% of 1531 trades had DIFFERENT exit times per leg  (always partial)    ║
-║   • 99.6% of all SL exits hit at exactly 20.0% of each leg's entry premium    ║
-║   • 542/543 both-SL cases had legs closing at DIFFERENT times (independent)    ║
-║   • Avg surviving-leg P&L after partner SL = Rs.3,084  (888 profit / 60 loss) ║
+║   Key facts from CSV analysis:                                                  ║
+║   • 61.6% of trades: one leg SL fires, other leg survives to 15:15             ║
+║   • 35.4% of trades: both legs SL — at DIFFERENT times (independent)           ║
+║   •  3.0% of trades: both legs exit normally at 15:15                          ║
+║   • 99.6% of SL exits hit at exactly 20.0% of each leg's entry premium         ║
+║   • Median SL hit: 22 min after entry | 40% of SLs hit within 15 min           ║
 ║                                                                                  ║
 ║   Implementation:                                                               ║
-║   1. Entry  : SELL CE + SELL PE at ATM simultaneously                          ║
+║   1. Entry  : SELL CE + SELL PE at ATM simultaneously at 09:17                 ║
 ║   2. Per-leg: each leg monitored with its OWN independent 20% SL level         ║
 ║              CE_SL = CE_entry_price × 1.20                                     ║
 ║              PE_SL = PE_entry_price × 1.20                                     ║
 ║   3. CE hits SL → BUY CE only. PE continues with its own SL                   ║
 ║   4. PE hits SL → BUY PE only. CE continues with its own SL                   ║
 ║   5. Surviving leg exits at: its own SL  OR  15:15 hard exit                  ║
-║   6. Daily target/limit evaluated on COMBINED P&L:                            ║
+║   6. Daily target/limit evaluated on COMBINED P&L:                             ║
 ║              combined = closed_leg_pnl + open_leg_mtm                          ║
 ║      If either breaches → close ALL remaining open legs                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
-║   RESTART SAFETY                                                                 ║
-║   • State persisted to JSON after every single mutation                        ║
+║   v4.0.0 NEW FEATURES                                                           ║
+║   • PRE-TRADE MARGIN GUARD: checks funds() + margin() basket before entry      ║
+║     - Available cash + collateral must cover required margin × safety buffer    ║
+║     - Basket call gets straddle SPAN offset (cheaper than two naked shorts)    ║
+║     - Fail-open design: API failure allows trade (prevents false skips)         ║
+║   • ATM STRIKE FETCH: LTP-based ATM strike for accurate margin estimate        ║
+║   • ENHANCED BANNER: shows margin guard config at startup                      ║
+║   • ATOMIC STATE WRITE: temp-file + rename prevents corrupt state on crash     ║
+║   • FILL PRICE RETRY: 3 attempts with 1s delay to fetch orderstatus fills      ║
+║   • MONITOR THREAD GUARD: concurrent monitor calls blocked via threading.Lock  ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║   RESTART SAFETY (unchanged + improved)                                         ║
+║   • State persisted atomically after every single mutation                     ║
 ║   • Each leg's active/closed status tracked and persisted independently        ║
 ║   • On restart: reconciles with live positionbook() before scheduler starts    ║
 ║   • 5 cases handled: fresh / restore partial / restore full /                  ║
@@ -44,7 +56,7 @@
 ║       export TELEGRAM_CHAT_ID="your_chat_id"                                    ║
 ║   3.  Sync Master Contract in OpenAlgo dashboard before 09:00                  ║
 ║   4.  Enable Analyze Mode in OpenAlgo dashboard (paper trade first)            ║
-║   5.  python trending_strategy_partial.py                                       ║
+║   5.  python Nifty_TrendingStrategy_v4.py                                      ║
 ║   6.  After satisfied with paper trades → disable Analyze Mode → goes LIVE     ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   SYMBOL FORMAT  (docs.openalgo.in)                                             ║
@@ -57,6 +69,9 @@
 import os
 import sys
 import json
+import time
+import tempfile
+import threading
 import requests
 import pytz
 from datetime import datetime, date, timedelta
@@ -79,7 +94,7 @@ OPENALGO_API_KEY = os.getenv("OPENALGO_APIKEY", "your_openalgo_api_key_here")
 
 UNDERLYING     = "NIFTY"       # NIFTY | BANKNIFTY | FINNIFTY
 EXCHANGE       = "NSE_INDEX"   # Always NSE_INDEX for index-based option orders
-LOT_SIZE       = 75            # NIFTY=75  BANKNIFTY=30  FINNIFTY=40
+LOT_SIZE       = 75            # NIFTY=75  BANKNIFTY=35  FINNIFTY=40
 NUMBER_OF_LOTS = 1             # Lots per leg — start with 1 for paper trading
 PRODUCT        = "MIS"         # MIS = intraday auto sq-off  |  NRML = carry forward
 STRIKE_OFFSET  = "ATM"         # ATM | OTM1..OTM5 | ITM1..ITM5
@@ -94,18 +109,18 @@ MONITOR_INTERVAL_S = 15        # Seconds between P&L / SL checks
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 4 — TRADE DAY FILTER
-#  Backtest day-wise P&L (Wed+Thu+Fri, no Nov):
-#    Thu Rs.2,07,418  |  Wed Rs.1,00,311  |  Fri Rs.92,238
+#  Backtest day-wise P&L (Wed+Thu+Fri = 81% of total P&L):
+#    Thu Rs.2,12,547  |  Fri Rs.1,08,537  |  Wed Rs.87,880
 #  0=Mon 1=Tue 2=Wed 3=Thu 4=Fri
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TRADE_DAYS = [2, 3, 4]            # Wed + Thu + Fri
+TRADE_DAYS = [2, 3, 4]            # Wed + Thu + Fri  (highest alpha days)
 # TRADE_DAYS = [3]                # Thursday only
 # TRADE_DAYS = [0, 1, 2, 3, 4]   # All weekdays
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 5 — MONTH FILTER
-#  November = Rs.-10,748 loss (consistent — always skip)
+#  November = consistent loss month across all years
 #  1=Jan .. 11=Nov .. 12=Dec
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -116,6 +131,7 @@ SKIP_MONTHS = [11]               # Skip November
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 6 — VIX FILTER
 #  VIX < 14 : premiums too thin  |  VIX > 28 : danger zone
+#  Verified against AlgoTest backtest configuration.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 VIX_FILTER_ENABLED = True
@@ -128,7 +144,7 @@ VIX_MAX            = 28.0
 #  LEG_SL_PERCENT — applied to EACH LEG INDEPENDENTLY
 #    CE SL = CE_entry_price × (1 + LEG_SL_PERCENT/100)  → close CE only
 #    PE SL = PE_entry_price × (1 + LEG_SL_PERCENT/100)  → close PE only
-#    This matches 99.6% accuracy verified from AlgoTest backtest CSV.
+#    99.6% accuracy verified from AlgoTest CSV (2311 SL hits, median = 20.00%)
 #
 #  DAILY_PROFIT_TARGET / DAILY_LOSS_LIMIT — evaluated on COMBINED P&L
 #    combined = closed_leg_pnl + open_leg(s)_mtm
@@ -138,6 +154,31 @@ VIX_MAX            = 28.0
 LEG_SL_PERCENT      = 20.0     # % of entry premium per leg  (0 = disabled)
 DAILY_PROFIT_TARGET =  5000    # Combined Rs. target  (0 = disabled)
 DAILY_LOSS_LIMIT    = -4000    # Combined Rs. loss limit — NEGATIVE  (0 = disabled)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7A — PRE-TRADE MARGIN GUARD  (NEW in v4.0.0)
+#
+#  Before placing the straddle, the script:
+#    1. Calls client.funds()  → fetches availablecash + collateral
+#    2. Calls client.margin() → fetches basket margin for CE+PE SELL MIS
+#       (includes SPAN straddle portfolio offset — cheaper than two naked shorts)
+#    3. Checks: (availablecash + collateral) >= required_margin × MARGIN_BUFFER
+#
+#  MARGIN_BUFFER = 1.20 → requires 20% headroom above margin
+#    Rationale: SPAN margins can spike intraday on VIX moves.
+#    Also compensates for Dhan's sequential (not basket) margin calculation.
+#
+#  MARGIN_GUARD_FAIL_OPEN = True  → if API fails, allow trade (don't block)
+#    Set to False to be conservative: skip trade if margin API is unreachable.
+#
+#  ATM_STRIKE_ROUNDING = 50  → NIFTY rounds to nearest 50
+#    Used to build the symbol string for the margin pre-check call.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MARGIN_GUARD_ENABLED   = True
+MARGIN_BUFFER          = 1.20    # 20% safety headroom over required margin
+MARGIN_GUARD_FAIL_OPEN = True    # True = allow trade if margin API fails
+ATM_STRIKE_ROUNDING    = 50      # NIFTY=50, BANKNIFTY=100, FINNIFTY=50
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 8 — EXPIRY
@@ -165,8 +206,9 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 11 — STATE FILE
-#  JSON persisted after every state mutation.
+#  JSON persisted atomically after every state mutation.
 #  Use absolute path when running as a systemd service or crontab.
+#  e.g.  STATE_FILE = "/home/ubuntu/strategy/strategy_state.json"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 STATE_FILE = "strategy_state.json"
@@ -180,7 +222,7 @@ STATE_FILE = "strategy_state.json"
 #  INTERNAL CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "3.0.0"
+VERSION     = "4.0.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -192,6 +234,9 @@ MONTH_NAMES = {
     5:"May",       6:"June",     7:"July",      8:"August",
     9:"September", 10:"October", 11:"November", 12:"December",
 }
+
+# Monitor job concurrency guard — prevents overlapping monitor ticks
+_monitor_lock = threading.Lock()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -218,41 +263,49 @@ MONTH_NAMES = {
 #    Used to compute per-leg SL levels (FIXED at entry, never change):
 #      CE SL level = entry_price_ce × (1 + LEG_SL_PERCENT/100)
 #      PE SL level = entry_price_pe × (1 + LEG_SL_PERCENT/100)
+#
+#  margin_required / margin_available
+#    Captured at entry time from margin guard check.
+#    Stored for logging and Telegram only — not used in trade logic.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 state = {
     # ── Position flags ────────────────────────────────────────────────────────
-    "in_position"    : False,   # True if ANY leg is still open
-    "ce_active"      : False,   # True = CE leg open at broker
-    "pe_active"      : False,   # True = PE leg open at broker
+    "in_position"      : False,   # True if ANY leg is still open
+    "ce_active"        : False,   # True = CE leg open at broker
+    "pe_active"        : False,   # True = PE leg open at broker
 
     # ── Leg symbols (resolved by OpenAlgo from ATM + expiry) ─────────────────
-    "symbol_ce"      : "",      # e.g. NIFTY19MAR2623000CE
-    "symbol_pe"      : "",      # e.g. NIFTY19MAR2623000PE
+    "symbol_ce"        : "",      # e.g. NIFTY19MAR2623000CE
+    "symbol_pe"        : "",      # e.g. NIFTY19MAR2623000PE
 
     # ── Order IDs ─────────────────────────────────────────────────────────────
-    "orderid_ce"     : "",
-    "orderid_pe"     : "",
+    "orderid_ce"       : "",
+    "orderid_pe"       : "",
 
     # ── Entry fill prices — basis of per-leg SL calculation ──────────────────
-    "entry_price_ce" : 0.0,
-    "entry_price_pe" : 0.0,
+    "entry_price_ce"   : 0.0,
+    "entry_price_pe"   : 0.0,
 
     # ── Realised P&L from legs already closed this session ───────────────────
-    "closed_pnl"     : 0.0,
+    "closed_pnl"       : 0.0,
 
     # ── Context at entry ─────────────────────────────────────────────────────
-    "underlying_ltp" : 0.0,
-    "vix_at_entry"   : 0.0,
-    "entry_time"     : None,   # ISO string (JSON-serialisable)
-    "entry_date"     : None,   # YYYY-MM-DD (stale-state detection on restart)
+    "underlying_ltp"   : 0.0,
+    "vix_at_entry"     : 0.0,
+    "entry_time"       : None,    # ISO string (JSON-serialisable)
+    "entry_date"       : None,    # YYYY-MM-DD (stale-state detection on restart)
+
+    # ── Margin info captured at entry (v4.0.0) ────────────────────────────────
+    "margin_required"  : 0.0,     # From margin guard check
+    "margin_available" : 0.0,     # From funds check (cash + collateral)
 
     # ── Running P&L (updated every monitor cycle) ────────────────────────────
-    "today_pnl"      : 0.0,   # closed_pnl + current open_mtm
+    "today_pnl"        : 0.0,    # closed_pnl + current open_mtm
 
     # ── Session stats ─────────────────────────────────────────────────────────
-    "trade_count"    : 0,
-    "exit_reason"    : "",
+    "trade_count"      : 0,
+    "exit_reason"      : "",
 }
 
 
@@ -266,14 +319,14 @@ client = OpenAlgoClient(api_key=OPENALGO_API_KEY, host=OPENALGO_HOST)
 # ═══════════════════════════════════════════════════════════════════════════════
 #  LOGGER
 #  All output via print(flush=True) — captured by OpenAlgo's log system.
-#  Format: [YYYY-MM-DD HH:MM:SS] [LEVEL   ] message
+#  Format: [YYYY-MM-DD HH:MM:SS IST] [LEVEL   ] message
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def now_ist() -> datetime:
     return datetime.now(IST)
 
 def ts() -> str:
-    return f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}]"
+    return f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')} IST]"
 
 def plog(level: str, msg: str):
     print(f"{ts()} [{level:<8}] {msg}", flush=True)
@@ -288,21 +341,42 @@ def psep():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STATE PERSISTENCE
+#  STATE PERSISTENCE  (atomic write — crash-safe)
+#
+#  Uses write-to-temp-then-rename pattern.
+#  On Linux/Mac: rename() is atomic — partial writes never corrupt STATE_FILE.
+#  On Windows: uses os.replace() which is atomic on NTFS.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def save_state():
     """
-    Write current in-memory state to STATE_FILE (JSON).
+    Atomically write current in-memory state to STATE_FILE (JSON).
     Called after EVERY state mutation — ensures restart safety at any moment.
+    Uses temp-file + rename for crash-safe atomic writes.
     """
     try:
         payload = dict(state)
+        # Serialize datetime objects to ISO strings for JSON
         if isinstance(payload.get("entry_time"), datetime):
             payload["entry_time"] = payload["entry_time"].isoformat()
-        with open(STATE_FILE, "w") as f:
-            json.dump(payload, f, indent=2)
-        pdebug(f"State saved → {STATE_FILE}")
+
+        state_dir  = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f, indent=2)
+            # Atomic rename: replaces STATE_FILE if it exists
+            os.replace(tmp_path, STATE_FILE)
+        except Exception:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+        pdebug(f"State saved atomically → {STATE_FILE}")
+
     except Exception as exc:
         pwarn(f"State save failed: {exc}")
 
@@ -387,7 +461,7 @@ def telegram(msg: str):
         url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         data = {
             "chat_id"    : TELEGRAM_CHAT_ID,
-            "text"       : f"[{STRATEGY_NAME}]\n{msg}",
+            "text"       : f"[{STRATEGY_NAME} v{VERSION}]\n{msg}",
             "parse_mode" : "HTML",
         }
         r = requests.post(url, json=data, timeout=6)
@@ -404,7 +478,7 @@ def telegram(msg: str):
 def nearest_thursday_expiry() -> str:
     """
     Return nearest NIFTY weekly expiry (Thursday) as DDMMMYY.
-    If today IS Thursday before market close (15:00 IST) → use today.
+    If today IS Thursday and before market close (15:00 IST) → use today.
     Otherwise → roll to next Thursday.
     """
     today      = date.today()
@@ -478,11 +552,11 @@ def vix_ok() -> bool:
         return False
     if vix < VIX_MIN:
         pwarn(f"VIX {vix:.2f} < {VIX_MIN} — premiums too thin, skipping")
-        telegram(f"VIX {vix:.2f} < {VIX_MIN} — thin premiums, no trade today")
+        telegram(f"VIX {vix:.2f} &lt; {VIX_MIN} — thin premiums, no trade today")
         return False
     if vix > VIX_MAX:
         pwarn(f"VIX {vix:.2f} > {VIX_MAX} — danger zone, skipping")
-        telegram(f"VIX {vix:.2f} > {VIX_MAX} — DANGER ZONE, no trade today!")
+        telegram(f"VIX {vix:.2f} &gt; {VIX_MAX} — DANGER ZONE, no trade today!")
         return False
 
     pinfo(f"VIX {vix:.2f} within [{VIX_MIN}–{VIX_MAX}] — OK to trade")
@@ -513,6 +587,211 @@ def trade_day_ok() -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  PRE-TRADE MARGIN GUARD  (NEW in v4.0.0)
+#
+#  OpenAlgo APIs used:
+#    /api/v1/funds  → availablecash + collateral (pledged securities, haircut applied)
+#    /api/v1/margin → basket margin for SELL CE + SELL PE MIS
+#                     returns total_margin_required with SPAN straddle offset
+#
+#  Design decisions:
+#    • FAIL-OPEN: if either API call fails, log + proceed (don't block live trades)
+#    • Collateral is included: pledged Nifty BeES / liquid funds count as margin
+#    • MARGIN_BUFFER = 1.20: 20% headroom handles intraday SPAN spikes
+#    • Dhan note: margin() calculates legs sequentially (no basket offset),
+#      so the 20% buffer also compensates for this conservatism
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_atm_strike_for_margin() -> str:
+    """
+    Fetch NIFTY spot LTP and return nearest ATM strike as string.
+    Used only for the margin pre-check symbol string — not for order entry.
+    OpenAlgo resolves the actual ATM strike automatically at order time.
+    Falls back to a hardcoded reasonable default on any failure.
+    """
+    try:
+        q = client.quotes(symbol=UNDERLYING, exchange=INDEX_EXCH)
+        if isinstance(q, dict) and q.get("status") == "success":
+            ltp = float(q.get("data", {}).get("ltp", 0))
+            if ltp > 0:
+                atm = round(ltp / ATM_STRIKE_ROUNDING) * ATM_STRIKE_ROUNDING
+                pdebug(f"ATM strike for margin check: {atm}  (LTP: {ltp:.2f})")
+                return str(int(atm))
+    except Exception as exc:
+        pwarn(f"ATM LTP fetch failed: {exc}")
+    # Safe fallback — margin estimate may be slightly off but won't block trade
+    return "23000"
+
+
+def check_margin_sufficient(expiry: str) -> bool:
+    """
+    Pre-trade margin guard. Runs before optionsmultiorder().
+
+    Step 1: GET available capital via client.funds()
+      availablecash + collateral = total available for trading
+      utiliseddebits = already blocked (existing positions)
+
+    Step 2: GET basket margin via client.margin()
+      Sends both legs (CE + PE SELL MIS) to get combined straddle margin.
+      Many brokers apply SPAN straddle portfolio offset — cheaper than 2 naked shorts.
+
+    Step 3: Sufficiency check
+      total_available >= required_margin × MARGIN_BUFFER
+
+    Returns:
+      True  — sufficient margin, proceed with entry
+      False — insufficient margin, skip today's trade
+    """
+    if not MARGIN_GUARD_ENABLED:
+        pinfo("Margin guard disabled — skipping pre-trade margin check")
+        return True
+
+    psep()
+    pinfo("PRE-TRADE MARGIN CHECK")
+
+    # ── Step 1: Fetch available capital (cash + collateral) ──────────────────
+    available_cash = 0.0
+    collateral     = 0.0
+    utilised       = 0.0
+
+    try:
+        funds_resp = client.funds()
+        if isinstance(funds_resp, dict) and funds_resp.get("status") == "success":
+            data           = funds_resp.get("data", {})
+            available_cash = float(data.get("availablecash", 0) or 0)
+            collateral     = float(data.get("collateral",    0) or 0)
+            utilised       = float(data.get("utiliseddebits",0) or 0)
+            pinfo(f"  Available cash  : Rs.{available_cash:,.2f}")
+            pinfo(f"  Collateral      : Rs.{collateral:,.2f}  (pledged securities)")
+            pinfo(f"  Utilised debits : Rs.{utilised:,.2f}  (existing margin)")
+        else:
+            msg = funds_resp.get("message","") if isinstance(funds_resp, dict) else str(funds_resp)
+            pwarn(f"funds() failed: {msg}")
+            if MARGIN_GUARD_FAIL_OPEN:
+                pwarn("Margin guard fail-open: proceeding with entry despite funds() failure")
+                return True
+            else:
+                pwarn("Margin guard fail-closed: skipping trade due to funds() failure")
+                telegram("Margin guard: funds() API failed — trade SKIPPED (fail-closed mode)")
+                return False
+    except Exception as exc:
+        pwarn(f"funds() exception: {exc}")
+        if MARGIN_GUARD_FAIL_OPEN:
+            pwarn("Margin guard fail-open: proceeding with entry despite exception")
+            return True
+        telegram(f"Margin guard: funds() exception — trade SKIPPED\n{exc}")
+        return False
+
+    total_available = available_cash + collateral
+    pinfo(f"  Total available : Rs.{total_available:,.2f}  (cash + collateral)")
+
+    # ── Step 2: Fetch basket margin for straddle ─────────────────────────────
+    required_margin = 0.0
+    span_margin     = 0.0
+    exposure_margin = 0.0
+    atm_strike      = _get_atm_strike_for_margin()
+
+    # Build approximate symbol strings for margin API call
+    # OpenAlgo symbol format: NIFTY19MAR2623000CE
+    ce_symbol = f"{UNDERLYING}{expiry}{atm_strike}CE"
+    pe_symbol = f"{UNDERLYING}{expiry}{atm_strike}PE"
+
+    pinfo(f"  Margin check symbols: {ce_symbol} + {pe_symbol}")
+    pinfo(f"  Qty/leg: {qty()}  |  Product: {PRODUCT}")
+
+    try:
+        margin_resp = client.margin(
+            positions=[
+                {
+                    "symbol"    : ce_symbol,
+                    "exchange"  : OPTION_EXCH,
+                    "action"    : "SELL",
+                    "product"   : PRODUCT,
+                    "pricetype" : "MARKET",
+                    "quantity"  : str(qty()),
+                    "price"     : "0",
+                },
+                {
+                    "symbol"    : pe_symbol,
+                    "exchange"  : OPTION_EXCH,
+                    "action"    : "SELL",
+                    "product"   : PRODUCT,
+                    "pricetype" : "MARKET",
+                    "quantity"  : str(qty()),
+                    "price"     : "0",
+                },
+            ]
+        )
+
+        if isinstance(margin_resp, dict) and margin_resp.get("status") == "success":
+            margin_data     = margin_resp.get("data", {})
+            required_margin = float(margin_data.get("total_margin_required", 0) or 0)
+            span_margin     = float(margin_data.get("span_margin",  0) or 0)
+            exposure_margin = float(margin_data.get("exposure_margin", 0) or 0)
+            pinfo(f"  SPAN margin     : Rs.{span_margin:,.2f}")
+            pinfo(f"  Exposure margin : Rs.{exposure_margin:,.2f}")
+            pinfo(f"  Required total  : Rs.{required_margin:,.2f}")
+        else:
+            msg = margin_resp.get("message","") if isinstance(margin_resp, dict) else str(margin_resp)
+            pwarn(f"margin() failed: {msg}")
+            if MARGIN_GUARD_FAIL_OPEN:
+                pwarn("Margin guard fail-open: proceeding with entry despite margin() failure")
+                return True
+            telegram("Margin guard: margin() API failed — trade SKIPPED")
+            return False
+
+    except Exception as exc:
+        pwarn(f"margin() exception: {exc}")
+        if MARGIN_GUARD_FAIL_OPEN:
+            pwarn("Margin guard fail-open: proceeding with entry despite exception")
+            return True
+        telegram(f"Margin guard: margin() exception — trade SKIPPED\n{exc}")
+        return False
+
+    # ── Step 3: Sufficiency check ─────────────────────────────────────────────
+    if required_margin <= 0:
+        pwarn("Margin API returned zero — treating as unavailable, proceeding")
+        return True
+
+    required_with_buffer = required_margin * MARGIN_BUFFER
+    sufficient           = total_available >= required_with_buffer
+    surplus_or_shortfall = total_available - required_with_buffer
+
+    # Store for Telegram message at entry
+    state["margin_required"]  = required_margin
+    state["margin_available"] = total_available
+
+    if sufficient:
+        pinfo(
+            f"  MARGIN CHECK: PASS ✓  "
+            f"Available Rs.{total_available:,.0f}  |  "
+            f"Required Rs.{required_margin:,.0f} (+{int((MARGIN_BUFFER-1)*100)}% = Rs.{required_with_buffer:,.0f})  |  "
+            f"Surplus Rs.{surplus_or_shortfall:,.0f}"
+        )
+        psep()
+        return True
+    else:
+        pwarn(
+            f"  MARGIN CHECK: FAIL ✗  "
+            f"Available Rs.{total_available:,.0f}  |  "
+            f"Required Rs.{required_margin:,.0f} (+{int((MARGIN_BUFFER-1)*100)}% = Rs.{required_with_buffer:,.0f})  |  "
+            f"Shortfall Rs.{abs(surplus_or_shortfall):,.0f}"
+        )
+        psep()
+        telegram(
+            f"⚠️ MARGIN INSUFFICIENT — trade SKIPPED\n"
+            f"Available  : Rs.{total_available:,.0f}\n"
+            f"  Cash     : Rs.{available_cash:,.0f}\n"
+            f"  Collateral: Rs.{collateral:,.0f}\n"
+            f"Required   : Rs.{required_margin:,.0f}\n"
+            f"  +{int((MARGIN_BUFFER-1)*100)}% buffer = Rs.{required_with_buffer:,.0f}\n"
+            f"Shortfall  : Rs.{abs(surplus_or_shortfall):,.0f}\n"
+            f"Action: Add funds or reduce NUMBER_OF_LOTS."
+        )
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  ENTRY — Short ATM Straddle (SELL CE + SELL PE)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -522,13 +801,13 @@ def place_entry() -> bool:
 
     Success path:
       • Both legs filled → ce_active=True, pe_active=True
-      • Fill prices captured via orderstatus()
-      • Full state saved to disk
+      • Fill prices captured via orderstatus() with retry
+      • Full state saved to disk atomically
       • Returns True
 
     Failure paths:
       • API exception / rejected → Returns False, nothing opened
-      • One leg filled, other failed (partial) → emergency close, Returns False
+      • One leg filled, other failed (partial fill) → emergency close, Returns False
     """
     expiry = get_expiry()
 
@@ -609,7 +888,7 @@ def place_entry() -> bool:
         return False
 
     # ── Populate state — BOTH legs now active ─────────────────────────────────
-    now = now_ist()
+    now_dt = now_ist()
     state["in_position"]    = True
     state["ce_active"]      = True
     state["pe_active"]      = True
@@ -618,16 +897,16 @@ def place_entry() -> bool:
     state["orderid_ce"]     = filled_legs["CE"]["orderid"]
     state["orderid_pe"]     = filled_legs["PE"]["orderid"]
     state["underlying_ltp"] = float(resp.get("underlying_ltp", 0))
-    state["entry_time"]     = now.isoformat()
-    state["entry_date"]     = now.strftime("%Y-%m-%d")
+    state["entry_time"]     = now_dt.isoformat()
+    state["entry_date"]     = now_dt.strftime("%Y-%m-%d")
     state["closed_pnl"]     = 0.0
     state["today_pnl"]      = 0.0
     state["exit_reason"]    = ""
 
-    # ── Fetch average fill prices (needed for per-leg SL levels) ─────────────
+    # ── Fetch average fill prices with retry (SL depends on accuracy) ────────
     _capture_fill_prices()
 
-    # ── Persist to disk immediately ───────────────────────────────────────────
+    # ── Persist atomically to disk immediately ────────────────────────────────
     save_state()
 
     trade_mode = (results[0].get("mode", "live") if results else "live").upper()
@@ -638,17 +917,19 @@ def place_entry() -> bool:
     pinfo(f"  Mode      : {trade_mode}  NIFTY: {state['underlying_ltp']}  VIX: {state['vix_at_entry']:.2f}")
     pinfo(f"  CE        : {state['symbol_ce']}  fill Rs.{state['entry_price_ce']:.2f}  SL @ Rs.{sl_ce:.2f}")
     pinfo(f"  PE        : {state['symbol_pe']}  fill Rs.{state['entry_price_pe']:.2f}  SL @ Rs.{sl_pe:.2f}")
+    pinfo(f"  Margin used : Rs.{state['margin_required']:,.0f}  |  Available was: Rs.{state['margin_available']:,.0f}")
     pinfo(f"  State persisted → {STATE_FILE}")
     psep()
 
     telegram(
-        f"ENTRY PLACED [{trade_mode}]\n"
+        f"✅ ENTRY PLACED [{trade_mode}]\n"
         f"NIFTY: {state['underlying_ltp']}  VIX: {state['vix_at_entry']:.2f}\n"
-        f"CE: {state['symbol_ce']}\n"
+        f"CE : {state['symbol_ce']}\n"
         f"  Fill Rs.{state['entry_price_ce']:.2f}  |  SL @ Rs.{sl_ce:.2f}\n"
-        f"PE: {state['symbol_pe']}\n"
+        f"PE : {state['symbol_pe']}\n"
         f"  Fill Rs.{state['entry_price_pe']:.2f}  |  SL @ Rs.{sl_pe:.2f}\n"
-        f"Expiry: {expiry}  Qty/leg: {qty()}"
+        f"Expiry: {expiry}  Qty/leg: {qty()}\n"
+        f"Margin used: Rs.{state['margin_required']:,.0f}"
     )
     return True
 
@@ -658,25 +939,45 @@ def _capture_fill_prices():
     Fetch average fill prices from broker via orderstatus() for both legs.
     These are the foundation of per-leg SL levels — must be accurate.
 
+    Retry logic: up to 3 attempts with 1s delay.
+    Accounts for broker API propagation delay after order placement.
+
     Failure handling:
-      • Warns and leaves entry_price at 0.0 if orderstatus fails
+      • After 3 retries, warns and leaves entry_price at 0.0
       • Position is already placed — we do NOT abort or unwind
       • SL check is skipped for that leg if entry_price is 0.0
     """
+    MAX_ATTEMPTS = 3
+    RETRY_DELAY  = 1.0   # seconds
+
     for leg, oid in [("CE", state["orderid_ce"]), ("PE", state["orderid_pe"])]:
-        try:
-            resp = client.orderstatus(order_id=oid, strategy=STRATEGY_NAME)
-            if isinstance(resp, dict) and resp.get("status") == "success":
-                avg_px = float(resp.get("data", {}).get("average_price", 0))
-                state[f"entry_price_{leg.lower()}"] = avg_px
-                pinfo(f"  Fill [{leg}]: Rs.{avg_px:.2f}  (orderid: {oid})")
-            else:
-                pwarn(
-                    f"  orderstatus failed [{leg}] — SL disabled for this leg. "
-                    f"Resp: {resp.get('message','') if isinstance(resp,dict) else str(resp)}"
-                )
-        except Exception as exc:
-            pwarn(f"  Fill price exception [{leg}]: {exc} — SL disabled for this leg")
+        filled = False
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                resp = client.orderstatus(order_id=oid, strategy=STRATEGY_NAME)
+                if isinstance(resp, dict) and resp.get("status") == "success":
+                    avg_px = float(resp.get("data", {}).get("average_price", 0) or 0)
+                    if avg_px > 0:
+                        state[f"entry_price_{leg.lower()}"] = avg_px
+                        pinfo(f"  Fill [{leg}]: Rs.{avg_px:.2f}  (orderid: {oid}  attempt: {attempt})")
+                        filled = True
+                        break
+                    else:
+                        pdebug(f"  Fill [{leg}]: avg_px=0 on attempt {attempt}, retrying...")
+                else:
+                    msg = resp.get("message","") if isinstance(resp, dict) else str(resp)
+                    pdebug(f"  orderstatus [{leg}] attempt {attempt} failed: {msg}")
+            except Exception as exc:
+                pdebug(f"  orderstatus [{leg}] attempt {attempt} exception: {exc}")
+
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_DELAY)
+
+        if not filled:
+            pwarn(
+                f"  Fill price [{leg}] unavailable after {MAX_ATTEMPTS} attempts "
+                f"— SL disabled for this leg. Monitor will warn on each cycle."
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -688,7 +989,7 @@ def _capture_fill_prices():
 #  What this function does:
 #    1. Guard against double-close (idempotent)
 #    2. Place BUY MARKET order for this leg only (reverses the SELL)
-#    3. On success  → mark leg inactive, add approx P&L to closed_pnl
+#    3. On success  → mark leg inactive, add approx P&L to closed_pnl, save state
 #    4. If other leg still active → log partial state, save, return
 #    5. If both legs now closed   → call _mark_fully_flat()
 #    6. On order failure → log error + Telegram alert, RETURN without state change
@@ -716,8 +1017,8 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
         pwarn(f"close_one_leg({leg_upper}) — already closed, skipping")
         return
 
-    symbol   = state[symbol_key]
-    entry_px = state[entry_key]
+    symbol     = state[symbol_key]
+    entry_px   = state[entry_key]
     approx_pnl = (entry_px - current_ltp) * qty() if (entry_px > 0 and current_ltp > 0) else 0.0
 
     psep()
@@ -742,10 +1043,10 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
         perr(f"close_one_leg({leg_upper}) ORDER EXCEPTION: {exc}")
         perr(f"*** MANUAL ACTION REQUIRED — close {symbol} in broker terminal ***")
         telegram(
-            f"EXIT FAILED — {leg_upper} ORDER EXCEPTION\n"
+            f"🚨 EXIT FAILED — {leg_upper} ORDER EXCEPTION\n"
             f"MANUAL ACTION REQUIRED\n"
-            f"Symbol: {symbol}\n"
-            f"Error : {exc}"
+            f"Symbol : {symbol}\n"
+            f"Error  : {exc}"
         )
         return  # State unchanged — leg still marked active
 
@@ -754,10 +1055,10 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
         perr(f"close_one_leg({leg_upper}) ORDER REJECTED: {err}")
         perr(f"*** MANUAL ACTION REQUIRED — close {symbol} in broker terminal ***")
         telegram(
-            f"EXIT FAILED — {leg_upper} ORDER REJECTED\n"
+            f"🚨 EXIT FAILED — {leg_upper} ORDER REJECTED\n"
             f"MANUAL ACTION REQUIRED\n"
-            f"Symbol: {symbol}\n"
-            f"Error : {err}"
+            f"Symbol : {symbol}\n"
+            f"Error  : {err}"
         )
         return  # State unchanged — leg still marked active
 
@@ -789,11 +1090,11 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
         psep()
 
         telegram(
-            f"PARTIAL EXIT — {leg_upper} LEG CLOSED\n"
+            f"⚡ PARTIAL EXIT — {leg_upper} LEG CLOSED\n"
             f"Reason     : {reason}\n"
             f"Symbol     : {symbol}\n"
             f"Approx P&L : Rs.{approx_pnl:.0f}\n"
-            f"─────────────────────\n"
+            f"───────────────────\n"
             f"{other_leg} STILL ACTIVE\n"
             f"Symbol     : {other_symbol}\n"
             f"Entry      : Rs.{other_entry_px:.2f}\n"
@@ -844,7 +1145,7 @@ def close_all(reason: str = "Scheduled Exit"):
             perr(f"closeposition() EXCEPTION: {exc}")
             perr("*** MANUAL ACTION REQUIRED in broker terminal ***")
             telegram(
-                f"EXIT FAILED — closeposition() EXCEPTION\n"
+                f"🚨 EXIT FAILED — closeposition() EXCEPTION\n"
                 f"MANUAL ACTION REQUIRED\n"
                 f"CE: {state['symbol_ce']}\n"
                 f"PE: {state['symbol_pe']}\n"
@@ -861,7 +1162,7 @@ def close_all(reason: str = "Scheduled Exit"):
             perr(f"closeposition() REJECTED: {err}")
             perr("*** MANUAL ACTION REQUIRED in broker terminal ***")
             telegram(
-                f"EXIT FAILED — closeposition() REJECTED\n"
+                f"🚨 EXIT FAILED — closeposition() REJECTED\n"
                 f"MANUAL ACTION REQUIRED\n"
                 f"CE: {state['symbol_ce']}\n"
                 f"PE: {state['symbol_pe']}\n"
@@ -916,22 +1217,24 @@ def _mark_fully_flat(reason: str):
             pass
 
     # Reset all position-related state
-    state["in_position"]    = False
-    state["ce_active"]      = False
-    state["pe_active"]      = False
-    state["symbol_ce"]      = ""
-    state["symbol_pe"]      = ""
-    state["orderid_ce"]     = ""
-    state["orderid_pe"]     = ""
-    state["entry_price_ce"] = 0.0
-    state["entry_price_pe"] = 0.0
-    state["closed_pnl"]     = 0.0
-    state["underlying_ltp"] = 0.0
-    state["vix_at_entry"]   = 0.0
-    state["entry_time"]     = None
-    state["entry_date"]     = None
-    state["exit_reason"]    = reason
-    state["trade_count"]   += 1
+    state["in_position"]      = False
+    state["ce_active"]        = False
+    state["pe_active"]        = False
+    state["symbol_ce"]        = ""
+    state["symbol_pe"]        = ""
+    state["orderid_ce"]       = ""
+    state["orderid_pe"]       = ""
+    state["entry_price_ce"]   = 0.0
+    state["entry_price_pe"]   = 0.0
+    state["closed_pnl"]       = 0.0
+    state["underlying_ltp"]   = 0.0
+    state["vix_at_entry"]     = 0.0
+    state["entry_time"]       = None
+    state["entry_date"]       = None
+    state["margin_required"]  = 0.0
+    state["margin_available"] = 0.0
+    state["exit_reason"]      = reason
+    state["trade_count"]     += 1
 
     # Delete state file — flat position needs no persistence
     clear_state_file()
@@ -944,8 +1247,9 @@ def _mark_fully_flat(reason: str):
     pinfo(f"Session trade count: {state['trade_count']}")
     psep()
 
+    emoji = "🟢" if final_pnl >= 0 else "🔴"
     telegram(
-        f"POSITION FULLY CLOSED\n"
+        f"{emoji} POSITION FULLY CLOSED\n"
         f"Reason        : {reason}\n"
         f"Final P&L ≈   : Rs.{sign}{final_pnl:.0f}{duration_str}\n"
         f"Session trades: {state['trade_count']}"
@@ -975,8 +1279,8 @@ def _mark_fully_flat(reason: str):
 #       Check DAILY_PROFIT_TARGET → close_all() if breached
 #       Check DAILY_LOSS_LIMIT    → close_all() if breached
 #
-#  Important: after close_one_leg() changes state["in_position"] to False
-#  (when both legs are now closed), we bail out early — no combined checks needed.
+#  Threading guard: _monitor_lock prevents concurrent monitor ticks
+#  (APScheduler may overlap if a tick takes > MONITOR_INTERVAL_S seconds)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _fetch_ltp(leg: str) -> float:
@@ -990,7 +1294,7 @@ def _fetch_ltp(leg: str) -> float:
     try:
         q = client.quotes(symbol=symbol, exchange=OPTION_EXCH)
         if isinstance(q, dict) and q.get("status") == "success":
-            ltp = float(q.get("data", {}).get("ltp", 0))
+            ltp = float(q.get("data", {}).get("ltp", 0) or 0)
             return ltp if ltp > 0 else 0.0
         pwarn(f"quotes() failed [{leg}]: {q.get('message','') if isinstance(q,dict) else str(q)}")
         return 0.0
@@ -1003,10 +1307,25 @@ def monitor_pnl():
     """
     Monitor tick — runs every MONITOR_INTERVAL_S seconds.
     Implements full partial square off logic.
+    Protected by threading lock to prevent overlapping executions.
     """
     if not state["in_position"]:
         return
 
+    # Non-blocking lock: skip this tick if previous one is still running
+    acquired = _monitor_lock.acquire(blocking=False)
+    if not acquired:
+        pwarn("Monitor tick skipped — previous tick still running (lock contention)")
+        return
+
+    try:
+        _run_monitor_tick()
+    finally:
+        _monitor_lock.release()
+
+
+def _run_monitor_tick():
+    """Inner monitor logic — called from monitor_pnl() under lock."""
     open_mtm = 0.0   # sum of live MTM for still-open legs only
 
     for leg in ["CE", "PE"]:
@@ -1046,7 +1365,6 @@ def monitor_pnl():
                 current_ltp=ltp,
             )
             # This leg's P&L is now in closed_pnl — not in open_mtm
-            # Do NOT add leg_mtm to open_mtm
             continue
 
         # ── No SL — accumulate to open MTM ───────────────────────────────────
@@ -1164,7 +1482,7 @@ def reconcile_on_startup():
         psep()
 
         telegram(
-            f"RESTARTED — STATE RESTORED\n"
+            f"♻️ RESTARTED — STATE RESTORED\n"
             f"Active legs : {active}\n"
             f"CE: {state['symbol_ce']}\n"
             f"  Fill Rs.{state['entry_price_ce']:.2f}  SL @ Rs.{sl_level('CE'):.2f}\n"
@@ -1183,7 +1501,7 @@ def reconcile_on_startup():
         state["exit_reason"] = "Closed externally before restart"
         clear_state_file()
         telegram(
-            f"RESTART WARNING\n"
+            f"⚠️ RESTART WARNING\n"
             f"State showed open position but broker is FLAT.\n"
             f"CE: {saved.get('symbol_ce','?')}\n"
             f"PE: {saved.get('symbol_pe','?')}\n"
@@ -1199,7 +1517,7 @@ def reconcile_on_startup():
             perr(f"  {p.get('symbol')} | qty: {p.get('quantity')} | avg: {p.get('average_price')}")
         perr("Attempting emergency close")
         telegram(
-            f"CRITICAL: Orphan NFO positions on restart!\n"
+            f"🚨 CRITICAL: Orphan NFO positions on restart!\n"
             + "\n".join(
                 f"{p.get('symbol')} qty:{p.get('quantity')}"
                 for p in broker_positions
@@ -1229,7 +1547,7 @@ def _fetch_broker_positions() -> list:
         open_nfo = [
             p for p in all_pos
             if p.get("exchange", "") == OPTION_EXCH
-            and int(p.get("quantity", 0)) != 0
+            and int(p.get("quantity", 0) or 0) != 0
         ]
 
         if open_nfo:
@@ -1251,21 +1569,40 @@ def _fetch_broker_positions() -> list:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def job_entry():
-    """Entry job — fires once at ENTRY_TIME on configured TRADE_DAYS."""
+    """
+    Entry job — fires once at ENTRY_TIME on configured TRADE_DAYS.
+
+    Filter order (short-circuit on first failure):
+      1. Duplicate guard (already in position)
+      2. Trade day filter (day of week + skip months)
+      3. VIX filter (VIX_MIN ≤ VIX ≤ VIX_MAX)
+      4. Margin guard (available capital ≥ required × buffer)  ← NEW v4.0.0
+      5. Place straddle entry
+    """
     psep()
     pinfo(f"ENTRY JOB | {now_ist().strftime('%A %d-%b-%Y %H:%M:%S IST')}")
     psep()
 
+    # ── 1. Duplicate guard ────────────────────────────────────────────────────
     if state["in_position"]:
         pwarn("Already in position — entry skipped (duplicate guard)")
         return
 
+    # ── 2. Trade day filter ───────────────────────────────────────────────────
     if not trade_day_ok():
         return
 
+    # ── 3. VIX filter ─────────────────────────────────────────────────────────
     if not vix_ok():
         return
 
+    # ── 4. Pre-trade margin guard ─────────────────────────────────────────────
+    expiry = get_expiry()
+    if not check_margin_sufficient(expiry):
+        perr("Entry ABORTED — insufficient margin (cash + collateral)")
+        return
+
+    # ── 5. Reset daily counters and place entry ───────────────────────────────
     state["today_pnl"]  = 0.0
     state["closed_pnl"] = 0.0
 
@@ -1301,12 +1638,17 @@ def job_monitor():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _print_banner():
-    days_str = ", ".join(DAY_NAMES[d] for d in sorted(TRADE_DAYS))
-    skip_str = ", ".join(MONTH_NAMES[m] for m in sorted(SKIP_MONTHS)) if SKIP_MONTHS else "None"
+    days_str  = ", ".join(DAY_NAMES[d] for d in sorted(TRADE_DAYS))
+    skip_str  = ", ".join(MONTH_NAMES[m] for m in sorted(SKIP_MONTHS)) if SKIP_MONTHS else "None"
+    guard_str = (
+        f"ENABLED  buffer={int((MARGIN_BUFFER-1)*100)}%  "
+        f"fail_open={MARGIN_GUARD_FAIL_OPEN}"
+        if MARGIN_GUARD_ENABLED else "DISABLED"
+    )
     print("", flush=True)
     print("=" * 72, flush=True)
     print(f"  NIFTY TRENDING STRADDLE  v{VERSION}  —  PARTIAL SQUARE OFF", flush=True)
-    print(f"  OpenAlgo + Dhan API  |  Restart-Safe Production Strategy", flush=True)
+    print(f"  OpenAlgo + Dhan API  |  Restart-Safe  |  Production Grade", flush=True)
     print("=" * 72, flush=True)
     print(f"  Host             : {OPENALGO_HOST}", flush=True)
     print(f"  Strategy         : {STRATEGY_NAME}", flush=True)
@@ -1321,17 +1663,19 @@ def _print_banner():
     print(f"  Sq-off mode      : PARTIAL — each leg has independent {LEG_SL_PERCENT}% SL", flush=True)
     print(f"  Daily target     : Rs.{DAILY_PROFIT_TARGET}  (combined, 0=disabled)", flush=True)
     print(f"  Daily limit      : Rs.{DAILY_LOSS_LIMIT}   (combined, 0=disabled)", flush=True)
+    print(f"  Margin guard     : {guard_str}", flush=True)
     print(f"  Auto expiry      : {AUTO_EXPIRY}  |  Manual : {MANUAL_EXPIRY}", flush=True)
     print(f"  State file       : {os.path.abspath(STATE_FILE)}", flush=True)
     print(f"  Telegram         : {TELEGRAM_ENABLED}", flush=True)
     print("=" * 72, flush=True)
-    print(f"  Backtest (2020-2026): P&L Rs.3,19,204 | Win 55.31% | MaxDD Rs.34,762", flush=True)
-    print(f"  Avg/trade Rs.364 | Return/MDD 1.48", flush=True)
+    print(f"  Backtest (2019-2026): P&L Rs.5,04,192 | Win 66.71% | MaxDD Rs.34,179", flush=True)
+    print(f"  Avg/trade Rs.289 | Return/MDD 1.38 | 1746 trades", flush=True)
     print("─" * 72, flush=True)
     print(f"  Partial logic: each leg has its OWN 20% SL.", flush=True)
     print(f"  SL on CE → close CE only. PE continues with its own SL.", flush=True)
     print(f"  SL on PE → close PE only. CE continues with its own SL.", flush=True)
     print(f"  combined P&L = closed_pnl + open_leg_mtm", flush=True)
+    print(f"  Margin guard: funds() + margin() checked before every entry.", flush=True)
     print(f"  Analyze Mode (paper/live) is set in the OpenAlgo dashboard.", flush=True)
     print("=" * 72, flush=True)
     print("", flush=True)
@@ -1342,17 +1686,23 @@ def _print_banner():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def check_connection():
-    """Test OpenAlgo connection and display account funds."""
+    """Test OpenAlgo connection and display account funds + collateral."""
     psep()
     pinfo("Testing OpenAlgo connection...")
     try:
         resp = client.funds()
         if isinstance(resp, dict) and resp.get("status") == "success":
-            data = resp.get("data", {})
-            pinfo(f"Connection : OK")
-            pinfo(f"Available  : Rs.{data.get('availablecash', 'N/A')}")
-            pinfo(f"Utilized   : Rs.{data.get('utiliseddebits', 'N/A')}")
-            pinfo(f"M2M Unreal : Rs.{data.get('m2munrealized', 'N/A')}")
+            data  = resp.get("data", {})
+            cash  = float(data.get("availablecash",  0) or 0)
+            coll  = float(data.get("collateral",     0) or 0)
+            used  = float(data.get("utiliseddebits", 0) or 0)
+            m2m   = float(data.get("m2munrealized",  0) or 0)
+            pinfo(f"Connection       : OK")
+            pinfo(f"Available cash   : Rs.{cash:,.2f}")
+            pinfo(f"Collateral       : Rs.{coll:,.2f}")
+            pinfo(f"Total available  : Rs.{cash + coll:,.2f}")
+            pinfo(f"Utilised debits  : Rs.{used:,.2f}")
+            pinfo(f"M2M Unrealised   : Rs.{m2m:,.2f}")
         else:
             perr(f"Connection FAILED: {resp}")
     except Exception as exc:
@@ -1374,11 +1724,20 @@ def show_state():
     psep()
     pinfo("STATE DUMP:")
     for k, v in state.items():
-        print(f"    {k:<22} : {v}", flush=True)
-    print(f"    {'sl_ce (computed)':<22} : Rs.{sl_level('CE'):.2f}", flush=True)
-    print(f"    {'sl_pe (computed)':<22} : Rs.{sl_level('PE'):.2f}", flush=True)
-    print(f"    {'active_legs':<22} : {active_legs()}", flush=True)
+        print(f"    {k:<24} : {v}", flush=True)
+    print(f"    {'sl_ce (computed)':<24} : Rs.{sl_level('CE'):.2f}", flush=True)
+    print(f"    {'sl_pe (computed)':<24} : Rs.{sl_level('PE'):.2f}", flush=True)
+    print(f"    {'active_legs':<24} : {active_legs()}", flush=True)
     psep()
+
+def check_margin_now():
+    """
+    Manual margin check — call this to test margin guard without placing a trade.
+    Useful for verifying API connectivity and capital sufficiency.
+    """
+    expiry = get_expiry()
+    result = check_margin_sufficient(expiry)
+    pinfo(f"Margin check result: {'PASS ✓' if result else 'FAIL ✗'}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1389,7 +1748,7 @@ def run():
     """
     Production startup:
       1. Print banner
-      2. Test connection + show funds
+      2. Test connection + show funds (including collateral)
       3. Reconcile state with broker (restart-safe)
       4. Start APScheduler (entry / exit / monitor)
       5. Graceful shutdown on Ctrl+C or crash
@@ -1438,14 +1797,20 @@ def run():
     pinfo("Press Ctrl+C to stop gracefully")
     print("", flush=True)
 
+    guard_status = (
+        f"Margin guard: ENABLED ({int((MARGIN_BUFFER-1)*100)}% buffer, "
+        f"fail_open={MARGIN_GUARD_FAIL_OPEN})"
+        if MARGIN_GUARD_ENABLED else "Margin guard: DISABLED"
+    )
     telegram(
-        f"Strategy STARTED v{VERSION} [PARTIAL]\n"
+        f"🚀 Strategy STARTED v{VERSION} [PARTIAL]\n"
         f"Entry: {ENTRY_TIME}  Hard Exit: {EXIT_TIME}\n"
         f"Qty/leg: {NUMBER_OF_LOTS}×{LOT_SIZE} = {qty()}\n"
         f"Leg SL: {LEG_SL_PERCENT}% (independent per leg)\n"
         f"VIX: {VIX_MIN}–{VIX_MAX}\n"
         f"Days: {', '.join(DAY_NAMES[d][:3] for d in sorted(TRADE_DAYS))}\n"
-        f"Target: Rs.{DAILY_PROFIT_TARGET}  Limit: Rs.{DAILY_LOSS_LIMIT}"
+        f"Target: Rs.{DAILY_PROFIT_TARGET}  Limit: Rs.{DAILY_LOSS_LIMIT}\n"
+        f"{guard_status}"
     )
 
     try:
@@ -1463,7 +1828,7 @@ def run():
         if state["in_position"]:
             perr(f"Open legs: {active_legs()} — attempting emergency close")
             close_all(reason="Emergency: Scheduler Crash")
-        telegram(f"Strategy CRASHED\n{exc}\nCheck logs immediately.")
+        telegram(f"🚨 Strategy CRASHED\n{exc}\nCheck logs immediately.")
         raise
 
 
@@ -1476,17 +1841,19 @@ if __name__ == "__main__":
     Default: run() — full production scheduler.
 
     For testing (comment run(), uncomment one):
-      check_connection()  → verify OpenAlgo + show funds
-      manual_entry()      → force entry now (bypasses time, runs other filters)
-      manual_exit()       → close all active legs now
-      show_state()        → dump full state + computed SL levels
+      check_connection()   → verify OpenAlgo + show funds + collateral
+      check_margin_now()   → test margin guard without placing a trade
+      manual_entry()       → force entry now (bypasses time, runs all filters)
+      manual_exit()        → close all active legs now
+      show_state()         → dump full state + computed SL levels
     """
 
-    # Production
+    # ── Production ────────────────────────────────────────────────────────────
     run()
 
-    # Testing
+    # ── Testing (uncomment one at a time) ─────────────────────────────────────
     # check_connection()
+    # check_margin_now()
     # manual_entry()
     # manual_exit()
     # show_state()
