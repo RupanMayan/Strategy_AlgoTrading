@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v4.2.0                     ║
+║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v4.2.1                     ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -40,6 +40,18 @@
 ║   BUG 3 FIX: _print_banner() _dte_to_day map only covered DTE0–4, returned    ║
 ║              '?' for DTE5/DTE6. Now dynamically computed from expiry date,     ║
 ║              works correctly for all DTE values including DTE5 and DTE6.       ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║   v4.2.1 FIX  (Weekend guard in dte_filter_ok)                                  ║
+║   BUG: Friday, Saturday, Sunday all returned the same DTE value because the     ║
+║        trading-day loop counts only Mon–Fri between today and expiry.           ║
+║        Fri→Tue = Mon(1)+Tue(2) = DTE2. Sat→Tue = Mon(1)+Tue(2) = DTE2.        ║
+║        So TRADE_DTE=[0,1,2] would technically allow a Saturday manual trade.    ║
+║   FIX: dte_filter_ok() now explicitly rejects Saturday and Sunday first,        ║
+║        before computing DTE. Weekends are never valid trading days per           ║
+║        AlgoTest — they don't appear in backtest data at all.                    ║
+║        Log: "Saturday is not a trading day — skipping" (clear, unambiguous).    ║
+║        Production impact: zero (scheduler already restricts to mon-fri).        ║
+║        Manual entry on weekends: now correctly and cleanly rejected.            ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   v4.1.0 CHANGES (retained)                                                     ║
 ║   • TRADE_DAYS (weekday) → TRADE_DTE (Days To Expiry)                          ║
@@ -260,7 +272,7 @@ STATE_FILE = "strategy_state.json"
 #  INTERNAL CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "4.2.0"
+VERSION     = "4.2.1"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -676,20 +688,41 @@ def vix_ok() -> bool:
 
 def dte_filter_ok() -> bool:
     """
-    Return True if today passes both the DTE filter and the month filter.
+    Return True if today passes the weekend check, the month filter, and the
+    DTE filter — in that order (cheapest checks first).
 
-    DTE filter:
-      Compute today's DTE using TRADING days (matching AlgoTest exactly).
-      Allow trade only if DTE is in TRADE_DTE list.
+    Weekend guard (v4.2.1 fix):
+      Saturday and Sunday are never valid trading days. AlgoTest's DTE filter
+      only applies to Mon–Fri; weekends do not appear in backtest data at all.
+      Without this guard, Friday/Saturday/Sunday all compute the same DTE value
+      because the trading-day loop counts only Mon–Fri between today and expiry:
+        Friday  Mar 13 → Mon(1)+Tue(2) = DTE2  ← correct trading day
+        Saturday Mar 14 → Mon(1)+Tue(2) = DTE2  ← non-trading, same DTE value
+        Sunday  Mar 15 → Mon(1)+Tue(2) = DTE2  ← non-trading, same DTE value
+      The APScheduler (day_of_week="mon-fri") already prevents automatic trades
+      on weekends, so production impact is zero. This guard makes manual_entry()
+      on weekends reject cleanly with a clear log message instead of computing a
+      misleading DTE value and potentially passing through.
 
     Month filter:
-      Skip trade entirely if current month is in SKIP_MONTHS.
+      Skip if current month is in SKIP_MONTHS (no API call needed).
 
-    Month filter runs first — it's cheaper (no API call) and often rules
-    out entire months before we even need to compute the DTE.
+    DTE filter:
+      Compute today's trading-day DTE (AlgoTest-compatible).
+      Allow trade only if DTE is in TRADE_DTE list.
     """
-    now   = now_ist()
-    month = now.month
+    now     = now_ist()
+    weekday = now.weekday()   # 0=Mon … 4=Fri  5=Sat  6=Sun
+    month   = now.month
+
+    # ── Weekend guard — must be first ─────────────────────────────────────────
+    # weekday 5 = Saturday, weekday 6 = Sunday
+    if weekday >= 5:
+        pinfo(
+            f"{DAY_NAMES[weekday]} is not a trading day — skipping "
+            f"(scheduler never fires on weekends; this path only reached via manual_entry)"
+        )
+        return False
 
     # ── Month filter ──────────────────────────────────────────────────────────
     if month in SKIP_MONTHS:
@@ -702,13 +735,13 @@ def dte_filter_ok() -> bool:
 
     if dte not in TRADE_DTE:
         pinfo(
-            f"DTE{dte} ({DAY_NAMES[now.weekday()]}) not in "
+            f"DTE{dte} ({DAY_NAMES[weekday]}) not in "
             f"TRADE_DTE {['DTE' + str(d) for d in sorted(TRADE_DTE)]} — skipping"
         )
         return False
 
     pinfo(
-        f"DTE filter OK: DTE{dte} ({DAY_NAMES[now.weekday()]}) "
+        f"DTE filter OK: DTE{dte} ({DAY_NAMES[weekday]}) "
         f"| month: {MONTH_NAMES[month]} {now.year}"
     )
     return True
