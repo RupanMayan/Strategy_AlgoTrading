@@ -61,13 +61,12 @@
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   SYMBOL FORMAT  (docs.openalgo.in)                                             ║
 ║   Order entry   : NIFTY  on  NSE_INDEX  (OpenAlgo resolves ATM strike)         ║
-║   Option quotes : NIFTY19MAR2623000CE  on  NFO                                 ║
+║   Option quotes : NIFTY17MAR2623000CE  on  NFO  (Tuesday expiry)          ║
 ║   VIX           : INDIAVIX  on  NSE_INDEX                                      ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 """
 
 import os
-import sys
 import json
 import time
 import tempfile
@@ -185,8 +184,8 @@ ATM_STRIKE_ROUNDING    = 50      # NIFTY=50, BANKNIFTY=100, FINNIFTY=50
 #  Format : DDMMMYY uppercase  e.g. "19MAR26"
 # ═══════════════════════════════════════════════════════════════════════════════
 
-AUTO_EXPIRY   = True           # True = auto nearest Thursday
-MANUAL_EXPIRY = "27MAR26"      # Used only when AUTO_EXPIRY = False
+AUTO_EXPIRY   = True           # True = auto nearest Tuesday (NIFTY weekly expiry day)
+MANUAL_EXPIRY = "17MAR26"      # Used only when AUTO_EXPIRY = False  (must be a Tuesday)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 9 — STRATEGY NAME
@@ -475,24 +474,34 @@ def telegram(msg: str):
 #  EXPIRY CALCULATION  (DDMMMYY uppercase per OpenAlgo docs)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def nearest_thursday_expiry() -> str:
+def nearest_tuesday_expiry() -> str:
     """
-    Return nearest NIFTY weekly expiry (Thursday) as DDMMMYY.
-    If today IS Thursday and before market close (15:00 IST) → use today.
-    Otherwise → roll to next Thursday.
+    Return nearest NIFTY weekly expiry (TUESDAY) as DDMMMYY.
+
+    ⚠️  IMPORTANT — NSE EXPIRY CHANGE effective September 2, 2025:
+        NIFTY 50 weekly & monthly options now expire every TUESDAY.
+        (Previously Thursday — changed as part of SEBI's F&O restructuring.)
+        Bank Nifty: Wednesday | Sensex/Bankex: Thursday
+
+    Logic:
+      • If today IS Tuesday and before market close (15:30 IST) → use today
+      • If today IS Tuesday and after 15:30 → roll to NEXT Tuesday
+      • Any other day → roll to nearest upcoming Tuesday
     """
     today      = date.today()
-    days_ahead = (3 - today.weekday()) % 7   # 0 if today is Thursday
-    if days_ahead == 0 and now_ist().hour >= 15:
-        days_ahead = 7
+    now        = now_ist()
+    # Tuesday = weekday 1
+    days_ahead = (1 - today.weekday()) % 7   # 0 if today is Tuesday
+    if days_ahead == 0 and now.hour >= 15 and now.minute >= 30:
+        days_ahead = 7   # today's expiry already settled, use next week
     expiry = today + timedelta(days=days_ahead)
     result = expiry.strftime("%d%b%y").upper()
-    pinfo(f"Auto expiry: {result}  (date: {expiry})")
+    pinfo(f"Auto expiry: {result}  (date: {expiry}, {expiry.strftime('%A')})")
     return result
 
 def get_expiry() -> str:
     if AUTO_EXPIRY:
-        return nearest_thursday_expiry()
+        return nearest_tuesday_expiry()
     pinfo(f"Manual expiry: {MANUAL_EXPIRY}")
     return MANUAL_EXPIRY
 
@@ -1664,7 +1673,7 @@ def _print_banner():
     print(f"  Daily target     : Rs.{DAILY_PROFIT_TARGET}  (combined, 0=disabled)", flush=True)
     print(f"  Daily limit      : Rs.{DAILY_LOSS_LIMIT}   (combined, 0=disabled)", flush=True)
     print(f"  Margin guard     : {guard_str}", flush=True)
-    print(f"  Auto expiry      : {AUTO_EXPIRY}  |  Manual : {MANUAL_EXPIRY}", flush=True)
+    print(f"  Auto expiry      : {AUTO_EXPIRY}  |  Manual : {MANUAL_EXPIRY}  (NIFTY expires TUESDAY)", flush=True)
     print(f"  State file       : {os.path.abspath(STATE_FILE)}", flush=True)
     print(f"  Telegram         : {TELEGRAM_ENABLED}", flush=True)
     print("=" * 72, flush=True)
