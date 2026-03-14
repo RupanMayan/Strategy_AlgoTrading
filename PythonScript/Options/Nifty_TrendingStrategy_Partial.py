@@ -1858,9 +1858,25 @@ def show_state():
     print(f"    {'sl_ce (computed)':<24} : Rs.{sl_level('CE'):.2f}", flush=True)
     print(f"    {'sl_pe (computed)':<24} : Rs.{sl_level('PE'):.2f}", flush=True)
     print(f"    {'active_legs':<24} : {active_legs()}", flush=True)
-    dte = get_dte()
-    print(f"    {'current_dte':<24} : DTE{dte} ({DAY_NAMES[date.today().weekday()]})", flush=True)
-    print(f"    {'dte_in_filter':<24} : {dte in TRADE_DTE}  (TRADE_DTE={['DTE'+str(d) for d in sorted(TRADE_DTE)]})", flush=True)
+
+    dte        = get_dte()
+    weekday    = date.today().weekday()
+    is_weekend = weekday >= 5   # 5=Sat, 6=Sun
+
+    print(f"    {'current_dte':<24} : DTE{dte} ({DAY_NAMES[weekday]})", flush=True)
+
+    if is_weekend:
+        print(
+            f"    {'dte_in_filter':<24} : False  "
+            f"(weekend — blocked by weekend guard regardless of DTE)",
+            flush=True
+        )
+    else:
+        print(
+            f"    {'dte_in_filter':<24} : {dte in TRADE_DTE}  "
+            f"(TRADE_DTE={['DTE' + str(d) for d in sorted(TRADE_DTE)]})",
+            flush=True
+        )
     psep()
 
 
