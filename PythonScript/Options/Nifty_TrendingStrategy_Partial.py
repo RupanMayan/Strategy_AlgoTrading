@@ -103,11 +103,11 @@
 ║           which could result in duplicate close orders on a leg.                ║
 ║           close_all() → _close_all_locked() split for clean re-entrancy.        ║
 ║                                                                                  ║
-║   FIX-III NSE holiday calendar added (NSE_HOLIDAYS frozenset). get_dte()        ║
-║           now skips holidays in addition to weekends. Previously, on a          ║
-║           mid-week market holiday (e.g. Holi on Wed), DTE was 1 less than       ║
-║           the AlgoTest figure, potentially causing trades on wrong DTE.          ║
-║           NOTE: NSE_HOLIDAYS must be updated annually (see constant).            ║
+║   FIX-III NSE holiday handling delegated to OpenAlgo Python Strategy            ║
+║           scheduler. OpenAlgo already skips NSE market holidays, so the         ║
+║           internal NSE_HOLIDAYS calendar is unnecessary and has been removed.   ║
+║           get_dte() now skips weekends only (Sat/Sun). The script will never    ║
+║           start on a market holiday because OpenAlgo won't schedule it.         ║
 ║                                                                                  ║
 ║   FIX-IV  _capture_fill_prices() retries increased from 3×1s to 5×(1-4s)      ║
 ║           exponential back-off. On high-VIX days, broker fill reporting can     ║
@@ -214,7 +214,9 @@ MONITOR_INTERVAL_S = 15        # Seconds between P&L / SL checks
 #  SECTION 4 — DTE FILTER  (Days To Expiry)
 #
 #  DTE = TRADING days from today to nearest weekly expiry.
-#  Matches AlgoTest exactly — weekends and market holidays are excluded.
+#  Matches AlgoTest exactly — weekends are excluded.
+#  NSE market holidays are handled by the OpenAlgo Python Strategy scheduler;
+#  the script will not be started on a holiday, so no internal holiday check needed.
 #  Source: AlgoTest DTE filter documentation.
 #
 #  DTE mapping for NIFTY (Tuesday expiry):
@@ -226,7 +228,7 @@ MONITOR_INTERVAL_S = 15        # Seconds between P&L / SL checks
 #    DTE5 = Tuesday   (5 trading days before)  — prev week expiry day
 #    DTE6 = Monday    (6 trading days before)  — prev week Monday
 #
-#  NOTE: DTE uses TRADING days only (Mon–Fri, excluding holidays).
+#  NOTE: DTE uses TRADING days only (Mon–Fri, excluding weekends).
 #        Calendar days give WRONG numbers — Fri would be DTE4 in calendar mode
 #        but is correctly DTE2 in trading-day mode (matching AlgoTest).
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -358,49 +360,6 @@ MONTH_NAMES = {
     5: "May",       6: "June",     7: "July",      8: "August",
     9: "September", 10: "October", 11: "November", 12: "December",
 }
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  NSE TRADING HOLIDAYS
-#
-#  DTE calculation skips these dates in addition to weekends.
-#  On a market holiday (weekday with no trading), the "true" DTE is one more
-#  than the simple weekend-skip count — including holidays makes DTE match
-#  AlgoTest exactly on holiday weeks.
-#
-#  !! ACTION REQUIRED !!
-#  Update this set at the start of EACH new calendar year from:
-#    https://www.nseindia.com/resources/exchange-communication-holidays
-#
-#  Leave out Saturday/Sunday entries — those are already excluded by weekday
-#  check. Only add weekday (Mon–Fri) market closures.
-# ─────────────────────────────────────────────────────────────────────────────
-NSE_HOLIDAYS: frozenset = frozenset({
-    # ── 2025 (confirmed NSE equity market holidays) ──────────────────────────
-    date(2025,  1, 26),   # Republic Day              (Sunday  — mkt already closed)
-    date(2025,  2, 26),   # Mahashivratri             (Wednesday)
-    date(2025,  3, 14),   # Holi                      (Friday)
-    date(2025,  4, 10),   # Shri Ram Navami           (Thursday)
-    date(2025,  4, 14),   # Dr. Ambedkar Jayanti      (Monday)
-    date(2025,  4, 18),   # Good Friday               (Friday)
-    date(2025,  5,  1),   # Maharashtra Day           (Thursday)
-    date(2025,  8, 15),   # Independence Day          (Friday)
-    date(2025, 10,  2),   # Gandhi Jayanti            (Thursday)
-    date(2025, 10,  2),   # Dussehra (same day)       (Thursday)
-    date(2025, 10, 20),   # Diwali Laxmi Puja         (Monday)  ← verify
-    date(2025, 10, 21),   # Diwali Balipratipada      (Tuesday) ← verify
-    date(2025, 11,  5),   # Gurunanak Jayanti         (Wednesday)
-    date(2025, 12, 25),   # Christmas                 (Thursday)
-
-    # ── 2026 (fixed-date national holidays — floating dates TBD) ─────────────
-    # !! IMPORTANT: Add all NSE-announced 2026 holidays before Jan 2026 !!
-    date(2026,  1, 26),   # Republic Day              (Monday)
-    date(2026,  4, 14),   # Dr. Ambedkar Jayanti      (Tuesday)
-    date(2026,  5,  1),   # Maharashtra Day           (Friday)
-    date(2026,  8, 15),   # Independence Day          (Saturday — mkt already closed)
-    date(2026, 10,  2),   # Gandhi Jayanti            (Friday)
-    date(2026, 12, 25),   # Christmas                 (Friday)
-    # Floating holidays (Holi, Diwali, Eid, Good Friday etc.) — ADD WHEN KNOWN
-})
 
 # Monitor job + state mutation guard (RLock — reentrant so close_all can call
 # close_one_leg while both hold the lock within the same call chain).
@@ -722,9 +681,9 @@ def _get_expiry_date_silent() -> date:
 #     and Friday = DTE2."
 #
 #  We count Mon–Fri only between today and expiry, excluding weekends.
-#  We do NOT have an NSE holiday calendar, so we skip only weekends (Sat/Sun).
-#  On rare market holidays that fall mid-week, DTE may be off by 1 vs AlgoTest.
-#  This is an acceptable edge case for a production system.
+#  NSE market holidays are handled upstream by the OpenAlgo Python Strategy
+#  scheduler — the script is never started on a market holiday, so no internal
+#  holiday calendar is needed here.
 #
 #  FIX-1 (v5.0.0): get_dte() now uses _get_expiry_date_silent() instead of
 #  get_expiry(), which previously logged "Auto expiry: …" on every 15s tick.
@@ -746,17 +705,17 @@ def get_dte() -> int:
       DTE6 = Monday   (previous week)
 
     Uses now_ist().date() (not date.today()) to be timezone-safe.
-    Skips NSE_HOLIDAYS in addition to Sat/Sun for accurate AlgoTest match.
+    Skips Sat/Sun only. NSE market holidays are handled by the OpenAlgo scheduler.
     """
     today       = now_ist().date()    # IST date — not OS date (critical fix)
     expiry_date = _get_expiry_date_silent()
 
-    # Count Mon–Fri non-holiday days between today (exclusive) and expiry (inclusive)
+    # Count Mon–Fri days between today (exclusive) and expiry (inclusive)
     dte     = 0
     current = today
     while current < expiry_date:
         current += timedelta(days=1)
-        if current.weekday() < 5 and current not in NSE_HOLIDAYS:
+        if current.weekday() < 5:
             dte += 1
 
     pdebug(
