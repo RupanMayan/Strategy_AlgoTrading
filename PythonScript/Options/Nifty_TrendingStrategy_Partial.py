@@ -231,10 +231,10 @@ MONITOR_INTERVAL_S = 15        # Seconds between P&L / SL checks
 #        but is correctly DTE2 in trading-day mode (matching AlgoTest).
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TRADE_DTE = [0, 1]             # DTE0=Tue (expiry), DTE1=Mon — peak theta days
+# TRADE_DTE = [0, 1]             # DTE0=Tue (expiry), DTE1=Mon — peak theta days
 # TRADE_DTE = [0]              # Expiry day only — most aggressive theta capture
 # TRADE_DTE = [0, 1, 2]       # Tue + Mon + Fri
-# TRADE_DTE = [0, 1, 2, 3, 4] # Full expiry week (all 5 trading days)
+TRADE_DTE = [0, 1, 2, 3, 4] # Full expiry week (all 5 trading days)
 # TRADE_DTE = [0, 1, 2, 3, 4, 5, 6]  # All days — previous + current expiry week
 
 # ═══════════════════════════════════════════════════════════════════════════════
