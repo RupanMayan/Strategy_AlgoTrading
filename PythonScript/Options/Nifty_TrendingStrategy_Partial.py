@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v5.0.0                     ║
+║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v5.1.0                     ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -86,6 +86,24 @@
 ║   FIX-11 In dte_filter_ok(), telegram() is called only on SKIP_MONTHS.        ║
 ║          DTE-filtered skip days produce no Telegram alert. This is intentional ║
 ║          (DTE filter fires every non-trade day). No change.                     ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║   v5.1.0 FIXES  (second-pass audit)                                             ║
+║                                                                                  ║
+║   FIX-A  Double get_expiry() call: job_entry() resolved expiry for margin      ║
+║          check, then place_entry() called get_expiry() again independently.     ║
+║          Two "Auto expiry" log lines per trade day; tiny race window if the     ║
+║          Tuesday 15:30 boundary falls between the two calls (theoretical).      ║
+║          Fixed: place_entry(expiry) now accepts expiry as a parameter.          ║
+║          job_entry() resolves expiry ONCE, passes it to both                   ║
+║          check_margin_sufficient() and place_entry(). Single source of truth.  ║
+║                                                                                  ║
+║   FIX-B  FIX-3 edge case: if no monitor tick has run yet when close_all()      ║
+║          fires (window: 0–15s after entry), today_pnl=0 so open_mtm_snapshot   ║
+║          = 0-0 = 0, meaning final P&L shows Rs.0 despite live position value.  ║
+║          Fixed: close_all() now detects the no-tick case (today_pnl==0 with    ║
+║          both legs active + entry prices captured) and fetches live LTPs        ║
+║          directly to compute a real open_mtm. Falls back gracefully to the      ║
+║          existing today_pnl snapshot if either LTP fetch fails.                ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   DTE REFERENCE (NIFTY, Tuesday expiry, trading days per AlgoTest)             ║
 ║   DTE0 = Tuesday   expiry day          — peak theta                            ║
@@ -287,7 +305,7 @@ STATE_FILE = "strategy_state.json"
 #  INTERNAL CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "5.0.0"
+VERSION     = "5.1.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -976,9 +994,15 @@ def check_margin_sufficient(expiry: str) -> bool:
 #  ENTRY — Short ATM Straddle (SELL CE + SELL PE)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def place_entry() -> bool:
+def place_entry(expiry: str) -> bool:
     """
     Place both legs atomically via optionsmultiorder().
+
+    Parameters
+    ----------
+    expiry : str
+        Expiry string already resolved by job_entry() — e.g. "25MAR26".
+        Passed in to avoid a second get_expiry() call (FIX-A v5.1.0).
 
     Success path:
       • Both legs filled → ce_active=True, pe_active=True
@@ -990,7 +1014,6 @@ def place_entry() -> bool:
       • API exception / rejected → Returns False, nothing opened
       • One leg filled, other failed → emergency close, Returns False
     """
-    expiry = get_expiry()
 
     psep()
     pinfo("PLACING ENTRY — Short ATM Straddle  [PARTIAL SQUARE OFF]")
@@ -1293,14 +1316,15 @@ def close_all(reason: str = "Scheduled Exit"):
     NO legs active   → no-op
 
     FIX-3 (v5.0.0): When using atomic closeposition() for both legs,
-    we snapshot the current open MTM from the last monitor tick and add
-    it to closed_pnl before calling _mark_fully_flat(). This ensures the
-    final P&L summary is meaningful rather than showing Rs.0.
-    (closeposition() does not update closed_pnl — only close_one_leg() does.)
+    snapshot open MTM from the last monitor tick into closed_pnl before
+    calling _mark_fully_flat(), so final P&L is meaningful.
 
-    FIX-8 (v5.0.0): When ONE leg is active, we fetch its current LTP before
-    calling close_one_leg() so the approx_pnl is populated in closed_pnl,
-    giving _mark_fully_flat() an accurate final P&L.
+    FIX-B (v5.1.0): Edge case where no monitor tick has run yet (window:
+    0–15s after entry). In that case today_pnl==0 and closed_pnl==0, so
+    FIX-3's snapshot gives Rs.0 even though positions have live value.
+    Detection: both legs active + entry prices captured + today_pnl==0.
+    Resolution: fetch live LTPs directly to compute a real open_mtm.
+    Fallback: if either LTP fetch fails, use today_pnl snapshot (FIX-3).
     """
     if not state["in_position"]:
         pinfo(f"close_all() — no open position ({reason!r}), nothing to do")
@@ -1332,15 +1356,48 @@ def close_all(reason: str = "Scheduled Exit"):
             return
 
         if isinstance(resp, dict) and resp.get("status") == "success":
-            # FIX-3: Snapshot open MTM into closed_pnl so final P&L is correct.
-            # state["today_pnl"] was set by the most recent monitor tick:
+            # ── Compute open_mtm for final P&L summary ────────────────────────
+            #
+            # FIX-B: If today_pnl == 0 AND both entry prices are known,
+            # no monitor tick has run yet — fetch live LTPs directly.
+            # This handles the 0–15s window between entry and first tick.
+            #
+            # Normal path (FIX-3): today_pnl was set by last monitor tick.
             #   today_pnl = closed_pnl + open_mtm
-            # So: open_mtm_snapshot = today_pnl - closed_pnl
-            # We add this to closed_pnl before marking flat.
-            open_mtm_snapshot = state["today_pnl"] - state["closed_pnl"]
+            #   → open_mtm_snapshot = today_pnl - closed_pnl
+            #
+            ce_px = state["entry_price_ce"]
+            pe_px = state["entry_price_pe"]
+            no_tick_yet = (
+                state["today_pnl"] == 0.0
+                and state["closed_pnl"] == 0.0
+                and ce_px > 0
+                and pe_px > 0
+            )
+
+            if no_tick_yet:
+                pinfo("No monitor tick yet — fetching live LTPs for P&L estimate")
+                ltp_ce = _fetch_ltp("CE")
+                ltp_pe = _fetch_ltp("PE")
+                if ltp_ce > 0 and ltp_pe > 0:
+                    open_mtm_snapshot = (
+                        (ce_px - ltp_ce) * qty() +
+                        (pe_px - ltp_pe) * qty()
+                    )
+                    pinfo(
+                        f"  Live LTPs: CE Rs.{ltp_ce:.2f}  PE Rs.{ltp_pe:.2f}  "
+                        f"→ open_mtm Rs.{open_mtm_snapshot:.0f}"
+                    )
+                else:
+                    pwarn("LTP fetch failed in no-tick path — P&L summary will show Rs.0")
+                    open_mtm_snapshot = 0.0
+            else:
+                # Normal FIX-3 path: derive open_mtm from last monitor tick
+                open_mtm_snapshot = state["today_pnl"] - state["closed_pnl"]
+
             state["closed_pnl"] += open_mtm_snapshot
-            state["ce_active"]  = False
-            state["pe_active"]  = False
+            state["ce_active"]   = False
+            state["pe_active"]   = False
             _mark_fully_flat(reason=reason)
         else:
             err = resp.get("message", str(resp)) if isinstance(resp, dict) else str(resp)
@@ -1358,7 +1415,6 @@ def close_all(reason: str = "Scheduled Exit"):
         # ── One leg remaining — fetch LTP for accurate P&L then close ────────
         leg = active[0]
         pinfo(f"Only {leg} active → fetching LTP then close_one_leg({leg})")
-        # FIX-8: fetch LTP so close_one_leg() can compute approx_pnl accurately
         ltp = _fetch_ltp(leg)
         if ltp <= 0:
             pwarn(f"  LTP fetch failed for {leg} — P&L estimate will be Rs.0")
@@ -1780,6 +1836,11 @@ def job_entry():
       3. VIX filter
       4. Margin guard (cash + collateral >= required × buffer)
       5. Reset daily counters and place straddle entry
+
+    FIX-A (v5.1.0): expiry resolved ONCE here, passed to both
+    check_margin_sufficient() and place_entry() — single source of truth,
+    eliminates the double get_expiry() call and the theoretical race window
+    at the Tuesday 15:30 boundary.
     """
     psep()
     pinfo(f"ENTRY JOB | {now_ist().strftime('%A %d-%b-%Y %H:%M:%S IST')}")
@@ -1798,17 +1859,19 @@ def job_entry():
     if not vix_ok():
         return
 
-    # ── 4. Pre-trade margin guard ─────────────────────────────────────────────
+    # ── 4. Resolve expiry ONCE — used for both margin check and order entry ───
     expiry = get_expiry()
+
+    # ── 5. Pre-trade margin guard ─────────────────────────────────────────────
     if not check_margin_sufficient(expiry):
         perr("Entry ABORTED — insufficient margin (cash + collateral)")
         return
 
-    # ── 5. Reset daily counters and place entry ───────────────────────────────
+    # ── 6. Reset daily counters and place entry ───────────────────────────────
     state["today_pnl"]  = 0.0
     state["closed_pnl"] = 0.0
 
-    success = place_entry()
+    success = place_entry(expiry)
     if not success:
         perr("Entry FAILED — no position opened today")
         telegram("Entry FAILED — no position opened. Check logs.")
