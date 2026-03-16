@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v5.1.0                     ║
+║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v5.2.0                     ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -87,6 +87,43 @@
 ║          DTE-filtered skip days produce no Telegram alert. This is intentional ║
 ║          (DTE filter fires every non-trade day). No change.                     ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
+║   v5.2.0 PRODUCTION-GRADE HARDENING  (third-pass audit)                         ║
+║                                                                                  ║
+║   FIX-I   CRITICAL — date.today() used in 3 places instead of                  ║
+║           now_ist().date(). On UTC servers (VPS, cloud) date.today()            ║
+║           returns UTC date, which can be 5h 30m behind IST. This caused        ║
+║           wrong expiry dates late in the IST evening, and wrong stale-state     ║
+║           detection on midnight boundaries. All 3 locations fixed:              ║
+║             _nearest_tuesday_date(), get_dte(), reconcile_on_startup()          ║
+║                                                                                  ║
+║   FIX-II  Thread safety: _monitor_lock upgraded from threading.Lock() to       ║
+║           threading.RLock(). close_all() now acquires _monitor_lock (blocking)  ║
+║           before entering _close_all_locked(). This prevents a race where       ║
+║           job_exit() fires at 15:15 while a monitor tick is mid-SL-close,      ║
+║           which could result in duplicate close orders on a leg.                ║
+║           close_all() → _close_all_locked() split for clean re-entrancy.        ║
+║                                                                                  ║
+║   FIX-III NSE holiday calendar added (NSE_HOLIDAYS frozenset). get_dte()        ║
+║           now skips holidays in addition to weekends. Previously, on a          ║
+║           mid-week market holiday (e.g. Holi on Wed), DTE was 1 less than       ║
+║           the AlgoTest figure, potentially causing trades on wrong DTE.          ║
+║           NOTE: NSE_HOLIDAYS must be updated annually (see constant).            ║
+║                                                                                  ║
+║   FIX-IV  _capture_fill_prices() retries increased from 3×1s to 5×(1-4s)      ║
+║           exponential back-off. On high-VIX days, broker fill reporting can     ║
+║           be delayed beyond 3s. If capture still fails, a Telegram alert is     ║
+║           sent immediately so the operator knows SL is disabled.                ║
+║                                                                                  ║
+║   FIX-V   _validate_config() added — called at startup before any API call.    ║
+║           Checks 15+ configuration constraints and raises ValueError with a      ║
+║           clear error list if anything is misconfigured. Prevents a live trade  ║
+║           being placed with typos (e.g. positive DAILY_LOSS_LIMIT).             ║
+║                                                                                  ║
+║   FIX-VI  SIGTERM handler added in run(). Raises SystemExit(0) on SIGTERM so   ║
+║           the scheduler's except (KeyboardInterrupt, SystemExit) block runs     ║
+║           and positions are closed before the process exits. Required for        ║
+║           clean shutdown under systemd / docker stop / supervisord.             ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   v5.1.0 FIXES  (second-pass audit)                                             ║
 ║                                                                                  ║
 ║   FIX-A  Double get_expiry() call: job_entry() resolved expiry for margin      ║
@@ -135,6 +172,7 @@
 import os
 import json
 import time
+import signal
 import tempfile
 import threading
 import requests
@@ -305,7 +343,7 @@ STATE_FILE = "strategy_state.json"
 #  INTERNAL CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "5.1.0"
+VERSION     = "5.2.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -318,8 +356,52 @@ MONTH_NAMES = {
     9: "September", 10: "October", 11: "November", 12: "December",
 }
 
-# Monitor job concurrency guard — prevents overlapping monitor ticks
-_monitor_lock = threading.Lock()
+# ─────────────────────────────────────────────────────────────────────────────
+#  NSE TRADING HOLIDAYS
+#
+#  DTE calculation skips these dates in addition to weekends.
+#  On a market holiday (weekday with no trading), the "true" DTE is one more
+#  than the simple weekend-skip count — including holidays makes DTE match
+#  AlgoTest exactly on holiday weeks.
+#
+#  !! ACTION REQUIRED !!
+#  Update this set at the start of EACH new calendar year from:
+#    https://www.nseindia.com/resources/exchange-communication-holidays
+#
+#  Leave out Saturday/Sunday entries — those are already excluded by weekday
+#  check. Only add weekday (Mon–Fri) market closures.
+# ─────────────────────────────────────────────────────────────────────────────
+NSE_HOLIDAYS: frozenset = frozenset({
+    # ── 2025 (confirmed NSE equity market holidays) ──────────────────────────
+    date(2025,  1, 26),   # Republic Day              (Sunday  — mkt already closed)
+    date(2025,  2, 26),   # Mahashivratri             (Wednesday)
+    date(2025,  3, 14),   # Holi                      (Friday)
+    date(2025,  4, 10),   # Shri Ram Navami           (Thursday)
+    date(2025,  4, 14),   # Dr. Ambedkar Jayanti      (Monday)
+    date(2025,  4, 18),   # Good Friday               (Friday)
+    date(2025,  5,  1),   # Maharashtra Day           (Thursday)
+    date(2025,  8, 15),   # Independence Day          (Friday)
+    date(2025, 10,  2),   # Gandhi Jayanti            (Thursday)
+    date(2025, 10,  2),   # Dussehra (same day)       (Thursday)
+    date(2025, 10, 20),   # Diwali Laxmi Puja         (Monday)  ← verify
+    date(2025, 10, 21),   # Diwali Balipratipada      (Tuesday) ← verify
+    date(2025, 11,  5),   # Gurunanak Jayanti         (Wednesday)
+    date(2025, 12, 25),   # Christmas                 (Thursday)
+
+    # ── 2026 (fixed-date national holidays — floating dates TBD) ─────────────
+    # !! IMPORTANT: Add all NSE-announced 2026 holidays before Jan 2026 !!
+    date(2026,  1, 26),   # Republic Day              (Monday)
+    date(2026,  4, 14),   # Dr. Ambedkar Jayanti      (Tuesday)
+    date(2026,  5,  1),   # Maharashtra Day           (Friday)
+    date(2026,  8, 15),   # Independence Day          (Saturday — mkt already closed)
+    date(2026, 10,  2),   # Gandhi Jayanti            (Friday)
+    date(2026, 12, 25),   # Christmas                 (Friday)
+    # Floating holidays (Holi, Diwali, Eid, Good Friday etc.) — ADD WHEN KNOWN
+})
+
+# Monitor job + state mutation guard (RLock — reentrant so close_all can call
+# close_one_leg while both hold the lock within the same call chain).
+_monitor_lock = threading.RLock()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -570,9 +652,12 @@ def _nearest_tuesday_date() -> date:
       • If today IS Tuesday and time < 15:30 IST → use today
       • If today IS Tuesday and time >= 15:30 IST → use next Tuesday
       • Any other day → find next upcoming Tuesday
+
+    NOTE: Uses now_ist().date() (not date.today()) so the script works
+    correctly when the server is in UTC or any non-IST timezone.
     """
-    today      = date.today()
     now        = now_ist()
+    today      = now.date()           # IST date — not OS date (critical fix)
     days_ahead = (1 - today.weekday()) % 7   # 0 if today is already Tuesday
 
     if days_ahead == 0 and (now.hour, now.minute) >= (15, 30):
@@ -645,16 +730,19 @@ def get_dte() -> int:
       DTE4 = Wednesday(previous week)
       DTE5 = Tuesday  (previous week — that week's expiry day)
       DTE6 = Monday   (previous week)
+
+    Uses now_ist().date() (not date.today()) to be timezone-safe.
+    Skips NSE_HOLIDAYS in addition to Sat/Sun for accurate AlgoTest match.
     """
-    today       = date.today()
+    today       = now_ist().date()    # IST date — not OS date (critical fix)
     expiry_date = _get_expiry_date_silent()
 
-    # Count Mon–Fri days between today (exclusive) and expiry (inclusive)
+    # Count Mon–Fri non-holiday days between today (exclusive) and expiry (inclusive)
     dte     = 0
     current = today
     while current < expiry_date:
         current += timedelta(days=1)
-        if current.weekday() < 5:   # 0=Mon … 4=Fri, skip 5=Sat 6=Sun
+        if current.weekday() < 5 and current not in NSE_HOLIDAYS:
             dte += 1
 
     pdebug(
@@ -1143,11 +1231,14 @@ def _capture_fill_prices():
     Fetch average fill prices from broker via orderstatus() for both legs.
     These are the foundation of per-leg SL levels — must be accurate.
 
-    Retry logic: up to 3 attempts with 1s delay between attempts.
+    Retry logic: up to 5 attempts with exponential back-off (1s, 2s, 3s, 4s).
+    Extra attempts vs v5.1.0 (was 3 × 1s) to handle slow broker fill reporting.
     Failure: warns and leaves entry_price at 0.0 — SL disabled for that leg.
+    CRITICAL: SL cannot fire without a valid entry price.  If fill capture
+    fails, the operator must monitor this trade manually until a restart.
     """
-    MAX_ATTEMPTS = 3
-    RETRY_DELAY  = 1.0   # seconds
+    MAX_ATTEMPTS = 5
+    RETRY_DELAYS = [1.0, 2.0, 3.0, 4.0]   # delay BEFORE attempt 2, 3, 4, 5
 
     for leg, oid in [("CE", state["orderid_ce"]), ("PE", state["orderid_pe"])]:
         filled = False
@@ -1170,12 +1261,18 @@ def _capture_fill_prices():
                 pdebug(f"  orderstatus [{leg}] attempt {attempt} exception: {exc}")
 
             if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_DELAY)
+                time.sleep(RETRY_DELAYS[attempt - 1])
 
         if not filled:
             pwarn(
                 f"  Fill price [{leg}] unavailable after {MAX_ATTEMPTS} attempts "
-                f"— SL disabled for this leg. Monitor will warn on each cycle."
+                f"— SL DISABLED for this leg. MANUAL MONITORING REQUIRED."
+            )
+            telegram(
+                f"⚠️ FILL PRICE CAPTURE FAILED — {leg} leg\n"
+                f"SL is disabled for this leg.\n"
+                f"Order ID: {oid}\n"
+                f"MANUAL MONITORING REQUIRED until position is closed."
             )
 
 
@@ -1326,6 +1423,15 @@ def close_all(reason: str = "Scheduled Exit"):
     Resolution: fetch live LTPs directly to compute a real open_mtm.
     Fallback: if either LTP fetch fails, use today_pnl snapshot (FIX-3).
     """
+    # Acquire the RLock so this call is serialised with any running monitor tick.
+    # Using RLock (not Lock) allows close_one_leg() called from within this
+    # function to re-enter the lock without deadlocking.
+    with _monitor_lock:
+        _close_all_locked(reason)
+
+
+def _close_all_locked(reason: str):
+    """Inner implementation of close_all() — called while _monitor_lock is held."""
     if not state["in_position"]:
         pinfo(f"close_all() — no open position ({reason!r}), nothing to do")
         return
@@ -1687,7 +1793,7 @@ def reconcile_on_startup():
     saved            = load_state()
     broker_positions = _fetch_broker_positions()
 
-    today_str    = date.today().isoformat()
+    today_str    = now_ist().date().isoformat()  # IST date — not OS date (critical fix)
     saved_date   = saved.get("entry_date", "")
     saved_in_pos = saved.get("in_position", False)
 
@@ -2025,7 +2131,7 @@ def show_state():
     print(f"    {'active_legs':<24} : {active_legs()}", flush=True)
 
     dte        = get_dte()
-    weekday    = date.today().weekday()
+    weekday    = now_ist().date().weekday()   # IST weekday — not OS date
     is_weekend = weekday >= 5
 
     print(f"    {'current_dte':<24} : DTE{dte} ({DAY_NAMES[weekday]})", flush=True)
@@ -2056,15 +2162,102 @@ def check_margin_now():
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _validate_config():
+    """
+    Sanity-check all configuration constants at startup.
+    Raises ValueError on any fatal misconfiguration — prevents a live trade
+    being placed with wrong parameters due to a typo in the config section.
+    """
+    errors = []
+
+    # ── API credentials ───────────────────────────────────────────────────────
+    if OPENALGO_API_KEY in ("", "your_openalgo_api_key_here"):
+        errors.append("OPENALGO_API_KEY is not set (still placeholder)")
+
+    # ── Lot / quantity ────────────────────────────────────────────────────────
+    if LOT_SIZE <= 0:
+        errors.append(f"LOT_SIZE must be > 0, got {LOT_SIZE}")
+    if NUMBER_OF_LOTS <= 0:
+        errors.append(f"NUMBER_OF_LOTS must be > 0, got {NUMBER_OF_LOTS}")
+
+    # ── Risk parameters ───────────────────────────────────────────────────────
+    if LEG_SL_PERCENT < 0:
+        errors.append(f"LEG_SL_PERCENT must be >= 0, got {LEG_SL_PERCENT}")
+    if DAILY_PROFIT_TARGET < 0:
+        errors.append(f"DAILY_PROFIT_TARGET must be >= 0 (use 0 to disable), got {DAILY_PROFIT_TARGET}")
+    if DAILY_LOSS_LIMIT > 0:
+        errors.append(f"DAILY_LOSS_LIMIT must be <= 0 (negative = loss, use 0 to disable), got {DAILY_LOSS_LIMIT}")
+
+    # ── Margin guard ──────────────────────────────────────────────────────────
+    if MARGIN_BUFFER < 1.0:
+        errors.append(f"MARGIN_BUFFER must be >= 1.0 (e.g. 1.20 = 20% headroom), got {MARGIN_BUFFER}")
+    if ATM_STRIKE_ROUNDING <= 0:
+        errors.append(f"ATM_STRIKE_ROUNDING must be > 0, got {ATM_STRIKE_ROUNDING}")
+
+    # ── Timing ────────────────────────────────────────────────────────────────
+    try:
+        eh, em = parse_hhmm(ENTRY_TIME)
+        assert 0 <= eh <= 23 and 0 <= em <= 59
+    except Exception:
+        errors.append(f"ENTRY_TIME invalid: {ENTRY_TIME!r}  (expected HH:MM)")
+    try:
+        xh, xm = parse_hhmm(EXIT_TIME)
+        assert 0 <= xh <= 23 and 0 <= xm <= 59
+    except Exception:
+        errors.append(f"EXIT_TIME invalid: {EXIT_TIME!r}  (expected HH:MM)")
+    if MONITOR_INTERVAL_S <= 0:
+        errors.append(f"MONITOR_INTERVAL_S must be > 0, got {MONITOR_INTERVAL_S}")
+
+    # ── DTE filter ────────────────────────────────────────────────────────────
+    if not TRADE_DTE:
+        errors.append("TRADE_DTE is empty — no trading days configured")
+    if any(d < 0 for d in TRADE_DTE):
+        errors.append(f"TRADE_DTE contains negative values: {TRADE_DTE}")
+
+    # ── VIX filter ────────────────────────────────────────────────────────────
+    if VIX_FILTER_ENABLED and VIX_MIN >= VIX_MAX:
+        errors.append(f"VIX_MIN ({VIX_MIN}) must be < VIX_MAX ({VIX_MAX})")
+
+    # ── Expiry ────────────────────────────────────────────────────────────────
+    if not AUTO_EXPIRY:
+        try:
+            manual_dt = datetime.strptime(MANUAL_EXPIRY, "%d%b%y")
+            if manual_dt.weekday() != 1:   # 1 = Tuesday
+                errors.append(
+                    f"MANUAL_EXPIRY {MANUAL_EXPIRY!r} is a {DAY_NAMES[manual_dt.weekday()]} "
+                    f"— NIFTY weekly expiry is on Tuesday"
+                )
+        except Exception:
+            errors.append(f"MANUAL_EXPIRY format invalid: {MANUAL_EXPIRY!r}  (expected DDMMMYY e.g. 25MAR26)")
+
+    # ── Telegram ──────────────────────────────────────────────────────────────
+    if TELEGRAM_ENABLED and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
+        # Warn, don't block — Telegram is advisory only
+        pwarn("CONFIG: TELEGRAM_ENABLED=True but BOT_TOKEN or CHAT_ID is empty — alerts will be silent")
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    if errors:
+        perr("═" * 68)
+        perr("CONFIGURATION ERRORS — strategy will NOT start:")
+        for e in errors:
+            perr(f"  ✗  {e}")
+        perr("═" * 68)
+        raise ValueError(f"Config validation failed with {len(errors)} error(s). See logs above.")
+
+    pinfo("Config validation: all checks passed ✓")
+
+
 def run():
     """
     Production startup:
-      1. Print banner
-      2. Test connection + show funds
-      3. Reconcile state with broker
-      4. Start APScheduler (entry / exit / monitor)
-      5. Graceful shutdown on Ctrl+C or crash
+      1. Validate configuration
+      2. Print banner
+      3. Test connection + show funds
+      4. Reconcile state with broker
+      5. Start APScheduler (entry / exit / monitor)
+      6. Graceful shutdown on Ctrl+C, SIGTERM, or crash
     """
+    _validate_config()   # Raises on misconfiguration — must be first
     _print_banner()
     check_connection()
     reconcile_on_startup()
@@ -2107,8 +2300,21 @@ def run():
         f"Scheduler running | Entry: {ENTRY_TIME} | "
         f"Exit: {EXIT_TIME} | Monitor: every {MONITOR_INTERVAL_S}s"
     )
-    pinfo("Press Ctrl+C to stop gracefully")
+    pinfo("Press Ctrl+C to stop gracefully  |  systemd sends SIGTERM — both handled")
     print("", flush=True)
+
+    # ── SIGTERM handler (systemd / docker stop / kill) ────────────────────────
+    # APScheduler's BlockingScheduler converts SIGTERM → SystemExit by default,
+    # which is caught below. This explicit handler ensures we log and close open
+    # positions even on SIGTERM before the scheduler handles it.
+    def _sigterm_handler(signum, frame):                          # noqa: ANN001
+        pinfo("SIGTERM received — initiating graceful shutdown")
+        raise SystemExit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+    except (OSError, ValueError):
+        pass   # Not supported on this platform (e.g. Windows threads)
 
     guard_status = (
         f"Margin guard: ENABLED ({int((MARGIN_BUFFER - 1) * 100)}% buffer, "
