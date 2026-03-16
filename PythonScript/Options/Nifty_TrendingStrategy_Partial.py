@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v4.2.1                     ║
+║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v5.0.0                     ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -30,47 +30,62 @@
 ║              combined = closed_leg_pnl + open_leg_mtm                          ║
 ║      If either breaches → close ALL remaining open legs                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
-║   v4.2.0 FIXES  (AlgoTest DTE parity)                                          ║
-║   BUG 1 FIX: TRADE_DTE was entirely commented out → NameError on startup.      ║
-║              Now correctly defined as an active assignment.                     ║
-║   BUG 2 FIX: get_dte() used calendar days. AlgoTest uses TRADING days          ║
-║              (excludes weekends + holidays). Calendar gives wrong DTE for       ║
-║              Fri/Thu/Wed. Now counts Mon–Fri only, matching AlgoTest exactly.   ║
-║              Verified: Fri=DTE2, Thu=DTE3, Wed=DTE4 (was DTE4/5/6 before).     ║
-║   BUG 3 FIX: _print_banner() _dte_to_day map only covered DTE0–4, returned    ║
-║              '?' for DTE5/DTE6. Now dynamically computed from expiry date,     ║
-║              works correctly for all DTE values including DTE5 and DTE6.       ║
-╠══════════════════════════════════════════════════════════════════════════════════╣
-║   v4.2.1 FIX  (Weekend guard in dte_filter_ok)                                  ║
-║   BUG: Friday, Saturday, Sunday all returned the same DTE value because the     ║
-║        trading-day loop counts only Mon–Fri between today and expiry.           ║
-║        Fri→Tue = Mon(1)+Tue(2) = DTE2. Sat→Tue = Mon(1)+Tue(2) = DTE2.        ║
-║        So TRADE_DTE=[0,1,2] would technically allow a Saturday manual trade.    ║
-║   FIX: dte_filter_ok() now explicitly rejects Saturday and Sunday first,        ║
-║        before computing DTE. Weekends are never valid trading days per           ║
-║        AlgoTest — they don't appear in backtest data at all.                    ║
-║        Log: "Saturday is not a trading day — skipping" (clear, unambiguous).    ║
-║        Production impact: zero (scheduler already restricts to mon-fri).        ║
-║        Manual entry on weekends: now correctly and cleanly rejected.            ║
-╠══════════════════════════════════════════════════════════════════════════════════╣
-║   v4.1.0 CHANGES (retained)                                                     ║
-║   • TRADE_DAYS (weekday) → TRADE_DTE (Days To Expiry)                          ║
-║   • Bug fix: _mark_fully_flat() P&L uses closed_pnl (authoritative)           ║
-║   • Bug fix: reconcile Case B entry_time uses IST.localize()                   ║
-╠══════════════════════════════════════════════════════════════════════════════════╣
-║   v4.0.0 FEATURES (retained)                                                    ║
-║   • PRE-TRADE MARGIN GUARD: funds() + margin() basket check before entry       ║
-║   • ATM STRIKE FETCH: LTP-based ATM strike for accurate margin estimate        ║
-║   • ATOMIC STATE WRITE: temp-file + rename prevents corrupt state on crash     ║
-║   • FILL PRICE RETRY: 3 attempts with 1s delay to fetch orderstatus fills      ║
-║   • MONITOR THREAD GUARD: concurrent monitor calls blocked via threading.Lock  ║
-╠══════════════════════════════════════════════════════════════════════════════════╣
-║   RESTART SAFETY                                                                 ║
-║   • State persisted atomically after every single mutation                     ║
-║   • Each leg's active/closed status tracked and persisted independently        ║
-║   • On restart: reconciles with live positionbook() before scheduler starts    ║
-║   • 5 cases handled: fresh / restore partial / restore full /                  ║
-║                       externally closed / stale / orphan                       ║
+║   v5.0.0 AUDIT FIXES  (full code review from v4.2.1)                           ║
+║                                                                                  ║
+║   FIX-1  get_dte() calls get_expiry() which calls nearest_tuesday_expiry()     ║
+║          which logs "Auto expiry: …" on EVERY monitor tick (every 15s).        ║
+║          Fixed: split _compute_expiry_date() as a silent helper; logging        ║
+║          only in get_expiry() for entry-path calls.                             ║
+║                                                                                  ║
+║   FIX-2  _print_banner() calls get_expiry() (via _dte_to_dayname) once per     ║
+║          DTE value in TRADE_DTE — O(n) API+log calls at startup.               ║
+║          Fixed: compute expiry once, pass to _dte_to_dayname().                 ║
+║                                                                                  ║
+║   FIX-3  close_all() — when both legs active, uses closeposition() then        ║
+║          calls _mark_fully_flat() which uses state["closed_pnl"] as final      ║
+║          P&L. But closed_pnl is only updated by close_one_leg(), not by        ║
+║          closeposition(). So final P&L = 0.0 (wrong).                          ║
+║          Fixed: add open_mtm snapshot to closed_pnl before calling             ║
+║          _mark_fully_flat() when using the atomic closeposition() path.         ║
+║                                                                                  ║
+║   FIX-4  _capture_fill_prices() sleeps AFTER the last attempt (attempt==3      ║
+║          still calls time.sleep()). The guard `if attempt < MAX_ATTEMPTS`       ║
+║          was correct in v4.0.0 but a refactor broke it. Verified correct        ║
+║          in this version — no change needed.                                    ║
+║                                                                                  ║
+║   FIX-5  reconcile Case B restores state["trade_count"] from saved JSON.       ║
+║          This is correct — trade_count persists across the day.                 ║
+║          But if the script runs the session stats across days (no restart),     ║
+║          trade_count was ALSO persisted. Verified acceptable — no change.       ║
+║                                                                                  ║
+║   FIX-6  job_entry() resets state["today_pnl"] and state["closed_pnl"] to 0   ║
+║          AFTER dte_filter_ok() returns True, but BEFORE place_entry().         ║
+║          If place_entry() fails, counters are reset but no trade happened.      ║
+║          This is safe — counters are reset again on next valid entry. OK.       ║
+║                                                                                  ║
+║   FIX-7  dte_filter_ok() calls get_dte() which calls get_expiry() which        ║
+║          calls nearest_tuesday_expiry() which logs. On non-trade days this      ║
+║          log is harmless but verbose. Accepted as-is (filter order is cheap).   ║
+║                                                                                  ║
+║   FIX-8  close_all() with ONE active leg calls close_one_leg() with no         ║
+║          current_ltp (defaults to 0.0), so approx_pnl = 0.0 and closed_pnl    ║
+║          += 0. This means _mark_fully_flat() uses closed_pnl without the        ║
+║          last leg's approx P&L for the final summary.                           ║
+║          Fixed: fetch LTP before calling close_one_leg() in single-leg path.   ║
+║                                                                                  ║
+║   FIX-9  NSE VIX fallback uses requests.Session() without setting cookies or   ║
+║          headers that NSE now requires. This path was already fail-safe.        ║
+║          Added explicit cookie-grabbing step and improved resilience.           ║
+║                                                                                  ║
+║   FIX-10 _mark_fully_flat() clears state["today_pnl"] = final_pnl then        ║
+║          immediately resets all state including today_pnl = 0.0 WAIT —         ║
+║          today_pnl is NOT in the reset block. Confirmed: today_pnl is set to   ║
+║          final_pnl but never cleared. After flat, today_pnl shows yesterday's  ║
+║          value. Fixed: reset today_pnl = 0.0 in reset block.                   ║
+║                                                                                  ║
+║   FIX-11 In dte_filter_ok(), telegram() is called only on SKIP_MONTHS.        ║
+║          DTE-filtered skip days produce no Telegram alert. This is intentional ║
+║          (DTE filter fires every non-trade day). No change.                     ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   DTE REFERENCE (NIFTY, Tuesday expiry, trading days per AlgoTest)             ║
 ║   DTE0 = Tuesday   expiry day          — peak theta                            ║
@@ -89,7 +104,7 @@
 ║       export TELEGRAM_CHAT_ID="your_chat_id"                                    ║
 ║   3.  Sync Master Contract in OpenAlgo dashboard before 09:00                  ║
 ║   4.  Enable Analyze Mode in OpenAlgo dashboard (paper trade first)            ║
-║   5.  python Nifty_TrendingStrategy_v4_2_DTE.py                                ║
+║   5.  python Nifty_TrendingStrategy_DTE_v5.py                                  ║
 ║   6.  After satisfied with paper trades → disable Analyze Mode → goes LIVE     ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   SYMBOL FORMAT  (docs.openalgo.in)                                             ║
@@ -144,7 +159,7 @@ MONITOR_INTERVAL_S = 15        # Seconds between P&L / SL checks
 #
 #  DTE = TRADING days from today to nearest weekly expiry.
 #  Matches AlgoTest exactly — weekends and market holidays are excluded.
-#  Source: https://docs.algotest.in/Time-Based-Algo-Trading/backtest-filters/dte-filter/
+#  Source: AlgoTest DTE filter documentation.
 #
 #  DTE mapping for NIFTY (Tuesday expiry):
 #    DTE0 = Tuesday   (expiry day)             — peak theta, max premium collapse
@@ -272,7 +287,7 @@ STATE_FILE = "strategy_state.json"
 #  INTERNAL CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "4.2.1"
+VERSION     = "5.0.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -525,30 +540,35 @@ def telegram(msg: str):
 #  EXPIRY CALCULATION  (DDMMMYY uppercase per OpenAlgo docs)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def nearest_tuesday_expiry() -> str:
+def _nearest_tuesday_date() -> date:
     """
-    Return nearest NIFTY weekly expiry (TUESDAY) as DDMMMYY.
+    Compute nearest NIFTY weekly expiry date (Tuesday) silently — no logging.
+    Called from get_dte() and _print_banner() to avoid spam.
 
     NSE EXPIRY: NIFTY 50 weekly & monthly options expire every TUESDAY
     (effective September 2, 2025 per SEBI F&O restructuring).
-    Bank Nifty: Wednesday | Sensex/Bankex: Thursday
 
     Logic:
       • If today IS Tuesday and time < 15:30 IST → use today
       • If today IS Tuesday and time >= 15:30 IST → use next Tuesday
       • Any other day → find next upcoming Tuesday
     """
-    today = date.today()
-    now   = now_ist()
-
-    # Tuesday = weekday() == 1
+    today      = date.today()
+    now        = now_ist()
     days_ahead = (1 - today.weekday()) % 7   # 0 if today is already Tuesday
 
-    # If today is Tuesday but market has closed, roll to next week
     if days_ahead == 0 and (now.hour, now.minute) >= (15, 30):
         days_ahead = 7
 
-    expiry = today + timedelta(days=days_ahead)
+    return today + timedelta(days=days_ahead)
+
+
+def nearest_tuesday_expiry() -> str:
+    """
+    Return nearest NIFTY weekly expiry (TUESDAY) as DDMMMYY, with logging.
+    Called only in get_expiry() — once per entry flow.
+    """
+    expiry = _nearest_tuesday_date()
     result = expiry.strftime("%d%b%y").upper()
     pinfo(f"Auto expiry: {result}  (date: {expiry}, {expiry.strftime('%A')})")
     return result
@@ -562,25 +582,42 @@ def get_expiry() -> str:
     return MANUAL_EXPIRY
 
 
+def _get_expiry_date_silent() -> date:
+    """
+    Return expiry as a date object WITHOUT logging. Used by get_dte() and
+    _print_banner() to avoid spurious log lines during monitor ticks or startup.
+    """
+    if AUTO_EXPIRY:
+        return _nearest_tuesday_date()
+    # Parse MANUAL_EXPIRY string to date
+    try:
+        return datetime.strptime(MANUAL_EXPIRY, "%d%b%y").date()
+    except Exception:
+        return _nearest_tuesday_date()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DTE CALCULATION  (v4.2.0 — trading days, matches AlgoTest exactly)
+#  DTE CALCULATION  (trading days — matches AlgoTest exactly)
 #
-#  AlgoTest definition (from docs):
+#  AlgoTest definition:
 #    "DTE only includes trading days and doesn't include weekends and
 #     market holidays. If the expiry is on Tuesday then Monday = DTE1
 #     and Friday = DTE2."
 #
-#  This means we count Mon–Fri only between today and expiry, excluding
-#  weekends. We do NOT have an NSE holiday calendar, so we skip only
-#  weekends (Sat/Sun). This matches AlgoTest's behavior for standard weeks.
-#  On rare market holidays that fall mid-week, DTE will be off by 1 vs
-#  AlgoTest — this is an acceptable edge case for a production system.
+#  We count Mon–Fri only between today and expiry, excluding weekends.
+#  We do NOT have an NSE holiday calendar, so we skip only weekends (Sat/Sun).
+#  On rare market holidays that fall mid-week, DTE may be off by 1 vs AlgoTest.
+#  This is an acceptable edge case for a production system.
+#
+#  FIX-1 (v5.0.0): get_dte() now uses _get_expiry_date_silent() instead of
+#  get_expiry(), which previously logged "Auto expiry: …" on every 15s tick.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_dte() -> int:
     """
     Compute DTE (Days To Expiry) = TRADING days from today to nearest expiry.
     Counts Mon–Fri only, skipping Sat and Sun. Matches AlgoTest's DTE filter.
+    Does NOT log expiry resolution — only logs the resulting DTE.
 
     NIFTY Tuesday expiry mapping:
       DTE0 = Tuesday  (expiry day)
@@ -590,14 +627,9 @@ def get_dte() -> int:
       DTE4 = Wednesday(previous week)
       DTE5 = Tuesday  (previous week — that week's expiry day)
       DTE6 = Monday   (previous week)
-
-    FIX v4.2.0: Previous version used (expiry_date - today).days which is
-    calendar days. Fri→Tue = 4 calendar days (wrong) vs 2 trading days (correct).
-    Now uses a trading-day counter loop, identical to AlgoTest's logic.
     """
     today       = date.today()
-    expiry_str  = get_expiry()
-    expiry_date = datetime.strptime(expiry_str, "%d%b%y").date()
+    expiry_date = _get_expiry_date_silent()
 
     # Count Mon–Fri days between today (exclusive) and expiry (inclusive)
     dte     = 0
@@ -607,10 +639,10 @@ def get_dte() -> int:
         if current.weekday() < 5:   # 0=Mon … 4=Fri, skip 5=Sat 6=Sun
             dte += 1
 
-    pinfo(
+    pdebug(
         f"DTE: {dte}  "
         f"(today: {today} {DAY_NAMES[today.weekday()]}  "
-        f"expiry: {expiry_str} {expiry_date.strftime('%A')})"
+        f"expiry: {expiry_date.strftime('%d%b%y').upper()} {expiry_date.strftime('%A')})"
     )
     return dte
 
@@ -622,6 +654,9 @@ def get_dte() -> int:
 def fetch_vix() -> float:
     """
     Fetch India VIX LTP. Returns float > 0, or -1.0 on total failure.
+
+    Primary: OpenAlgo SDK quotes()
+    Fallback: NSE direct API (with proper cookie pre-auth)
     """
     # Primary: OpenAlgo SDK
     try:
@@ -634,16 +669,20 @@ def fetch_vix() -> float:
     except Exception as exc:
         pwarn(f"OpenAlgo VIX exception: {exc}")
 
-    # Fallback: NSE direct API
+    # Fallback: NSE direct API (FIX-9: proper session + cookie pre-auth)
     try:
         hdrs = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept"    : "application/json",
-            "Referer"   : "https://www.nseindia.com",
+            "User-Agent"      : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept"          : "application/json, text/plain, */*",
+            "Accept-Language" : "en-US,en;q=0.9",
+            "Referer"         : "https://www.nseindia.com/",
         }
         sess = requests.Session()
-        sess.get("https://www.nseindia.com", headers=hdrs, timeout=5)
-        r = sess.get("https://www.nseindia.com/api/allIndices", headers=hdrs, timeout=6)
+        # NSE requires cookie grab before API calls
+        sess.get("https://www.nseindia.com", headers=hdrs, timeout=8)
+        sess.get("https://www.nseindia.com/option-chain", headers=hdrs, timeout=8)
+        r = sess.get("https://www.nseindia.com/api/allIndices", headers=hdrs, timeout=8)
+        r.raise_for_status()
         for item in r.json().get("data", []):
             if item.get("index", "").replace(" ", "").upper() == "INDIAVIX":
                 vix = float(item["last"])
@@ -691,18 +730,16 @@ def dte_filter_ok() -> bool:
     Return True if today passes the weekend check, the month filter, and the
     DTE filter — in that order (cheapest checks first).
 
-    Weekend guard (v4.2.1 fix):
+    Weekend guard:
       Saturday and Sunday are never valid trading days. AlgoTest's DTE filter
       only applies to Mon–Fri; weekends do not appear in backtest data at all.
       Without this guard, Friday/Saturday/Sunday all compute the same DTE value
       because the trading-day loop counts only Mon–Fri between today and expiry:
         Friday  Mar 13 → Mon(1)+Tue(2) = DTE2  ← correct trading day
-        Saturday Mar 14 → Mon(1)+Tue(2) = DTE2  ← non-trading, same DTE value
-        Sunday  Mar 15 → Mon(1)+Tue(2) = DTE2  ← non-trading, same DTE value
+        Saturday Mar 14 → Mon(1)+Tue(2) = DTE2  ← non-trading, same DTE value!
+        Sunday  Mar 15 → Mon(1)+Tue(2) = DTE2  ← non-trading, same DTE value!
       The APScheduler (day_of_week="mon-fri") already prevents automatic trades
-      on weekends, so production impact is zero. This guard makes manual_entry()
-      on weekends reject cleanly with a clear log message instead of computing a
-      misleading DTE value and potentially passing through.
+      on weekends. This guard makes manual_entry() on weekends reject cleanly.
 
     Month filter:
       Skip if current month is in SKIP_MONTHS (no API call needed).
@@ -716,7 +753,6 @@ def dte_filter_ok() -> bool:
     month   = now.month
 
     # ── Weekend guard — must be first ─────────────────────────────────────────
-    # weekday 5 = Saturday, weekday 6 = Sunday
     if weekday >= 5:
         pinfo(
             f"{DAY_NAMES[weekday]} is not a trading day — skipping "
@@ -754,13 +790,6 @@ def dte_filter_ok() -> bool:
 #    /api/v1/funds  → availablecash + collateral (pledged securities, haircut applied)
 #    /api/v1/margin → basket margin for SELL CE + SELL PE MIS
 #                     returns total_margin_required with SPAN straddle offset
-#
-#  Design decisions:
-#    • FAIL-OPEN: if either API call fails, log + proceed (don't block live trades)
-#    • Collateral is included: pledged Nifty BeES / liquid funds count as margin
-#    • MARGIN_BUFFER = 1.20: 20% headroom handles intraday SPAN spikes
-#    • Dhan note: margin() calculates legs sequentially (no basket offset),
-#      so the 20% buffer also compensates for this conservatism
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _get_atm_strike_for_margin() -> str:
@@ -1091,7 +1120,7 @@ def _capture_fill_prices():
     Fetch average fill prices from broker via orderstatus() for both legs.
     These are the foundation of per-leg SL levels — must be accurate.
 
-    Retry logic: up to 3 attempts with 1s delay.
+    Retry logic: up to 3 attempts with 1s delay between attempts.
     Failure: warns and leaves entry_price at 0.0 — SL disabled for that leg.
     """
     MAX_ATTEMPTS = 3
@@ -1129,14 +1158,23 @@ def _capture_fill_prices():
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SINGLE-LEG CLOSE  ← CORE OF PARTIAL SQUARE OFF
+#
+#  When ONE leg hits its SL, ONLY that leg is closed.
+#  The other leg continues running with its own SL intact.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
     """
     Close a single leg (leg = 'CE' or 'PE').
-    Idempotent — double-close guard at top.
-    On order failure: logs + Telegram, returns WITHOUT changing state
-    (position remains open — operator must intervene manually).
+
+    Parameters
+    ----------
+    leg         : 'CE' or 'PE'
+    reason      : Human-readable close reason for logs and Telegram
+    current_ltp : Last known LTP for approximate P&L estimate.
+
+    On order failure: logs + Telegram, returns WITHOUT changing state.
+    The position remains open — operator must intervene manually.
     """
     leg_upper  = leg.upper()
     active_key = f"{leg.lower()}_active"
@@ -1242,14 +1280,27 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CLOSE ALL REMAINING LEGS
+#  Called for: 15:15 hard exit, daily profit target, daily loss limit,
+#              Ctrl+C shutdown, scheduler crash
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def close_all(reason: str = "Scheduled Exit"):
     """
     Close ALL currently active legs.
-    BOTH active → closeposition() (atomic)
-    ONE active  → close_one_leg() (targeted)
-    NONE active → no-op
+
+    BOTH legs active → closeposition() (atomic, single API call)
+    ONE leg active   → fetch LTP then close_one_leg() (with P&L estimate)
+    NO legs active   → no-op
+
+    FIX-3 (v5.0.0): When using atomic closeposition() for both legs,
+    we snapshot the current open MTM from the last monitor tick and add
+    it to closed_pnl before calling _mark_fully_flat(). This ensures the
+    final P&L summary is meaningful rather than showing Rs.0.
+    (closeposition() does not update closed_pnl — only close_one_leg() does.)
+
+    FIX-8 (v5.0.0): When ONE leg is active, we fetch its current LTP before
+    calling close_one_leg() so the approx_pnl is populated in closed_pnl,
+    giving _mark_fully_flat() an accurate final P&L.
     """
     if not state["in_position"]:
         pinfo(f"close_all() — no open position ({reason!r}), nothing to do")
@@ -1264,6 +1315,7 @@ def close_all(reason: str = "Scheduled Exit"):
     pinfo(f"CLOSE ALL REMAINING LEGS  |  Active: {active}  |  Reason: {reason}")
 
     if len(active) == 2:
+        # ── Both legs open — use closeposition() for atomic close ─────────────
         pinfo("Both legs active → closeposition() (atomic)")
         try:
             resp = client.closeposition(strategy=STRATEGY_NAME)
@@ -1280,8 +1332,15 @@ def close_all(reason: str = "Scheduled Exit"):
             return
 
         if isinstance(resp, dict) and resp.get("status") == "success":
-            state["ce_active"] = False
-            state["pe_active"] = False
+            # FIX-3: Snapshot open MTM into closed_pnl so final P&L is correct.
+            # state["today_pnl"] was set by the most recent monitor tick:
+            #   today_pnl = closed_pnl + open_mtm
+            # So: open_mtm_snapshot = today_pnl - closed_pnl
+            # We add this to closed_pnl before marking flat.
+            open_mtm_snapshot = state["today_pnl"] - state["closed_pnl"]
+            state["closed_pnl"] += open_mtm_snapshot
+            state["ce_active"]  = False
+            state["pe_active"]  = False
             _mark_fully_flat(reason=reason)
         else:
             err = resp.get("message", str(resp)) if isinstance(resp, dict) else str(resp)
@@ -1296,15 +1355,20 @@ def close_all(reason: str = "Scheduled Exit"):
             )
 
     elif len(active) == 1:
+        # ── One leg remaining — fetch LTP for accurate P&L then close ────────
         leg = active[0]
-        pinfo(f"Only {leg} active → close_one_leg({leg})")
-        close_one_leg(leg, reason=reason)
+        pinfo(f"Only {leg} active → fetching LTP then close_one_leg({leg})")
+        # FIX-8: fetch LTP so close_one_leg() can compute approx_pnl accurately
+        ltp = _fetch_ltp(leg)
+        if ltp <= 0:
+            pwarn(f"  LTP fetch failed for {leg} — P&L estimate will be Rs.0")
+        close_one_leg(leg, reason=reason, current_ltp=ltp)
 
 
 def _emergency_close_all():
     """
-    Best-effort close for emergency scenarios. Uses closeposition().
-    Does NOT update state — caller is responsible for state cleanup.
+    Best-effort close for emergency scenarios (partial entry fill, orphan positions).
+    Uses closeposition(). Does NOT update state — caller is responsible.
     """
     pinfo("Emergency close via closeposition()...")
     try:
@@ -1322,18 +1386,22 @@ def _emergency_close_all():
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MARK FULLY FLAT
+#  Called when BOTH legs confirmed closed (from close_one_leg or close_all).
+#  Resets position state, deletes state file, logs final summary.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _mark_fully_flat(reason: str):
     """
     Reset all position fields, delete state file, send final summary.
 
-    Uses state["closed_pnl"] as authoritative final P&L — it is incremented
-    immediately on each leg close and is always accurate at flat time.
-    state["today_pnl"] is only updated during monitor ticks and can be stale
-    if both legs closed by SL in the same tick or via close_all().
+    Uses state["closed_pnl"] as authoritative final P&L. It is incremented
+    on each leg close and carries the correct approximate realised P&L.
+
+    FIX-10 (v5.0.0): today_pnl was never reset to 0.0 in the reset block.
+    After the position was flat, today_pnl retained the previous trade's value.
+    Now explicitly reset to 0.0 in the state reset block.
     """
-    final_pnl    = state["closed_pnl"]   # Authoritative
+    final_pnl    = state["closed_pnl"]   # Authoritative — accumulated by leg closes
     duration_str = ""
 
     if state.get("entry_time"):
@@ -1346,10 +1414,7 @@ def _mark_fully_flat(reason: str):
         except Exception:
             pass
 
-    # Sync today_pnl with final closed_pnl before resetting
-    state["today_pnl"] = final_pnl
-
-    # Reset all position-related state
+    # Reset ALL position-related state (FIX-10: today_pnl included)
     state["in_position"]      = False
     state["ce_active"]        = False
     state["pe_active"]        = False
@@ -1360,6 +1425,7 @@ def _mark_fully_flat(reason: str):
     state["entry_price_ce"]   = 0.0
     state["entry_price_pe"]   = 0.0
     state["closed_pnl"]       = 0.0
+    state["today_pnl"]        = 0.0   # FIX-10: was missing, caused stale value after flat
     state["underlying_ltp"]   = 0.0
     state["vix_at_entry"]     = 0.0
     state["entry_time"]       = None
@@ -1390,11 +1456,34 @@ def _mark_fully_flat(reason: str):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  P&L MONITOR  (runs every MONITOR_INTERVAL_S seconds)
+#
+#  PARTIAL LOGIC STEP BY STEP:
+#
+#  ① For each leg in [CE, PE]:
+#       Skip if leg is already closed (state[leg_active] == False)
+#       Fetch live LTP from broker via quotes()
+#       If LTP unavailable this cycle → skip (do NOT fire SL on bad data)
+#       Compute leg_mtm = (entry_price - ltp) × qty
+#       Check per-leg SL: ltp >= sl_level(leg)?
+#         YES → call close_one_leg(leg, ...)  ← closes ONLY this leg
+#               do NOT add to open_mtm (leg is now in closed_pnl)
+#               continue loop (other leg might also need SL check)
+#         NO  → accumulate to open_mtm
+#
+#  ② combined_pnl = state["closed_pnl"] + open_mtm
+#     state["today_pnl"] = combined_pnl
+#
+#  ③ If still in position after SL checks:
+#       Check DAILY_PROFIT_TARGET → close_all() if breached
+#       Check DAILY_LOSS_LIMIT    → close_all() if breached
+#
+#  Threading guard: _monitor_lock prevents concurrent monitor ticks
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _fetch_ltp(leg: str) -> float:
     """
-    Fetch live LTP for a single leg. Returns float > 0 or 0.0 on failure.
+    Fetch live LTP for a single leg via quotes() on NFO exchange.
+    Returns float > 0 on success, or 0.0 on failure.
     """
     symbol = state[f"symbol_{leg.lower()}"]
     if not symbol:
@@ -1432,7 +1521,8 @@ def monitor_pnl():
 
 def _run_monitor_tick():
     """
-    Inner monitor logic. Per-leg SL check → combined P&L → daily target/limit.
+    Inner monitor logic — called from monitor_pnl() under lock.
+    Per-leg SL check → combined P&L → daily target/limit.
 
     PARTIAL LOGIC:
       Each leg has its OWN independent SL. When one leg hits SL, only that
@@ -1464,26 +1554,29 @@ def _run_monitor_tick():
         )
 
         # ── PER-LEG SL CHECK ─────────────────────────────────────────────────
+        # Fires only if: SL enabled, entry price captured, LTP breached SL level
         if LEG_SL_PERCENT > 0 and sl_lvl > 0 and ltp >= sl_lvl:
             pwarn(
                 f"SL HIT: {leg}  |  LTP Rs.{ltp:.2f} >= SL Rs.{sl_lvl:.2f}  "
                 f"({LEG_SL_PERCENT}% of Rs.{entry_px:.2f})"
             )
+            # Close ONLY this leg — other leg keeps running
             close_one_leg(
                 leg,
                 reason=f"{leg} Leg SL {LEG_SL_PERCENT}% Hit",
                 current_ltp=ltp,
             )
-            continue   # This leg's P&L is now in closed_pnl, not open_mtm
+            # This leg's P&L is now in closed_pnl — not in open_mtm
+            continue
 
-        # ── No SL hit — accumulate open MTM ──────────────────────────────────
+        # ── No SL hit — accumulate to open MTM ───────────────────────────────
         open_mtm += leg_mtm
 
-    # ── If both legs closed by SLs this cycle — done ─────────────────────────
+    # ── If both legs closed by SL(s) this tick → already flat, done ──────────
     if not state["in_position"]:
         return
 
-    # ── Combined P&L ─────────────────────────────────────────────────────────
+    # ── Combined P&L = closed (realised) + open (unrealised) ─────────────────
     combined_pnl       = state["closed_pnl"] + open_mtm
     state["today_pnl"] = combined_pnl
 
@@ -1497,13 +1590,13 @@ def _run_monitor_tick():
         f"Limit: Rs.{DAILY_LOSS_LIMIT}"
     )
 
-    # ── DAILY PROFIT TARGET ───────────────────────────────────────────────────
+    # ── DAILY PROFIT TARGET (combined) ───────────────────────────────────────
     if DAILY_PROFIT_TARGET > 0 and combined_pnl >= DAILY_PROFIT_TARGET:
         pinfo(f"DAILY PROFIT TARGET Rs.{DAILY_PROFIT_TARGET} REACHED — closing all")
         close_all(reason=f"Daily Profit Target Rs.{DAILY_PROFIT_TARGET} Reached")
         return
 
-    # ── DAILY LOSS LIMIT ──────────────────────────────────────────────────────
+    # ── DAILY LOSS LIMIT (combined) ──────────────────────────────────────────
     if DAILY_LOSS_LIMIT < 0 and combined_pnl <= DAILY_LOSS_LIMIT:
         pwarn(f"DAILY LOSS LIMIT Rs.{DAILY_LOSS_LIMIT} BREACHED — closing all")
         close_all(reason=f"Daily Loss Limit Rs.{DAILY_LOSS_LIMIT} Breached")
@@ -1512,18 +1605,25 @@ def _run_monitor_tick():
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STARTUP RECONCILIATION
+#
+#  On every restart (intentional or crash), compares saved state with live
+#  positionbook() before the scheduler starts:
+#
+#  Case A  No state file   + broker flat       → clean start, no action
+#  Case B  State: IN POS   + broker confirms   → restore full state, resume
+#  Case C  State: IN POS   + broker FLAT       → externally closed, clear state
+#  Case D  No state file   + broker has NFO    → orphan, emergency close
+#  Stale   State from prev trading day         → MIS auto sq-off, clear state
+#
+#  PARTIAL-AWARE:
+#  Case B restores ce_active and pe_active independently, so if the script
+#  crashed mid-partial (e.g. CE closed, PE still open), the correct state
+#  (ce_active=False, pe_active=True) is restored and monitoring resumes
+#  for only the surviving leg.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def reconcile_on_startup():
-    """
-    Compare saved state vs live broker positions before scheduler starts.
-
-    Case A: No state + broker flat        → clean start
-    Case B: State IN POS + broker confirms → restore state, resume monitor
-    Case C: State IN POS + broker flat    → externally closed, clear state
-    Case D: No state + broker has NFO     → orphan positions, emergency close
-    Stale:  State from previous day       → MIS auto sq-off, clear state
-    """
+    """Reconcile persisted state with live broker positions."""
     psep()
     pinfo("STARTUP RECONCILIATION — saved state vs live broker positions")
     psep()
@@ -1676,10 +1776,10 @@ def job_entry():
 
     Filter order (short-circuit on first failure):
       1. Duplicate guard
-      2. DTE filter (trading days) + month filter
+      2. DTE filter (trading days, AlgoTest-compatible) + month filter
       3. VIX filter
-      4. Margin guard
-      5. Place straddle entry
+      4. Margin guard (cash + collateral >= required × buffer)
+      5. Reset daily counters and place straddle entry
     """
     psep()
     pinfo(f"ENTRY JOB | {now_ist().strftime('%A %d-%b-%Y %H:%M:%S IST')}")
@@ -1737,6 +1837,8 @@ def job_monitor():
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STARTUP BANNER
+#  FIX-2 (v5.0.0): compute expiry date once, reuse for all DTE label lookups
+#  instead of calling get_expiry() (which logs) once per DTE value.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _print_banner():
@@ -1748,16 +1850,15 @@ def _print_banner():
         if MARGIN_GUARD_ENABLED else "DISABLED"
     )
 
-    # FIX v4.2.0: Dynamically compute day names from expiry date instead of
-    # a hardcoded map that only covered DTE0–4 and returned '?' for DTE5/DTE6.
-    def _dte_to_dayname(dte_val: int) -> str:
-        """Return the weekday name for a given trading-day DTE offset from Tuesday expiry."""
+    # FIX-2: compute expiry date ONCE, silently, before looping over TRADE_DTE
+    def _dte_to_dayname(dte_val: int, expiry_date: date) -> str:
+        """
+        Return the weekday name for a given trading-day DTE offset.
+        Walks backward from expiry_date by dte_val trading days.
+        """
         try:
-            today       = date.today()
-            expiry_str  = get_expiry()
-            expiry_date = datetime.strptime(expiry_str, "%d%b%y").date()
-            # Walk backward from expiry by dte_val trading days
-            d, count = expiry_date, 0
+            d     = expiry_date
+            count = 0
             while count < dte_val:
                 d -= timedelta(days=1)
                 if d.weekday() < 5:
@@ -1766,8 +1867,9 @@ def _print_banner():
         except Exception:
             return "?"
 
+    expiry_date = _get_expiry_date_silent()
     day_str = " | ".join(
-        f"DTE{d}={_dte_to_dayname(d)}" for d in sorted(TRADE_DTE)
+        f"DTE{d}={_dte_to_dayname(d, expiry_date)}" for d in sorted(TRADE_DTE)
     )
 
     print("", flush=True)
@@ -1861,7 +1963,7 @@ def show_state():
 
     dte        = get_dte()
     weekday    = date.today().weekday()
-    is_weekend = weekday >= 5   # 5=Sat, 6=Sun
+    is_weekend = weekday >= 5
 
     print(f"    {'current_dte':<24} : DTE{dte} ({DAY_NAMES[weekday]})", flush=True)
 
