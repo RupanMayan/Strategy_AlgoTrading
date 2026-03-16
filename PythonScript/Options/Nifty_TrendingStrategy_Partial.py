@@ -197,7 +197,7 @@ OPENALGO_API_KEY = os.getenv("OPENALGO_APIKEY", "your_openalgo_api_key_here")
 
 UNDERLYING     = "NIFTY"       # NIFTY | BANKNIFTY | FINNIFTY
 EXCHANGE       = "NSE_INDEX"   # Always NSE_INDEX for index-based option orders
-LOT_SIZE       = 75            # NIFTY=75  BANKNIFTY=35  FINNIFTY=40
+LOT_SIZE       = 65            # NIFTY=65  BANKNIFTY=35  FINNIFTY=40
 NUMBER_OF_LOTS = 1             # Lots per leg — start with 1 for paper trading
 PRODUCT        = "MIS"         # MIS = intraday auto sq-off  |  NRML = carry forward
 STRIKE_OFFSET  = "ATM"         # ATM | OTM1..OTM5 | ITM1..ITM5
@@ -1172,11 +1172,18 @@ def place_entry(expiry: str) -> bool:
         else:
             perr(f"  LEG {opt} FAILED: {leg.get('message', 'Unknown error')}")
 
-    # ── Partial entry fill → emergency close ─────────────────────────────────
+    # ── Partial or zero entry fill → emergency close ─────────────────────────
     if "CE" not in filled_legs or "PE" not in filled_legs:
-        perr("PARTIAL ENTRY FILL — only one leg placed. Emergency close triggered.")
-        telegram("PARTIAL ENTRY FILL — emergency close triggered. Check logs.")
-        _emergency_close_all()
+        n_filled = len(filled_legs)
+        if n_filled == 0:
+            perr("ENTRY FAILED — both legs rejected. No positions opened.")
+            telegram("ENTRY FAILED — both legs rejected (check lot size / funds). No positions opened.")
+        else:
+            filled_leg  = next(iter(filled_legs))
+            missing_leg = "PE" if filled_leg == "CE" else "CE"
+            perr(f"PARTIAL ENTRY FILL — {filled_leg} placed but {missing_leg} failed. Emergency close triggered.")
+            telegram(f"PARTIAL ENTRY FILL — {filled_leg} placed, {missing_leg} failed. Emergency close triggered. Check logs.")
+            _emergency_close_all()
         return False
 
     # ── Populate state — BOTH legs now active ─────────────────────────────────
