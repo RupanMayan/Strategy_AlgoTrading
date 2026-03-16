@@ -265,14 +265,17 @@ VIX_MAX            = 28.0
 #    PE SL = PE_entry_price × (1 + LEG_SL_PERCENT/100)  → close PE only
 #    99.6% accuracy verified from AlgoTest CSV (2311 SL hits, median = 20.00%)
 #
-#  DAILY_PROFIT_TARGET / DAILY_LOSS_LIMIT — evaluated on COMBINED P&L
+#  DAILY_PROFIT_TARGET_PER_LOT / DAILY_LOSS_LIMIT_PER_LOT — per lot values
+#    Effective Rs. thresholds = PER_LOT value × NUMBER_OF_LOTS (auto-scaled).
 #    combined = closed_leg_pnl + open_leg(s)_mtm
 #    Trips → close ALL remaining open legs immediately
+#
+#  Example: PER_LOT target=5000, lots=2 → effective target = Rs.10,000
 # ═══════════════════════════════════════════════════════════════════════════════
 
-LEG_SL_PERCENT      = 20.0     # % of entry premium per leg  (0 = disabled)
-DAILY_PROFIT_TARGET =  5000    # Combined Rs. target  (0 = disabled)
-DAILY_LOSS_LIMIT    = -4000    # Combined Rs. loss limit — NEGATIVE  (0 = disabled)
+LEG_SL_PERCENT               = 20.0   # % of entry premium per leg  (0 = disabled)
+DAILY_PROFIT_TARGET_PER_LOT  =  5000  # Rs. profit target PER LOT   (0 = disabled)
+DAILY_LOSS_LIMIT_PER_LOT     = -4000  # Rs. loss limit PER LOT — NEGATIVE  (0 = disabled)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 7A — PRE-TRADE MARGIN GUARD
@@ -402,6 +405,17 @@ NSE_HOLIDAYS: frozenset = frozenset({
 # Monitor job + state mutation guard (RLock — reentrant so close_all can call
 # close_one_leg while both hold the lock within the same call chain).
 _monitor_lock = threading.RLock()
+
+# ── Effective daily target / limit (auto-scaled with NUMBER_OF_LOTS) ──────────
+#  DO NOT edit these — change DAILY_PROFIT_TARGET_PER_LOT / DAILY_LOSS_LIMIT_PER_LOT
+#  in Section 7 above. Computed once at startup.
+#
+#  Examples:
+#    1 lot: target = 5000×1 = Rs. 5,000  |  limit = -4000×1 = Rs. -4,000
+#    2 lots: target = 5000×2 = Rs.10,000  |  limit = -4000×2 = Rs. -8,000
+#    3 lots: target = 5000×3 = Rs.15,000  |  limit = -4000×3 = Rs.-12,000
+DAILY_PROFIT_TARGET = DAILY_PROFIT_TARGET_PER_LOT * NUMBER_OF_LOTS
+DAILY_LOSS_LIMIT    = DAILY_LOSS_LIMIT_PER_LOT    * NUMBER_OF_LOTS
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2064,8 +2078,8 @@ def _print_banner():
     print(f"  Skip months      : {skip_str}", flush=True)
     print(f"  VIX filter       : {VIX_MIN}–{VIX_MAX}  (enabled: {VIX_FILTER_ENABLED})", flush=True)
     print(f"  Sq-off mode      : PARTIAL — each leg has independent {LEG_SL_PERCENT}% SL", flush=True)
-    print(f"  Daily target     : Rs.{DAILY_PROFIT_TARGET}  (combined, 0=disabled)", flush=True)
-    print(f"  Daily limit      : Rs.{DAILY_LOSS_LIMIT}   (combined, 0=disabled)", flush=True)
+    print(f"  Daily target     : Rs.{DAILY_PROFIT_TARGET_PER_LOT}/lot × {NUMBER_OF_LOTS} lot(s) = Rs.{DAILY_PROFIT_TARGET}  (0=disabled)", flush=True)
+    print(f"  Daily limit      : Rs.{DAILY_LOSS_LIMIT_PER_LOT}/lot × {NUMBER_OF_LOTS} lot(s) = Rs.{DAILY_LOSS_LIMIT}   (0=disabled)", flush=True)
     print(f"  Margin guard     : {guard_str}", flush=True)
     print(f"  Auto expiry      : {AUTO_EXPIRY}  |  Manual : {MANUAL_EXPIRY}  (NIFTY expires TUESDAY)", flush=True)
     print(f"  State file       : {os.path.abspath(STATE_FILE)}", flush=True)
@@ -2190,10 +2204,10 @@ def _validate_config():
     # ── Risk parameters ───────────────────────────────────────────────────────
     if LEG_SL_PERCENT < 0:
         errors.append(f"LEG_SL_PERCENT must be >= 0, got {LEG_SL_PERCENT}")
-    if DAILY_PROFIT_TARGET < 0:
-        errors.append(f"DAILY_PROFIT_TARGET must be >= 0 (use 0 to disable), got {DAILY_PROFIT_TARGET}")
-    if DAILY_LOSS_LIMIT > 0:
-        errors.append(f"DAILY_LOSS_LIMIT must be <= 0 (negative = loss, use 0 to disable), got {DAILY_LOSS_LIMIT}")
+    if DAILY_PROFIT_TARGET_PER_LOT < 0:
+        errors.append(f"DAILY_PROFIT_TARGET_PER_LOT must be >= 0 (use 0 to disable), got {DAILY_PROFIT_TARGET_PER_LOT}")
+    if DAILY_LOSS_LIMIT_PER_LOT > 0:
+        errors.append(f"DAILY_LOSS_LIMIT_PER_LOT must be <= 0 (negative = loss, use 0 to disable), got {DAILY_LOSS_LIMIT_PER_LOT}")
 
     # ── Margin guard ──────────────────────────────────────────────────────────
     if MARGIN_BUFFER < 1.0:
@@ -2336,7 +2350,8 @@ def run():
         f"VIX: {VIX_MIN}–{VIX_MAX}\n"
         f"DTE filter: {dte_str}  (trading days, AlgoTest-compatible)\n"
         f"Skip months: {', '.join(MONTH_NAMES[m] for m in sorted(SKIP_MONTHS)) if SKIP_MONTHS else 'None'}\n"
-        f"Target: Rs.{DAILY_PROFIT_TARGET}  Limit: Rs.{DAILY_LOSS_LIMIT}\n"
+        f"Target: Rs.{DAILY_PROFIT_TARGET_PER_LOT}/lot = Rs.{DAILY_PROFIT_TARGET}  "
+        f"Limit: Rs.{DAILY_LOSS_LIMIT_PER_LOT}/lot = Rs.{DAILY_LOSS_LIMIT}\n"
         f"{guard_status}"
     )
 
