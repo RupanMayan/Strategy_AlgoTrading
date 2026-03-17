@@ -111,7 +111,7 @@
 ║           start on a market holiday because OpenAlgo won't schedule it.         ║
 ║                                                                                  ║
 ║   FIX-IV  _capture_fill_prices() retries increased from 3×1s to 5×(1-4s)      ║
-║           exponential back-off. On high-VIX days, broker fill reporting can     ║
+║           linear back-off. On high-VIX days, broker fill reporting can          ║
 ║           be delayed beyond 3s. If capture still fails, a Telegram alert is     ║
 ║           sent immediately so the operator knows SL is disabled.                ║
 ║                                                                                  ║
@@ -995,17 +995,30 @@ def fetch_vix() -> float:
 def vix_ok() -> bool:
     """Check VIX filter. Returns True = OK to trade, False = skip."""
     if not VIX_FILTER_ENABLED:
-        # VIX range filter is off, but IVR/IVP filters still need a valid VIX value.
-        # Fetch and store it so ivr_ivp_ok() receives a real number, not 0.0.
-        if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED:
+        # VIX range filter is off, but other features still need a valid VIX value:
+        #   • IVR / IVP filters  — compute IV rank / percentile from current VIX
+        #   • VIX spike monitor  — compares live VIX against vix_at_entry each tick;
+        #     if vix_at_entry == 0.0 the spike monitor's guard (entry_vix <= 0)
+        #     silently skips every check, rendering spike protection inoperative.
+        # Fetch and store so both features work correctly.
+        if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED or VIX_SPIKE_MONITOR_ENABLED:
             vix = fetch_vix()
             if vix > 0:
                 state["vix_at_entry"] = vix
-                pinfo(f"VIX filter disabled — fetched VIX {vix:.2f} for IVR/IVP filter")
+                reasons = []
+                if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED:
+                    reasons.append("IVR/IVP filter")
+                if VIX_SPIKE_MONITOR_ENABLED:
+                    reasons.append("VIX spike monitor")
+                pinfo(
+                    f"VIX filter disabled — fetched VIX {vix:.2f} "
+                    f"for: {', '.join(reasons)}"
+                )
             else:
                 pwarn(
                     "VIX filter disabled but VIX fetch failed — "
-                    "IVR/IVP filter will receive VIX=0.0 and will likely skip trade. "
+                    "IVR/IVP filter will receive VIX=0.0 and will likely skip trade; "
+                    "VIX spike monitor is also unable to establish a baseline. "
                     "Check OpenAlgo / NSE connectivity."
                 )
         else:
