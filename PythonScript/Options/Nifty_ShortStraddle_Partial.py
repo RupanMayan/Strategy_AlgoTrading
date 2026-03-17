@@ -1787,7 +1787,8 @@ def _capture_fill_prices():
     Fetch average fill prices from broker via orderstatus() for both legs.
     These are the foundation of per-leg SL levels — must be accurate.
 
-    Retry logic: up to 5 attempts with exponential back-off (1s, 2s, 3s, 4s).
+    Retry logic: up to 5 attempts with linear back-off (1s, 2s, 3s, 4s delays
+    before attempts 2–5).
     Extra attempts vs v5.1.0 (was 3 × 1s) to handle slow broker fill reporting.
     Failure: warns and leaves entry_price at 0.0 — SL disabled for that leg.
     CRITICAL: SL cannot fire without a valid entry price.  If fill capture
@@ -3188,7 +3189,14 @@ def _print_banner():
         trail_str = "DISABLED"
     print(f"  Trailing SL      : {trail_str}", flush=True)
 
-    print(f"  Sq-off mode      : PARTIAL — each leg has independent {LEG_SL_PERCENT}% fixed SL → trailing once {TRAIL_TRIGGER_PCT}% decayed", flush=True)
+    if TRAILING_SL_ENABLED:
+        sqoff_detail = (
+            f"each leg has independent {LEG_SL_PERCENT}% fixed SL "
+            f"→ trailing once {TRAIL_TRIGGER_PCT}% decayed"
+        )
+    else:
+        sqoff_detail = f"each leg has independent {LEG_SL_PERCENT}% fixed SL (no trailing)"
+    print(f"  Sq-off mode      : PARTIAL — {sqoff_detail}", flush=True)
     print(f"  Daily target     : Rs.{DAILY_PROFIT_TARGET_PER_LOT}/lot × {NUMBER_OF_LOTS} lot(s) = Rs.{DAILY_PROFIT_TARGET}  (0=disabled)", flush=True)
     print(f"  Daily limit      : Rs.{DAILY_LOSS_LIMIT_PER_LOT}/lot × {NUMBER_OF_LOTS} lot(s) = Rs.{DAILY_LOSS_LIMIT}   (0=disabled)", flush=True)
     print(f"  Margin guard     : {guard_str}", flush=True)
@@ -3241,7 +3249,17 @@ def check_connection():
 
 
 def manual_entry():
-    """Force entry immediately — bypasses time check, runs all other filters."""
+    """Force entry immediately via job_entry() — bypasses the APScheduler time
+    trigger but still runs all guards inside job_entry():
+      • When USE_DTE_ENTRY_MAP=False : time check is fully bypassed ✓
+      • When USE_DTE_ENTRY_MAP=True  : the DTE-aware time-slot guard (step 0)
+        still runs — if the current clock time does not match this DTE's
+        configured entry slot, job_entry() returns silently without entering.
+        Call at the correct time for that DTE, or temporarily set
+        USE_DTE_ENTRY_MAP=False before invoking.
+    All other filters (VIX, IVR/IVP, margin, daily limit, weekend, etc.) run
+    normally regardless of the mode.
+    """
     pinfo("MANUAL ENTRY triggered")
     job_entry()
 
@@ -3355,6 +3373,28 @@ def _validate_config():
         assert 0 <= xh <= 23 and 0 <= xm <= 59
     except Exception:
         errors.append(f"EXIT_TIME invalid: {EXIT_TIME!r}  (expected HH:MM)")
+    # ── Entry must precede exit ────────────────────────────────────────────────
+    # Only check when both times parsed successfully (no prior format error).
+    try:
+        _eh, _em = parse_hhmm(ENTRY_TIME)
+        _xh, _xm = parse_hhmm(EXIT_TIME)
+        if (_eh, _em) >= (_xh, _xm):
+            errors.append(
+                f"ENTRY_TIME ({ENTRY_TIME}) must be earlier than EXIT_TIME ({EXIT_TIME})"
+            )
+        if USE_DTE_ENTRY_MAP:
+            for dte_key, t in DTE_ENTRY_TIME_MAP.items():
+                try:
+                    _dh, _dm = parse_hhmm(t)
+                    if (_dh, _dm) >= (_xh, _xm):
+                        errors.append(
+                            f"DTE_ENTRY_TIME_MAP[{dte_key}] ({t}) must be earlier than "
+                            f"EXIT_TIME ({EXIT_TIME})"
+                        )
+                except Exception:
+                    pass   # format already caught above
+    except Exception:
+        pass   # format errors already caught above
     if MONITOR_INTERVAL_S <= 0:
         errors.append(f"MONITOR_INTERVAL_S must be > 0, got {MONITOR_INTERVAL_S}")
 
