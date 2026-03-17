@@ -2993,16 +2993,22 @@ def bootstrap_vix_history() -> bool:
     NSE API: https://www.nseindia.com/api/historical/vixhistory
     Params : from=DD-MM-YYYY&to=DD-MM-YYYY
     Auth   : requires NSE session cookies (grabbed via two warm-up GETs).
+
+    NSE limits each request to ~365 days — we split the 2-year window into
+    two consecutive 365-day chunks and merge the results.
     """
     psep()
     pinfo("VIX HISTORY AUTO-BOOTSTRAP — fetching 2 years from NSE")
 
-    today     = now_ist().date()
-    from_date = today - timedelta(days=730)
-    from_str  = from_date.strftime("%d-%m-%Y")
-    to_str    = today.strftime("%d-%m-%Y")
+    today = now_ist().date()
 
-    pinfo(f"  Date range  : {from_str} → {to_str}")
+    # NSE rejects requests spanning > ~365 days; split into two 1-year chunks
+    chunks = [
+        (today - timedelta(days=730), today - timedelta(days=366)),
+        (today - timedelta(days=365), today),
+    ]
+
+    pinfo(f"  Date range  : {chunks[0][0].strftime('%d-%m-%Y')} → {chunks[-1][1].strftime('%d-%m-%Y')} (2 chunks)")
     pinfo(f"  Target file : {os.path.abspath(VIX_HISTORY_FILE)}")
 
     hdrs = {
@@ -3012,6 +3018,7 @@ def bootstrap_vix_history() -> bool:
         "Referer"         : "https://www.nseindia.com/",
     }
 
+    raw = []
     try:
         sess = requests.Session()
         # NSE requires cookie warm-up before API calls
@@ -3021,13 +3028,18 @@ def bootstrap_vix_history() -> bool:
             headers=hdrs, timeout=10,
         )
 
-        url = (
-            f"https://www.nseindia.com/api/historical/vixhistory"
-            f"?from={from_str}&to={to_str}"
-        )
-        r = sess.get(url, headers=hdrs, timeout=20)
-        r.raise_for_status()
-        raw = r.json().get("data", [])
+        for chunk_from, chunk_to in chunks:
+            from_str = chunk_from.strftime("%d-%m-%Y")
+            to_str   = chunk_to.strftime("%d-%m-%Y")
+            url = (
+                f"https://www.nseindia.com/api/historical/vixhistory"
+                f"?from={from_str}&to={to_str}"
+            )
+            r = sess.get(url, headers=hdrs, timeout=20)
+            r.raise_for_status()
+            chunk_data = r.json().get("data", [])
+            pinfo(f"  Chunk {from_str} → {to_str}: {len(chunk_data)} records")
+            raw.extend(chunk_data)
 
     except Exception as exc:
         pwarn(f"  Bootstrap: NSE request failed — {exc}")
