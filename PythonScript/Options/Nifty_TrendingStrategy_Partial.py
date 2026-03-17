@@ -429,6 +429,59 @@ VIX_SPIKE_THRESHOLD_PCT      = 15.0   # % rise from entry VIX triggers exit
 VIX_SPIKE_CHECK_INTERVAL_S   = 300    # Seconds between VIX spike checks (5 min)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7C — TRAILING STOP-LOSS / PROFIT LOCK-IN
+#
+#  WHY THIS EXISTS:
+#    The fixed LEG_SL_PERCENT creates a permanent ceiling on losses but the
+#    floor on profits NEVER lifts.  If a leg is sold at ₹100 and decays to ₹30
+#    (₹70/unit profit), the SL is still ₹120.  A sudden reversal from ₹30 to
+#    ₹120 would erase the ₹70 profit AND add a ₹20 loss — a ₹90/unit swing.
+#    Trailing SL prevents this by locking in increasing minimum profit as the
+#    option price decays.
+#
+#  HOW IT WORKS (per leg — independently):
+#
+#    Phase 1 — TRIGGER (one-time per leg per trade):
+#      When LTP falls to TRAIL_TRIGGER_PCT% of entry price, trailing activates.
+#      Example: entry ₹100, TRAIL_TRIGGER_PCT=50 → triggers when LTP = ₹50.
+#      At activation: initial trailing SL = LTP × (1 + TRAIL_LOCK_PCT/100).
+#      Safety cap: initial trailing SL is capped at the fixed SL level to
+#        prevent misconfigured TRAIL_LOCK_PCT from setting a worse SL than fixed.
+#
+#    Phase 2 — TRAIL (every monitor tick once active):
+#      new_trail_sl = LTP × (1 + TRAIL_LOCK_PCT/100)
+#      SL only MOVES DOWN — updates only when new value < current trailing SL.
+#      This locks in more profit as LTP continues to fall.
+#
+#    Example walk-through (entry ₹100, trigger=50%, lock=30%):
+#      LTP ₹50  → trail activates.  SL = ₹50 × 1.30 = ₹65   (locks ₹35/unit)
+#      LTP ₹35  → SL updated.      SL = ₹35 × 1.30 = ₹45.50 (locks ₹54.50/unit)
+#      LTP ₹20  → SL updated.      SL = ₹20 × 1.30 = ₹26    (locks ₹74/unit)
+#      LTP ₹10  → SL updated.      SL = ₹10 × 1.30 = ₹13    (locks ₹87/unit)
+#      LTP bounces from ₹10 → ₹13 → SL HIT → exit at ₹13 profit = ₹87/unit ✓
+#
+#  STATE PERSISTENCE:
+#    trailing_active_ce/pe and trailing_sl_ce/pe are part of the JSON state.
+#    On script restart mid-trade (crash/restart): the exact trailing state is
+#    fully restored from disk — trailing resumes exactly where it left off.
+#    No reset to the fixed SL on restart — this is the correct behaviour.
+#
+#  TRAIL_TRIGGER_PCT guidance (NIFTY weekly straddle):
+#    40 — early trail — activates when 60% profit captured (aggressive)
+#    50 — balanced    — activates when 50% profit captured (recommended)
+#    60 — conservative— activates when 40% profit captured (fewer activations)
+#
+#  TRAIL_LOCK_PCT guidance:
+#    20 — tight trail — more exits on small bounces, locks more profit
+#    30 — balanced    — good buffer for normal intraday bounces (recommended)
+#    40 — loose trail — fewer exits, wider room, less profit locked per step
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TRAILING_SL_ENABLED  = True
+TRAIL_TRIGGER_PCT    = 50.0   # Activate when LTP falls to this % of entry price
+TRAIL_LOCK_PCT       = 30.0   # Trailing SL = current_LTP × (1 + TRAIL_LOCK_PCT/100)
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 8 — EXPIRY
 #  Format : DDMMMYY uppercase  e.g. "25MAR26"
 #  AUTO_EXPIRY = True resolves the nearest Tuesday automatically every day.
@@ -556,6 +609,14 @@ state = {
 
     # ── Realised P&L from legs already closed this session ───────────────────
     "closed_pnl"       : 0.0,
+
+    # ── Trailing SL state (per leg — independent) ─────────────────────────────
+    # These four fields form the complete trailing SL machine state.
+    # Persisted to JSON so a mid-trade restart resumes trailing exactly.
+    "trailing_active_ce" : False,  # True once trailing SL has been activated for CE
+    "trailing_active_pe" : False,  # True once trailing SL has been activated for PE
+    "trailing_sl_ce"     : 0.0,    # Current trailing SL price level for CE
+    "trailing_sl_pe"     : 0.0,    # Current trailing SL price level for PE
 
     # ── Context at entry ─────────────────────────────────────────────────────
     "underlying_ltp"   : 0.0,
@@ -705,13 +766,38 @@ def active_legs() -> list:
 
 def sl_level(leg: str) -> float:
     """
-    Compute SL trigger price for a given leg.
-    Returns entry_price × (1 + LEG_SL_PERCENT/100).
-    Returns 0.0 if entry price was not captured (SL check will be skipped).
+    Return the CURRENT effective SL trigger price for a given leg.
+
+    Two modes depending on trailing state:
+
+    TRAILING ACTIVE (state["trailing_active_{leg}"] == True):
+      Returns state["trailing_sl_{leg}"] — the dynamically updated trailing level.
+      This value is always <= the fixed SL level (never worse).
+
+    FIXED SL (default / pre-trail):
+      Returns entry_price × (1 + LEG_SL_PERCENT / 100).
+
+    Returns 0.0 if entry price was not captured — SL check is skipped at 0.0.
+
+    Called from:
+      • _run_monitor_tick()    — hot path, every 15s per active leg
+      • place_entry()          — logging initial SL at entry (trailing inactive)
+      • close_one_leg()        — logging the surviving leg's SL after partial exit
+      • show_state()           — operator state dump
+      • reconcile log          — restart state display
     """
-    entry = state[f"entry_price_{leg.lower()}"]
+    leg_lower = leg.lower()
+    entry = state[f"entry_price_{leg_lower}"]
     if entry <= 0:
         return 0.0
+
+    # Trailing SL takes precedence over fixed SL once activated
+    if TRAILING_SL_ENABLED and state.get(f"trailing_active_{leg_lower}", False):
+        trail_sl = state.get(f"trailing_sl_{leg_lower}", 0.0)
+        if trail_sl > 0:
+            return trail_sl
+
+    # Fixed SL — default before trailing activation
     return round(entry * (1.0 + LEG_SL_PERCENT / 100.0), 2)
 
 
@@ -1605,19 +1691,25 @@ def place_entry(expiry: str) -> bool:
 
     # ── Populate state — BOTH legs now active ─────────────────────────────────
     now_dt = now_ist()
-    state["in_position"]    = True
-    state["ce_active"]      = True
-    state["pe_active"]      = True
-    state["symbol_ce"]      = filled_legs["CE"]["symbol"]
-    state["symbol_pe"]      = filled_legs["PE"]["symbol"]
-    state["orderid_ce"]     = filled_legs["CE"]["orderid"]
-    state["orderid_pe"]     = filled_legs["PE"]["orderid"]
-    state["underlying_ltp"] = float(resp.get("underlying_ltp", 0))
-    state["entry_time"]     = now_dt.isoformat()
-    state["entry_date"]     = now_dt.strftime("%Y-%m-%d")
-    state["closed_pnl"]     = 0.0
-    state["today_pnl"]      = 0.0
-    state["exit_reason"]    = ""
+    state["in_position"]       = True
+    state["ce_active"]         = True
+    state["pe_active"]         = True
+    state["symbol_ce"]         = filled_legs["CE"]["symbol"]
+    state["symbol_pe"]         = filled_legs["PE"]["symbol"]
+    state["orderid_ce"]        = filled_legs["CE"]["orderid"]
+    state["orderid_pe"]        = filled_legs["PE"]["orderid"]
+    state["underlying_ltp"]    = float(resp.get("underlying_ltp", 0))
+    state["entry_time"]        = now_dt.isoformat()
+    state["entry_date"]        = now_dt.strftime("%Y-%m-%d")
+    state["closed_pnl"]        = 0.0
+    state["today_pnl"]         = 0.0
+    state["exit_reason"]       = ""
+    # Explicitly reset trailing state — ensures a clean slate for each new trade
+    # even if _mark_fully_flat() was somehow skipped (defensive belt-and-suspenders)
+    state["trailing_active_ce"] = False
+    state["trailing_active_pe"] = False
+    state["trailing_sl_ce"]     = 0.0
+    state["trailing_sl_pe"]     = 0.0
 
     # ── Fetch average fill prices with retry (SL depends on accuracy) ────────
     _capture_fill_prices()
@@ -2015,27 +2107,31 @@ def _mark_fully_flat(reason: str):
             pass
 
     # Reset ALL position-related state (FIX-10: today_pnl included)
-    state["in_position"]      = False
-    state["ce_active"]        = False
-    state["pe_active"]        = False
-    state["symbol_ce"]        = ""
-    state["symbol_pe"]        = ""
-    state["orderid_ce"]       = ""
-    state["orderid_pe"]       = ""
-    state["entry_price_ce"]   = 0.0
-    state["entry_price_pe"]   = 0.0
-    state["closed_pnl"]       = 0.0
-    state["today_pnl"]        = 0.0   # FIX-10: was missing, caused stale value after flat
-    state["underlying_ltp"]   = 0.0
-    state["vix_at_entry"]     = 0.0
-    state["ivr_at_entry"]     = 0.0   # Reset IVR so stale value never shows in next trade
-    state["ivp_at_entry"]     = 0.0   # Reset IVP so stale value never shows in next trade
-    state["entry_time"]       = None
-    state["entry_date"]       = None
-    state["margin_required"]  = 0.0
-    state["margin_available"] = 0.0
-    state["exit_reason"]      = reason
-    state["trade_count"]     += 1
+    state["in_position"]       = False
+    state["ce_active"]         = False
+    state["pe_active"]         = False
+    state["symbol_ce"]         = ""
+    state["symbol_pe"]         = ""
+    state["orderid_ce"]        = ""
+    state["orderid_pe"]        = ""
+    state["entry_price_ce"]    = 0.0
+    state["entry_price_pe"]    = 0.0
+    state["closed_pnl"]        = 0.0
+    state["today_pnl"]         = 0.0   # FIX-10: was missing, caused stale value after flat
+    state["underlying_ltp"]    = 0.0
+    state["vix_at_entry"]      = 0.0
+    state["ivr_at_entry"]      = 0.0   # Reset IVR so stale value never shows in next trade
+    state["ivp_at_entry"]      = 0.0   # Reset IVP so stale value never shows in next trade
+    state["trailing_active_ce"] = False  # Reset trailing — next trade starts with fixed SL
+    state["trailing_active_pe"] = False
+    state["trailing_sl_ce"]     = 0.0
+    state["trailing_sl_pe"]     = 0.0
+    state["entry_time"]        = None
+    state["entry_date"]        = None
+    state["margin_required"]   = 0.0
+    state["margin_available"]  = 0.0
+    state["exit_reason"]       = reason
+    state["trade_count"]      += 1
 
     clear_state_file()
 
@@ -2054,6 +2150,150 @@ def _mark_fully_flat(reason: str):
         f"Final P&L ≈   : Rs.{sign}{final_pnl:.0f}{duration_str}\n"
         f"Session trades: {state['trade_count']}"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TRAILING STOP-LOSS ENGINE
+#
+#  _update_trailing_sl() is called from _run_monitor_tick() AFTER LTP is
+#  confirmed valid (ltp > 0) and BEFORE sl_level() is evaluated for that tick.
+#  This ordering guarantees the monitor always uses the most-current SL.
+#
+#  State mutations in this function:
+#    Phase 1 (activation): trailing_active_{leg} = True
+#                          trailing_sl_{leg}     = initial level
+#                          save_state() called   — persist immediately (critical)
+#    Phase 2 (update):     trailing_sl_{leg} updated if new < current
+#                          No save_state() call — frequent ticks would over-write;
+#                          acceptable: on restart the SL is slightly looser but
+#                          always within the locked-profit window from last save.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _update_trailing_sl(leg: str, ltp: float, entry_px: float):
+    """
+    Update the trailing SL state for one leg based on current LTP.
+
+    Parameters
+    ----------
+    leg      : 'CE' or 'PE'
+    ltp      : confirmed live LTP (caller guarantees ltp > 0)
+    entry_px : entry fill price for this leg (caller guarantees entry_px > 0)
+
+    Phase 1 — Activation (fires once per leg per trade):
+      Condition  : trailing not yet active AND ltp <= entry_px × (TRAIL_TRIGGER_PCT/100)
+      Action     :
+        1. Compute initial trailing SL = round(ltp × (1 + TRAIL_LOCK_PCT/100), 2)
+        2. Safety cap: if initial_trail_sl >= fixed_sl, cap at fixed_sl.
+           This prevents a misconfigured TRAIL_LOCK_PCT from producing a SL
+           that is worse (higher) than the fixed SL the position already had.
+        3. Set state["trailing_active_{leg}"] = True
+        4. Set state["trailing_sl_{leg}"]     = initial_trail_sl
+        5. Log activation with locked-profit amount in rupees
+        6. Send Telegram alert (one-time per leg per trade — not spammy)
+        7. save_state() — trailing activation is critical state, persist now
+
+    Phase 2 — Update (fires every monitor tick while trailing is active):
+      Condition  : trailing already active AND
+                   new_trail_sl < state["trailing_sl_{leg}"]  (SL only moves DOWN)
+      Action     :
+        1. Compute new_trail_sl = round(ltp × (1 + TRAIL_LOCK_PCT/100), 2)
+        2. Update state["trailing_sl_{leg}"] to new_trail_sl
+        3. pdebug log (no Telegram — would fire every 15s)
+        Note: save_state() NOT called here — see module docstring above.
+    """
+    if not TRAILING_SL_ENABLED:
+        return
+
+    leg_key    = leg.lower()   # "ce" or "pe"
+    leg_label  = leg.upper()   # "CE" or "PE"
+    active_key   = f"trailing_active_{leg_key}"
+    trail_sl_key = f"trailing_sl_{leg_key}"
+
+    is_trailing   = state.get(active_key, False)
+    trigger_price = round(entry_px * (TRAIL_TRIGGER_PCT / 100.0), 2)
+
+    if not is_trailing:
+        # ── Phase 1: Activation check ─────────────────────────────────────────
+        if ltp > trigger_price:
+            return   # Not in profit zone yet — nothing to do
+
+        # Compute initial trailing SL
+        initial_trail_sl = round(ltp * (1.0 + TRAIL_LOCK_PCT / 100.0), 2)
+
+        # Safety cap: trailing SL must NEVER be above (worse than) fixed SL.
+        # Only possible if TRAIL_LOCK_PCT is extremely high (misconfiguration).
+        fixed_sl = round(entry_px * (1.0 + LEG_SL_PERCENT / 100.0), 2)
+        if initial_trail_sl >= fixed_sl:
+            pwarn(
+                f"Trailing SL [{leg_label}]: initial trail SL Rs.{initial_trail_sl:.2f} "
+                f">= fixed SL Rs.{fixed_sl:.2f} — "
+                f"TRAIL_LOCK_PCT={TRAIL_LOCK_PCT}% may be too high. "
+                f"Capping at fixed SL Rs.{fixed_sl:.2f}."
+            )
+            initial_trail_sl = fixed_sl
+
+        locked_profit_per_unit = round(entry_px - initial_trail_sl, 2)
+        locked_profit_total    = round(locked_profit_per_unit * qty(), 0)
+        decay_pct              = round((entry_px - ltp) / entry_px * 100.0, 1)
+
+        state[active_key]   = True
+        state[trail_sl_key] = initial_trail_sl
+
+        pinfo(
+            f"TRAILING SL ACTIVATED [{leg_label}]  "
+            f"LTP Rs.{ltp:.2f} ≤ trigger Rs.{trigger_price:.2f} "
+            f"({TRAIL_TRIGGER_PCT}% of entry Rs.{entry_px:.2f}, "
+            f"{decay_pct}% decayed)"
+        )
+        pinfo(
+            f"  Trailing SL set : Rs.{initial_trail_sl:.2f}  "
+            f"(Rs.{ltp:.2f} × {1.0 + TRAIL_LOCK_PCT / 100.0:.2f})"
+        )
+        pinfo(
+            f"  Profit locked   : Rs.{locked_profit_per_unit:.2f}/unit  "
+            f"× {qty()} = Rs.{locked_profit_total:.0f}  "
+            f"(min guaranteed if SL fires)"
+        )
+        pinfo(
+            f"  Fixed SL was    : Rs.{fixed_sl:.2f}  — "
+            f"trailing SL is now Rs.{fixed_sl - initial_trail_sl:.2f} more favourable"
+        )
+
+        # Telegram alert — one-time per leg, high-value information
+        telegram(
+            f"🔒 TRAILING SL ACTIVATED — {leg_label} leg\n"
+            f"Entry price : Rs.{entry_px:.2f}\n"
+            f"LTP now     : Rs.{ltp:.2f}  ({decay_pct}% decayed)\n"
+            f"Trigger was : Rs.{trigger_price:.2f}  ({TRAIL_TRIGGER_PCT}% of entry)\n"
+            f"Trailing SL : Rs.{initial_trail_sl:.2f}  "
+            f"(LTP × {1.0 + TRAIL_LOCK_PCT / 100.0:.2f})\n"
+            f"Fixed SL was: Rs.{fixed_sl:.2f}\n"
+            f"Min profit locked: Rs.{locked_profit_per_unit:.2f}/unit "
+            f"× {qty()} = Rs.{locked_profit_total:.0f}\n"
+            f"SL will tighten further as premium continues to decay."
+        )
+
+        # Persist immediately — activation is critical state
+        save_state()
+
+    else:
+        # ── Phase 2: Update trailing SL (SL can only move DOWN) ──────────────
+        new_trail_sl     = round(ltp * (1.0 + TRAIL_LOCK_PCT / 100.0), 2)
+        current_trail_sl = state.get(trail_sl_key, 0.0)
+
+        if new_trail_sl >= current_trail_sl:
+            return   # SL would move up (worse) or stay — do nothing
+
+        # LTP has fallen further → tighten the trail
+        locked_profit_per_unit = round(entry_px - new_trail_sl, 2)
+        state[trail_sl_key] = new_trail_sl
+
+        pdebug(
+            f"  Trailing SL [{leg_label}] tightened: "
+            f"Rs.{current_trail_sl:.2f} → Rs.{new_trail_sl:.2f}  "
+            f"(LTP Rs.{ltp:.2f} × {1.0 + TRAIL_LOCK_PCT / 100.0:.2f})  "
+            f"min profit now Rs.{locked_profit_per_unit:.2f}/unit"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2233,12 +2473,19 @@ def monitor_pnl():
 def _run_monitor_tick():
     """
     Inner monitor logic — called from monitor_pnl() under lock.
-    Per-leg SL check → combined P&L → daily target/limit.
+    Per-leg SL check → combined P&L → VIX spike check → daily target/limit.
 
     PARTIAL LOGIC:
       Each leg has its OWN independent SL. When one leg hits SL, only that
       leg is closed via close_one_leg(). The other leg keeps running.
       combined_pnl = closed_pnl (realised) + open_mtm (unrealised open legs).
+
+    TRAILING SL INTEGRATION:
+      For each active leg, after LTP is fetched and confirmed valid:
+        1. _update_trailing_sl() — activates or tightens trailing SL in state
+        2. sl_level(leg)         — returns trailing SL if active, else fixed SL
+      This guarantees the SL check always uses the freshest effective SL.
+      Ordering is critical: sl_level() MUST be called AFTER _update_trailing_sl().
     """
     open_mtm = 0.0
 
@@ -2249,8 +2496,9 @@ def _run_monitor_tick():
             continue
 
         entry_px = state[f"entry_price_{leg.lower()}"]
-        sl_lvl   = sl_level(leg)
-        ltp      = _fetch_ltp(leg)
+
+        # ── Fetch live LTP — must come before sl_level() when trailing is on ──
+        ltp = _fetch_ltp(leg)
 
         # Skip this leg if LTP fetch failed — never fire SL on bad data
         if ltp <= 0:
@@ -2259,22 +2507,35 @@ def _run_monitor_tick():
 
         leg_mtm = (entry_px - ltp) * qty() if entry_px > 0 else 0.0
 
+        # ── Update trailing SL state BEFORE evaluating sl_level() ────────────
+        # _update_trailing_sl() may activate or tighten the trailing SL in state.
+        # sl_level() is called AFTER so it reads the freshest effective SL.
+        if entry_px > 0:
+            _update_trailing_sl(leg, ltp, entry_px)
+
+        # ── Effective SL: trailing if active, fixed otherwise ─────────────────
+        sl_lvl      = sl_level(leg)
+        is_trailing = TRAILING_SL_ENABLED and state.get(f"trailing_active_{leg.lower()}", False)
+
         pdebug(
             f"  {leg} | entry Rs.{entry_px:.2f} | ltp Rs.{ltp:.2f} | "
             f"mtm Rs.{leg_mtm:.0f} | sl @ Rs.{sl_lvl:.2f}"
+            + (" [TRAIL]" if is_trailing else " [FIXED]")
         )
 
         # ── PER-LEG SL CHECK ─────────────────────────────────────────────────
-        # Fires only if: SL enabled, entry price captured, LTP breached SL level
+        # Fires only if: SL enabled, entry price captured, LTP breached SL level.
+        # Works identically for fixed AND trailing SL — sl_level() abstracts both.
         if LEG_SL_PERCENT > 0 and sl_lvl > 0 and ltp >= sl_lvl:
+            sl_type = "Trailing SL" if is_trailing else f"Fixed SL {LEG_SL_PERCENT}%"
             pwarn(
-                f"SL HIT: {leg}  |  LTP Rs.{ltp:.2f} >= SL Rs.{sl_lvl:.2f}  "
-                f"({LEG_SL_PERCENT}% of Rs.{entry_px:.2f})"
+                f"SL HIT [{sl_type}]: {leg}  |  "
+                f"LTP Rs.{ltp:.2f} >= SL Rs.{sl_lvl:.2f}  "
+                f"(entry Rs.{entry_px:.2f})"
             )
-            # Close ONLY this leg — other leg keeps running
             close_one_leg(
                 leg,
-                reason=f"{leg} Leg SL {LEG_SL_PERCENT}% Hit",
+                reason=f"{leg} {sl_type} Hit @ Rs.{sl_lvl:.2f}",
                 current_ltp=ltp,
             )
             # This leg's P&L is now in closed_pnl — not in open_mtm
@@ -2740,7 +3001,17 @@ def _print_banner():
     )
     print(f"  VIX spike monitor: {spike_str}", flush=True)
 
-    print(f"  Sq-off mode      : PARTIAL — each leg has independent {LEG_SL_PERCENT}% SL", flush=True)
+    # Trailing SL display
+    if TRAILING_SL_ENABLED:
+        trail_str = (
+            f"ENABLED  trigger={TRAIL_TRIGGER_PCT}% of entry  "
+            f"lock={TRAIL_LOCK_PCT}% above LTP"
+        )
+    else:
+        trail_str = "DISABLED"
+    print(f"  Trailing SL      : {trail_str}", flush=True)
+
+    print(f"  Sq-off mode      : PARTIAL — each leg has independent {LEG_SL_PERCENT}% fixed SL → trailing once {TRAIL_TRIGGER_PCT}% decayed", flush=True)
     print(f"  Daily target     : Rs.{DAILY_PROFIT_TARGET_PER_LOT}/lot × {NUMBER_OF_LOTS} lot(s) = Rs.{DAILY_PROFIT_TARGET}  (0=disabled)", flush=True)
     print(f"  Daily limit      : Rs.{DAILY_LOSS_LIMIT_PER_LOT}/lot × {NUMBER_OF_LOTS} lot(s) = Rs.{DAILY_LOSS_LIMIT}   (0=disabled)", flush=True)
     print(f"  Margin guard     : {guard_str}", flush=True)
@@ -2921,6 +3192,36 @@ def _validate_config():
         except Exception:
             errors.append(f"MANUAL_EXPIRY format invalid: {MANUAL_EXPIRY!r}  (expected DDMMMYY e.g. 25MAR26)")
 
+    # ── Trailing SL ───────────────────────────────────────────────────────────
+    if TRAILING_SL_ENABLED:
+        if not (0.0 < TRAIL_TRIGGER_PCT < 100.0):
+            errors.append(
+                f"TRAIL_TRIGGER_PCT must be between 0 and 100 (exclusive), "
+                f"got {TRAIL_TRIGGER_PCT}"
+            )
+        if TRAIL_LOCK_PCT <= 0:
+            errors.append(
+                f"TRAIL_LOCK_PCT must be > 0 when TRAILING_SL_ENABLED=True, "
+                f"got {TRAIL_LOCK_PCT}"
+            )
+        # Logical consistency: trailing only makes sense if fixed SL is also set
+        if LEG_SL_PERCENT <= 0:
+            errors.append(
+                "TRAILING_SL_ENABLED=True requires LEG_SL_PERCENT > 0 — "
+                "trailing SL replaces the fixed SL after trigger; "
+                "with LEG_SL_PERCENT=0 (disabled) there is no fixed SL to improve upon"
+            )
+        # Warn (not error) if TRAIL_LOCK_PCT >= LEG_SL_PERCENT: trailing SL would
+        # activate at a level equal to or above the fixed SL — effectively no benefit.
+        # This is a misconfiguration warning, not a hard block.
+        if TRAIL_LOCK_PCT >= LEG_SL_PERCENT and LEG_SL_PERCENT > 0:
+            pwarn(
+                f"CONFIG WARNING: TRAIL_LOCK_PCT ({TRAIL_LOCK_PCT}%) >= "
+                f"LEG_SL_PERCENT ({LEG_SL_PERCENT}%). "
+                f"The trailing SL will be capped at the fixed SL level at activation. "
+                f"Consider reducing TRAIL_LOCK_PCT for meaningful profit locking."
+            )
+
     # ── IVR / IVP filter ──────────────────────────────────────────────────────
     if IVR_FILTER_ENABLED and not (0.0 <= IVR_MIN <= 100.0):
         errors.append(f"IVR_MIN must be 0–100, got {IVR_MIN}")
@@ -3090,17 +3391,21 @@ def run():
         )
     else:
         tg_entry = ENTRY_TIME
-    ivr_tg  = f"IVR>={IVR_MIN}" if IVR_FILTER_ENABLED else "off"
-    ivp_tg  = f"IVP>={IVP_MIN}%" if IVP_FILTER_ENABLED else "off"
-    spike_tg = (
+    ivr_tg     = f"IVR>={IVR_MIN}" if IVR_FILTER_ENABLED else "off"
+    ivp_tg     = f"IVP>={IVP_MIN}%" if IVP_FILTER_ENABLED else "off"
+    spike_tg   = (
         f"VIX spike: +{VIX_SPIKE_THRESHOLD_PCT}% → exit (check/{VIX_SPIKE_CHECK_INTERVAL_S}s)"
         if VIX_SPIKE_MONITOR_ENABLED else "VIX spike monitor: off"
+    )
+    trail_tg   = (
+        f"Trailing SL: trigger@{TRAIL_TRIGGER_PCT}% decay  lock={TRAIL_LOCK_PCT}% above LTP"
+        if TRAILING_SL_ENABLED else "Trailing SL: off"
     )
     telegram(
         f"🚀 Strategy STARTED v{VERSION} [PARTIAL]\n"
         f"Entry: {tg_entry}  Hard Exit: {EXIT_TIME}\n"
         f"Qty/leg: {NUMBER_OF_LOTS}×{LOT_SIZE} = {qty()}\n"
-        f"Leg SL: {LEG_SL_PERCENT}% (independent per leg)\n"
+        f"Fixed SL: {LEG_SL_PERCENT}% per leg  |  {trail_tg}\n"
         f"VIX: {VIX_MIN}–{VIX_MAX}  |  {ivr_tg}  |  {ivp_tg}\n"
         f"{spike_tg}\n"
         f"DTE filter: {dte_str}  (trading days, AlgoTest-compatible)\n"
