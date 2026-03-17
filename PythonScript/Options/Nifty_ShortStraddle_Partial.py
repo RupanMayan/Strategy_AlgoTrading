@@ -19,7 +19,8 @@
 ║   • Median SL hit: 22 min after entry | 40% of SLs hit within 15 min           ║
 ║                                                                                  ║
 ║   Implementation:                                                               ║
-║   1. Entry  : SELL CE + SELL PE at ATM simultaneously at 09:17                 ║
+║   1. Entry  : SELL CE + SELL PE at ATM simultaneously                          ║
+║              DTE0/DTE1: 09:30  DTE2: 09:35  DTE3: 09:40  DTE4: 09:45          ║
 ║   2. Per-leg: each leg monitored with its OWN independent 20% SL level         ║
 ║              CE_SL = CE_entry_price × 1.20                                     ║
 ║              PE_SL = PE_entry_price × 1.20                                     ║
@@ -994,7 +995,21 @@ def fetch_vix() -> float:
 def vix_ok() -> bool:
     """Check VIX filter. Returns True = OK to trade, False = skip."""
     if not VIX_FILTER_ENABLED:
-        pinfo("VIX filter disabled")
+        # VIX range filter is off, but IVR/IVP filters still need a valid VIX value.
+        # Fetch and store it so ivr_ivp_ok() receives a real number, not 0.0.
+        if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED:
+            vix = fetch_vix()
+            if vix > 0:
+                state["vix_at_entry"] = vix
+                pinfo(f"VIX filter disabled — fetched VIX {vix:.2f} for IVR/IVP filter")
+            else:
+                pwarn(
+                    "VIX filter disabled but VIX fetch failed — "
+                    "IVR/IVP filter will receive VIX=0.0 and will likely skip trade. "
+                    "Check OpenAlgo / NSE connectivity."
+                )
+        else:
+            pinfo("VIX filter disabled")
         return True
 
     vix = fetch_vix()
@@ -1338,10 +1353,16 @@ def _check_vix_history_on_startup():
 #  DTE + MONTH FILTERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def dte_filter_ok() -> bool:
+def dte_filter_ok(dte: int = None) -> bool:
     """
     Return True if today passes the weekend check, the month filter, and the
     DTE filter — in that order (cheapest checks first).
+
+    Parameters
+    ----------
+    dte : optional precomputed DTE value. When provided, get_dte() is skipped,
+          avoiding a redundant call in job_entry() which already computed DTE
+          for the USE_DTE_ENTRY_MAP time-slot guard.
 
     Weekend guard:
       Saturday and Sunday are never valid trading days. AlgoTest's DTE filter
@@ -1380,7 +1401,8 @@ def dte_filter_ok() -> bool:
         return False
 
     # ── DTE filter ────────────────────────────────────────────────────────────
-    dte = get_dte()
+    if dte is None:
+        dte = get_dte()
 
     if dte not in TRADE_DTE:
         pinfo(
@@ -2779,6 +2801,8 @@ def job_entry():
     #  per unique time in DTE_ENTRY_TIME_MAP). Each job fires on all weekdays;
     #  this guard ensures only the job whose scheduled time matches the current
     #  DTE's configured entry time actually proceeds.
+    #  dte_now is stored for reuse in step 2 — avoids a second get_dte() call.
+    dte_now = None
     if USE_DTE_ENTRY_MAP:
         now_hhmm = now_ist().strftime("%H:%M")
         dte_now  = get_dte()
@@ -2796,7 +2820,9 @@ def job_entry():
         return
 
     # ── 2. DTE filter + month filter ──────────────────────────────────────────
-    if not dte_filter_ok():
+    #  Pass precomputed dte_now (from step 0) when available so get_dte() is
+    #  not called a second time within dte_filter_ok().
+    if not dte_filter_ok(dte_now):
         return
 
     # ── 3. VIX filter ─────────────────────────────────────────────────────────
