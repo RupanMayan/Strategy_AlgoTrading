@@ -3062,10 +3062,11 @@ def bootstrap_vix_history() -> bool:
         )
         # Close/value field: try known NSE key names
         close_raw = (
-            item.get("EOD_INDEX_VALUE") or
-            item.get("CLOSE")           or
-            item.get("Close")           or
-            item.get("close")           or ""
+            item.get("EOD_CLOSE_INDEX_VAL") or
+            item.get("EOD_INDEX_VALUE")     or
+            item.get("CLOSE")               or
+            item.get("Close")               or
+            item.get("close")               or ""
         )
         if not date_raw or not close_raw:
             continue
