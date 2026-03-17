@@ -496,7 +496,7 @@ MANUAL_EXPIRY = "25MAR26"      # Used only when AUTO_EXPIRY = False  (must be a 
 #  Must match exactly what is registered in the OpenAlgo dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
 
-STRATEGY_NAME = "Nifty Trending Straddle"
+STRATEGY_NAME = "Nifty Short Straddle"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 10 — TELEGRAM ALERTS
