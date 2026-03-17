@@ -2994,21 +2994,27 @@ def bootstrap_vix_history() -> bool:
     Params : from=DD-MM-YYYY&to=DD-MM-YYYY
     Auth   : requires NSE session cookies (grabbed via two warm-up GETs).
 
-    NSE supports up to ~1 year per request — we split the 2-year window
-    into two consecutive 365-day chunks and merge the results.
+    NSE caps programmatic responses at ~70 records per request. We split
+    the 2-year window into 90-day calendar chunks (~8 requests) and merge.
     """
     psep()
     pinfo("VIX HISTORY AUTO-BOOTSTRAP — fetching 2 years from NSE")
 
     today = now_ist().date()
 
-    # NSE supports up to ~1 year per request; split 2-year window into two chunks.
-    chunks = [
-        (today - timedelta(days=730), today - timedelta(days=366)),
-        (today - timedelta(days=365), today),
-    ]
+    # NSE API caps each programmatic response at ~70 records regardless of date
+    # range (browser sessions get more due to richer cookies). Split into 90-day
+    # calendar chunks (~65 trading days each) so each request stays within the
+    # 70-record limit. 2 years / 90 days = ~8 chunks × ~65 records = ~520 rows.
+    start_date  = today - timedelta(days=730)
+    chunks      = []
+    chunk_start = start_date
+    while chunk_start < today:
+        chunk_end = min(chunk_start + timedelta(days=89), today)
+        chunks.append((chunk_start, chunk_end))
+        chunk_start = chunk_end + timedelta(days=1)
 
-    pinfo(f"  Date range  : {chunks[0][0].strftime('%d-%m-%Y')} → {chunks[-1][1].strftime('%d-%m-%Y')} (2 chunks)")
+    pinfo(f"  Date range  : {chunks[0][0].strftime('%d-%m-%Y')} → {chunks[-1][1].strftime('%d-%m-%Y')} ({len(chunks)} chunks)")
     pinfo(f"  Target file : {os.path.abspath(VIX_HISTORY_FILE)}")
 
     hdrs = {
