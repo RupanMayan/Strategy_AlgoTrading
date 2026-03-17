@@ -206,9 +206,37 @@ STRIKE_OFFSET  = "ATM"         # ATM | OTM1..OTM5 | ITM1..ITM5
 #  SECTION 3 — TIMING  (IST 24h HH:MM)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-ENTRY_TIME         = "09:17"   # Straddle entry time
+ENTRY_TIME         = "09:30"   # Straddle entry time (fallback when USE_DTE_ENTRY_MAP=False)
 EXIT_TIME          = "15:15"   # Hard square-off — closes ALL remaining open legs
 MONITOR_INTERVAL_S = 15        # Seconds between P&L / SL checks
+
+# ── DTE-aware entry time map ───────────────────────────────────────────────
+#
+#  Rationale: Opening IV is 15–25% inflated vs fair value for the first
+#  10–15 min. Entering at 09:17 captures max premium but also captures
+#  max opening volatility — 40% of all SL hits occur within 15 min of entry.
+#  Waiting for IV normalisation improves fill quality and reduces false SLs.
+#
+#  DTE0/DTE1 (Tue/Mon): enter at 09:30 — gap settled, still captures most
+#    of the day's theta on the highest-premium days.
+#  DTE2 (Fri): 09:35 — moderate theta, extra 5 min improves fill price.
+#  DTE3 (Thu): 09:40 — lower premium, margin-spike risk on open; cleaner
+#    entry outweighs the marginal extra premium from entering earlier.
+#  DTE4 (Wed): 09:45 — thin premium anyway; entering early adds risk with
+#    minimal reward.
+#
+#  Set USE_DTE_ENTRY_MAP = False to use the fixed ENTRY_TIME for all days.
+# ──────────────────────────────────────────────────────────────────────────
+
+USE_DTE_ENTRY_MAP  = True       # True = use map below | False = use ENTRY_TIME for all
+
+DTE_ENTRY_TIME_MAP = {
+    0: "09:30",   # DTE0 = Tuesday  (expiry day)   — gap settled, max theta day
+    1: "09:30",   # DTE1 = Monday   (1 day out)    — strong theta, same rationale
+    2: "09:35",   # DTE2 = Friday   (2 days out)   — moderate theta, cleaner fill
+    3: "09:40",   # DTE3 = Thursday (3 days out)   — lower premium, avoid open spike
+    4: "09:45",   # DTE4 = Wednesday (4 days out)  — thin premium, no rush
+}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 4 — DTE FILTER  (Days To Expiry)
@@ -1932,6 +1960,22 @@ def job_entry():
     pinfo(f"ENTRY JOB | {now_ist().strftime('%A %d-%b-%Y %H:%M:%S IST')}")
     psep()
 
+    # ── 0. DTE-aware entry time guard ─────────────────────────────────────────
+    #  When USE_DTE_ENTRY_MAP is True, multiple entry jobs are scheduled (one
+    #  per unique time in DTE_ENTRY_TIME_MAP). Each job fires on all weekdays;
+    #  this guard ensures only the job whose scheduled time matches the current
+    #  DTE's configured entry time actually proceeds.
+    if USE_DTE_ENTRY_MAP:
+        now_hhmm = now_ist().strftime("%H:%M")
+        dte_now  = get_dte()
+        effective_entry = DTE_ENTRY_TIME_MAP.get(dte_now, ENTRY_TIME)
+        if now_hhmm != effective_entry:
+            pinfo(
+                f"DTE{dte_now} effective entry is {effective_entry} — "
+                f"current time {now_hhmm} does not match; this job slot skipped"
+            )
+            return
+
     # ── 1. Duplicate guard ────────────────────────────────────────────────────
     if state["in_position"]:
         pwarn("Already in position — entry skipped (duplicate guard)")
@@ -2031,7 +2075,13 @@ def _print_banner():
     print(f"  Underlying       : {UNDERLYING}  |  Exchange  : {EXCHANGE}", flush=True)
     print(f"  Lot size         : {LOT_SIZE}  |  Lots : {NUMBER_OF_LOTS}  |  Qty/leg : {qty()}", flush=True)
     print(f"  Strike offset    : {STRIKE_OFFSET}  |  Product : {PRODUCT}", flush=True)
-    print(f"  Entry            : {ENTRY_TIME} IST  |  Hard exit : {EXIT_TIME} IST", flush=True)
+    if USE_DTE_ENTRY_MAP:
+        dte_entry_str = "  |  ".join(
+            f"DTE{d}={DTE_ENTRY_TIME_MAP[d]}" for d in sorted(DTE_ENTRY_TIME_MAP)
+        )
+        print(f"  Entry (DTE-map)  : {dte_entry_str}  |  Hard exit : {EXIT_TIME} IST", flush=True)
+    else:
+        print(f"  Entry            : {ENTRY_TIME} IST  |  Hard exit : {EXIT_TIME} IST", flush=True)
     print(f"  Monitor interval : every {MONITOR_INTERVAL_S}s", flush=True)
     print(f"  DTE filter       : {dte_str}  ({day_str})", flush=True)
     print(f"  Skip months      : {skip_str}", flush=True)
@@ -2180,6 +2230,13 @@ def _validate_config():
         assert 0 <= eh <= 23 and 0 <= em <= 59
     except Exception:
         errors.append(f"ENTRY_TIME invalid: {ENTRY_TIME!r}  (expected HH:MM)")
+    if USE_DTE_ENTRY_MAP:
+        for dte_key, t in DTE_ENTRY_TIME_MAP.items():
+            try:
+                dh, dm = parse_hhmm(t)
+                assert 0 <= dh <= 23 and 0 <= dm <= 59
+            except Exception:
+                errors.append(f"DTE_ENTRY_TIME_MAP[{dte_key}] invalid: {t!r}  (expected HH:MM)")
     try:
         xh, xm = parse_hhmm(EXIT_TIME)
         assert 0 <= xh <= 23 and 0 <= xm <= 59
@@ -2242,21 +2299,41 @@ def run():
     check_connection()
     reconcile_on_startup()
 
-    entry_h, entry_m = parse_hhmm(ENTRY_TIME)
     exit_h,  exit_m  = parse_hhmm(EXIT_TIME)
 
     scheduler = BlockingScheduler(timezone=IST)
 
-    scheduler.add_job(
-        func               = job_entry,
-        trigger            = "cron",
-        day_of_week        = "mon-fri",
-        hour               = entry_h,
-        minute             = entry_m,
-        id                 = "entry_job",
-        name               = f"Entry {ENTRY_TIME}",
-        misfire_grace_time = 60,
-    )
+    # ── Entry job(s) ──────────────────────────────────────────────────────────
+    if USE_DTE_ENTRY_MAP:
+        # Schedule one job per unique entry time in the map.
+        # Each job fires on all weekdays (mon-fri); the DTE-aware guard inside
+        # job_entry() ensures only the matching time slot actually enters.
+        unique_times = sorted(set(DTE_ENTRY_TIME_MAP.values()))
+        for t in unique_times:
+            th, tm = parse_hhmm(t)
+            scheduler.add_job(
+                func               = job_entry,
+                trigger            = "cron",
+                day_of_week        = "mon-fri",
+                hour               = th,
+                minute             = tm,
+                id                 = f"entry_job_{t.replace(':', '')}",
+                name               = f"Entry {t} (DTE-map)",
+                misfire_grace_time = 60,
+            )
+        pinfo(f"DTE-aware entry scheduled at: {', '.join(unique_times)} IST")
+    else:
+        entry_h, entry_m = parse_hhmm(ENTRY_TIME)
+        scheduler.add_job(
+            func               = job_entry,
+            trigger            = "cron",
+            day_of_week        = "mon-fri",
+            hour               = entry_h,
+            minute             = entry_m,
+            id                 = "entry_job",
+            name               = f"Entry {ENTRY_TIME}",
+            misfire_grace_time = 60,
+        )
     scheduler.add_job(
         func               = job_exit,
         trigger            = "cron",
@@ -2276,8 +2353,14 @@ def run():
     )
 
     dte_str = ", ".join(f"DTE{d}" for d in sorted(TRADE_DTE))
+    if USE_DTE_ENTRY_MAP:
+        entry_display = "DTE-map " + ", ".join(
+            f"DTE{d}={DTE_ENTRY_TIME_MAP[d]}" for d in sorted(DTE_ENTRY_TIME_MAP)
+        )
+    else:
+        entry_display = ENTRY_TIME
     pinfo(
-        f"Scheduler running | Entry: {ENTRY_TIME} | "
+        f"Scheduler running | Entry: {entry_display} | "
         f"Exit: {EXIT_TIME} | Monitor: every {MONITOR_INTERVAL_S}s"
     )
     pinfo("Press Ctrl+C to stop gracefully  |  systemd sends SIGTERM — both handled")
@@ -2301,9 +2384,15 @@ def run():
         f"fail_open={MARGIN_GUARD_FAIL_OPEN})"
         if MARGIN_GUARD_ENABLED else "Margin guard: DISABLED"
     )
+    if USE_DTE_ENTRY_MAP:
+        tg_entry = "DTE-map: " + ", ".join(
+            f"DTE{d}={DTE_ENTRY_TIME_MAP[d]}" for d in sorted(DTE_ENTRY_TIME_MAP)
+        )
+    else:
+        tg_entry = ENTRY_TIME
     telegram(
         f"🚀 Strategy STARTED v{VERSION} [PARTIAL]\n"
-        f"Entry: {ENTRY_TIME}  Hard Exit: {EXIT_TIME}\n"
+        f"Entry: {tg_entry}  Hard Exit: {EXIT_TIME}\n"
         f"Qty/leg: {NUMBER_OF_LOTS}×{LOT_SIZE} = {qty()}\n"
         f"Leg SL: {LEG_SL_PERCENT}% (independent per leg)\n"
         f"VIX: {VIX_MIN}–{VIX_MAX}\n"
