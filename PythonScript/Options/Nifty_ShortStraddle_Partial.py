@@ -338,7 +338,7 @@ IVR_FILTER_ENABLED   = True
 IVR_MIN              = 30.0    # Skip if IVR < 30  (IV in bottom 30% of 52wk range)
 IVP_FILTER_ENABLED   = True
 IVP_MIN              = 40.0    # Skip if IVP < 40% (IV below 40th percentile)
-IVR_FAIL_OPEN        = False   # False = skip trade when history file unavailable
+IVR_FAIL_OPEN        = True    # True = allow trade when history file unavailable (paper trading)
 VIX_HISTORY_FILE     = "vix_history.csv"   # Path to daily VIX closing data file
 VIX_HISTORY_MIN_ROWS = 100     # Minimum rows needed for a meaningful IVR/IVP calc
 VIX_UPDATE_TIME      = "15:30" # IST time to auto-append today's VIX to history file
