@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY TRENDING STRATEGY  —  PARTIAL SQUARE OFF   v5.4.0                     ║
+║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.4.0                        ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -159,7 +159,7 @@
 ║       export TELEGRAM_CHAT_ID="your_chat_id"                                    ║
 ║   3.  Sync Master Contract in OpenAlgo dashboard before 09:00                  ║
 ║   4.  Enable Analyze Mode in OpenAlgo dashboard (paper trade first)            ║
-║   5.  python Nifty_TrendingStrategy_DTE_v5.py                                  ║
+║   5.  python Nifty_ShortStraddle_Partial.py                                    ║
 ║   6.  After satisfied with paper trades → disable Analyze Mode → goes LIVE     ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   SYMBOL FORMAT  (docs.openalgo.in)                                             ║
@@ -496,7 +496,7 @@ MANUAL_EXPIRY = "25MAR26"      # Used only when AUTO_EXPIRY = False  (must be a 
 #  Must match exactly what is registered in the OpenAlgo dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
 
-STRATEGY_NAME = "Nifty Trending Straddle"
+STRATEGY_NAME = "Short Straddle"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 10 — TELEGRAM ALERTS
@@ -2964,7 +2964,7 @@ def _print_banner():
 
     print("", flush=True)
     print("=" * 72, flush=True)
-    print(f"  NIFTY TRENDING STRADDLE  v{VERSION}  —  PARTIAL SQUARE OFF", flush=True)
+    print(f"  NIFTY SHORT STRADDLE  v{VERSION}  —  PARTIAL SQUARE OFF", flush=True)
     print(f"  OpenAlgo + Dhan API  |  Restart-Safe  |  Production Grade", flush=True)
     print("=" * 72, flush=True)
     print(f"  Host             : {OPENALGO_HOST}", flush=True)
