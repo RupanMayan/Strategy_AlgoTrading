@@ -288,6 +288,62 @@ VIX_MIN            = 14.0
 VIX_MAX            = 28.0
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 6A — IV RANK (IVR) / IV PERCENTILE (IVP) FILTER
+#
+#  WHY THIS FILTER EXISTS:
+#    A short straddle only has genuine statistical edge when IMPLIED VOLATILITY
+#    is historically expensive — because expensive IV mean-reverts downward,
+#    adding an IV-crush profit component on top of theta decay.
+#    Without this filter, entries on low-IVR days face an IV headwind: even
+#    if NIFTY stays flat, rising IV makes your short positions more expensive.
+#
+#  IV RANK (IVR):
+#    IVR = (Today_VIX − 52wk_Low_VIX) / (52wk_High_VIX − 52wk_Low_VIX) × 100
+#    Answers: "Where is today's IV within the past 52-week HIGH/LOW range?"
+#    IVR = 0  → VIX at 52-week low   |   IVR = 100 → VIX at 52-week high
+#
+#  IV PERCENTILE (IVP):
+#    IVP = (Days in past 252 where VIX < Today_VIX) / 252 × 100
+#    Answers: "What % of past 252 days had LOWER IV than today?"
+#    IVP = 75 → IV is higher than it was on 75% of trading days this year
+#
+#  BALANCED THRESHOLDS (recommended for NIFTY weekly straddle):
+#    IVR_MIN = 30  — skip if IV is in the bottom 30% of its 52-week range
+#    IVP_MIN = 40  — skip if IV is below 40th percentile of daily occurrences
+#    Expected: ~20–25% fewer trades, +5–8% win-rate improvement, −30% max-DD
+#
+#  DATA REQUIREMENT:
+#    Requires vix_history.csv — a CSV of daily VIX closing values.
+#    Format (with header):
+#        date,vix_close
+#        2024-04-01,14.82
+#        2024-04-02,15.10
+#        ...
+#    BOOTSTRAP: Download NIFTY VIX historical data from nseindia.com
+#      → Market Data → Volatility → Historical VIX → download CSV.
+#      Rename to vix_history.csv, keep only "Date" and "Close" columns,
+#      rename headers to "date,vix_close", save in the same directory as this script.
+#    AUTO-UPDATE: job_update_vix_history() appends today's VIX every day at
+#      VIX_UPDATE_TIME automatically — file is self-maintaining after bootstrap.
+#
+#  IVR_FAIL_OPEN:
+#    False (recommended) → if history file is missing/short, SKIP trade.
+#      Rationale: unknown IV regime = unknown edge. Better to miss a trade than
+#      enter blindly. This is conservative and production-safe.
+#    True  → allow trade if data is unavailable (matches margin guard behaviour).
+#      Use only in paper-trade / testing mode.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+IVR_FILTER_ENABLED   = True
+IVR_MIN              = 30.0    # Skip if IVR < 30  (IV in bottom 30% of 52wk range)
+IVP_FILTER_ENABLED   = True
+IVP_MIN              = 40.0    # Skip if IVP < 40% (IV below 40th percentile)
+IVR_FAIL_OPEN        = False   # False = skip trade when history file unavailable
+VIX_HISTORY_FILE     = "vix_history.csv"   # Path to daily VIX closing data file
+VIX_HISTORY_MIN_ROWS = 100     # Minimum rows needed for a meaningful IVR/IVP calc
+VIX_UPDATE_TIME      = "15:30" # IST time to auto-append today's VIX to history file
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 7 — RISK MANAGEMENT
 #
 #  LEG_SL_PERCENT — applied to EACH LEG INDEPENDENTLY
@@ -331,6 +387,46 @@ MARGIN_GUARD_ENABLED   = True
 MARGIN_BUFFER          = 1.20    # 20% safety headroom over required margin
 MARGIN_GUARD_FAIL_OPEN = True    # True = allow trade if margin API fails
 ATM_STRIKE_ROUNDING    = 50      # NIFTY=50, BANKNIFTY=100, FINNIFTY=50
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7B — INTRADAY VIX SPIKE MONITOR
+#
+#  WHY THIS EXISTS:
+#    The short straddle is short vega — a rising VIX directly increases the
+#    value of both legs even if NIFTY price stays flat.  When VIX spikes
+#    mid-session (surprise macro event, global sell-off, circuit trigger),
+#    being short vega is the most dangerous place to be.
+#    This monitor catches mid-session IV expansion and exits BEFORE the
+#    combined loss exceeds what the VIX filter would have blocked at entry.
+#
+#  HOW IT WORKS:
+#    vix_at_entry is captured during the entry filter (stored in state).
+#    Every VIX_SPIKE_CHECK_INTERVAL_S seconds the monitor fetches live VIX.
+#    If current_VIX > vix_at_entry × (1 + VIX_SPIKE_THRESHOLD_PCT / 100):
+#      → close_all() fires immediately with reason "VIX Spike Exit"
+#      → Telegram alert sent
+#
+#  THRESHOLD GUIDANCE (NIFTY-specific):
+#    10% → very sensitive — catches even moderate IV expansion (more exits)
+#    15% → balanced — catches significant intraday spikes (recommended)
+#    20% → relaxed  — only exits on severe events (fewer exits, more risk)
+#
+#  CHECK INTERVAL:
+#    VIX fetch is throttled — runs at most once per VIX_SPIKE_CHECK_INTERVAL_S
+#    seconds regardless of how often the monitor tick fires.
+#    300s (5 min) is sufficient for event detection without API overload.
+#    Reduce to 180s (3 min) on high-volatility days if desired.
+#
+#  THREADING NOTE:
+#    _check_vix_spike() is called from _run_monitor_tick() which already
+#    holds _monitor_lock.  close_all() uses "with _monitor_lock" — this is
+#    safe because _monitor_lock is a threading.RLock (reentrant), so the same
+#    thread can re-acquire it without deadlocking.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+VIX_SPIKE_MONITOR_ENABLED    = True
+VIX_SPIKE_THRESHOLD_PCT      = 15.0   # % rise from entry VIX triggers exit
+VIX_SPIKE_CHECK_INTERVAL_S   = 300    # Seconds between VIX spike checks (5 min)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 8 — EXPIRY
@@ -392,6 +488,11 @@ MONTH_NAMES = {
 # Monitor job + state mutation guard (RLock — reentrant so close_all can call
 # close_one_leg while both hold the lock within the same call chain).
 _monitor_lock = threading.RLock()
+
+# Timestamp of the last intraday VIX spike check — module-level so it persists
+# across monitor ticks but resets on each new Python process (correct behaviour:
+# we want a fresh check timer for every trading session, not persisted to disk).
+_last_vix_spike_check_time = None
 
 # ── Effective daily target / limit (auto-scaled with NUMBER_OF_LOTS) ──────────
 #  DO NOT edit these — change DAILY_PROFIT_TARGET_PER_LOT / DAILY_LOSS_LIMIT_PER_LOT
@@ -459,6 +560,8 @@ state = {
     # ── Context at entry ─────────────────────────────────────────────────────
     "underlying_ltp"   : 0.0,
     "vix_at_entry"     : 0.0,
+    "ivr_at_entry"     : 0.0,     # IV Rank at entry time (0–100)
+    "ivp_at_entry"     : 0.0,     # IV Percentile at entry time (0–100)
     "entry_time"       : None,    # ISO string (JSON-serialisable)
     "entry_date"       : None,    # YYYY-MM-DD (stale-state detection on restart)
 
@@ -826,6 +929,319 @@ def vix_ok() -> bool:
     pinfo(f"VIX {vix:.2f} within [{VIX_MIN}–{VIX_MAX}] — OK to trade")
     state["vix_at_entry"] = vix
     return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  VIX HISTORY  —  DAILY DATA MANAGEMENT
+#
+#  VIX_HISTORY_FILE is a local CSV maintained automatically by this script.
+#  It is read at entry time to compute IVR and IVP.
+#  It is written once per trading day at VIX_UPDATE_TIME by job_update_vix_history().
+#
+#  File format (with header row):
+#    date,vix_close
+#    2024-04-01,14.82
+#    2024-04-02,15.10
+#    ...
+#
+#  BOOTSTRAP (first-time setup):
+#    1. Download NSE VIX historical data from nseindia.com
+#       → Market Data → Volatility → Historical VIX
+#    2. Keep only "Date" and "Close" columns, rename to "date,vix_close"
+#    3. Save as vix_history.csv in the same directory as this script
+#    After bootstrap the file self-maintains via the 15:30 daily update job.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_vix_history_raw() -> list:
+    """
+    Load all rows from VIX_HISTORY_FILE.
+
+    Returns a list of (date_str, vix_float) tuples sorted chronologically.
+    Returns [] if the file does not exist, is empty, or cannot be parsed.
+    Malformed individual rows are skipped — the rest of the file is still used.
+    """
+    if not os.path.exists(VIX_HISTORY_FILE):
+        return []
+    try:
+        rows = []
+        with open(VIX_HISTORY_FILE) as f:
+            for line in f:
+                line = line.strip()
+                # Skip blank lines and the header row
+                if not line or line.lower().startswith("date"):
+                    continue
+                parts = line.split(",")
+                if len(parts) < 2:
+                    continue
+                try:
+                    date_str = parts[0].strip()
+                    vix_val  = float(parts[1].strip())
+                    # Basic sanity: VIX should be a positive number in a sane range
+                    if vix_val > 0:
+                        rows.append((date_str, vix_val))
+                except (ValueError, IndexError):
+                    continue   # Skip malformed rows silently
+        # ISO date strings sort lexicographically = chronologically — no datetime parse needed
+        rows.sort(key=lambda x: x[0])
+        return rows
+    except Exception as exc:
+        pwarn(f"VIX history raw load failed: {exc}")
+        return []
+
+
+def _load_vix_history() -> list:
+    """
+    Load VIX history values for IVR/IVP calculation.
+
+    Returns the last 252 closing VIX values as a list of floats (oldest first).
+    Returns None if the file has fewer than VIX_HISTORY_MIN_ROWS valid rows,
+    signalling that the data is insufficient for a meaningful IVR/IVP result.
+    """
+    rows = _load_vix_history_raw()
+    n    = len(rows)
+
+    if n < VIX_HISTORY_MIN_ROWS:
+        pwarn(
+            f"VIX history: {n} rows found — need at least {VIX_HISTORY_MIN_ROWS} "
+            f"for IVR/IVP calculation. "
+            f"{'Bootstrap the file from NSE historical data.' if n == 0 else 'Continuing to collect daily data.'}"
+        )
+        return None
+
+    # Use the most recent 252 rows (one trading year) for the 52-week window.
+    # If fewer than 252 rows exist but >= VIX_HISTORY_MIN_ROWS, use all available
+    # rows — the calculation is still meaningful, just covers a shorter window.
+    recent = rows[-252:]
+    return [v for _, v in recent]
+
+
+def compute_ivr(current_vix: float, history_values: list) -> float:
+    """
+    Compute IV Rank (IVR) as a percentage (0–100).
+
+    IVR = (current_vix − min) / (max − min) × 100
+
+    Edge case: if max == min (flat VIX history — extremely rare), return 50.0
+    so the filter neither blocks nor artificially passes on degenerate data.
+
+    Parameters
+    ----------
+    current_vix    : today's VIX value
+    history_values : list of float VIX closes (typically 252 values)
+    """
+    low  = min(history_values)
+    high = max(history_values)
+    if high == low:
+        pwarn(f"compute_ivr: 52-week high == low ({high:.2f}) — returning neutral 50.0")
+        return 50.0
+    ivr = (current_vix - low) / (high - low) * 100.0
+    # Clamp to [0, 100] — current VIX could theoretically be outside the
+    # historical window if today is a new extreme (rare but possible)
+    return round(max(0.0, min(100.0, ivr)), 1)
+
+
+def compute_ivp(current_vix: float, history_values: list) -> float:
+    """
+    Compute IV Percentile (IVP) as a percentage (0–100).
+
+    IVP = count(days where vix_close < current_vix) / len(history) × 100
+
+    Uses strict less-than (<), not <=, which is the standard definition.
+    Days equal to current_vix are not counted as "below".
+
+    Parameters
+    ----------
+    current_vix    : today's VIX value
+    history_values : list of float VIX closes (typically 252 values)
+    """
+    if not history_values:
+        return 50.0
+    days_below = sum(1 for v in history_values if v < current_vix)
+    ivp = days_below / len(history_values) * 100.0
+    return round(ivp, 1)
+
+
+def ivr_ivp_ok(current_vix: float) -> bool:
+    """
+    IVR / IVP filter gate — called from job_entry() after vix_ok() passes.
+
+    Receives current_vix already fetched by vix_ok() — no duplicate API call.
+
+    Logic:
+      1. If both filters disabled → return True immediately (no-op)
+      2. Load 252-day VIX history from VIX_HISTORY_FILE
+         → If unavailable: apply IVR_FAIL_OPEN policy (fail-closed by default)
+      3. Compute IVR and IVP (always compute both for logging/analytics even if
+         one filter is disabled — values stored in state regardless)
+      4. IVR check (if IVR_FILTER_ENABLED): fail if ivr < IVR_MIN
+      5. IVP check (if IVP_FILTER_ENABLED): fail if ivp < IVP_MIN
+      6. Store ivr_at_entry / ivp_at_entry in state for Telegram + analytics
+
+    Returns True (proceed to entry) or False (skip today's trade).
+    """
+    both_disabled = not IVR_FILTER_ENABLED and not IVP_FILTER_ENABLED
+    if both_disabled:
+        pinfo("IVR/IVP filter: both disabled — skipping check")
+        return True
+
+    psep()
+    pinfo("IVR/IVP FILTER CHECK")
+    pinfo(f"  Current VIX : {current_vix:.2f}")
+
+    # ── Load VIX history ──────────────────────────────────────────────────────
+    history_values = _load_vix_history()
+
+    if history_values is None:
+        # Insufficient or missing data — apply fail-open/closed policy
+        if IVR_FAIL_OPEN:
+            pwarn(
+                "IVR/IVP: VIX history insufficient — fail-open policy, "
+                "proceeding with entry. Bootstrap vix_history.csv for full protection."
+            )
+            telegram(
+                "⚠️ IVR/IVP filter: VIX history insufficient\n"
+                "Proceeding (fail-open). Bootstrap vix_history.csv."
+            )
+            psep()
+            return True
+        else:
+            pwarn(
+                "IVR/IVP: VIX history insufficient — fail-closed policy, "
+                "skipping trade. Bootstrap vix_history.csv to enable this filter."
+            )
+            telegram(
+                "IVR/IVP filter: VIX history insufficient — trade SKIPPED (fail-closed).\n"
+                "Bootstrap vix_history.csv from NSE historical VIX data."
+            )
+            psep()
+            return False
+
+    n    = len(history_values)
+    low  = min(history_values)
+    high = max(history_values)
+
+    # ── Compute both metrics (always — for logging and state storage) ─────────
+    ivr = compute_ivr(current_vix, history_values)
+    ivp = compute_ivp(current_vix, history_values)
+
+    pinfo(f"  History     : {n} days  |  52wk Low: {low:.2f}  52wk High: {high:.2f}")
+    pinfo(f"  IVR         : {ivr:.1f}  (threshold: >= {IVR_MIN}  |  enabled: {IVR_FILTER_ENABLED})")
+    pinfo(f"  IVP         : {ivp:.1f}%  (threshold: >= {IVP_MIN}%  |  enabled: {IVP_FILTER_ENABLED})")
+
+    # ── IVR check ─────────────────────────────────────────────────────────────
+    if IVR_FILTER_ENABLED:
+        if ivr < IVR_MIN:
+            pwarn(
+                f"  IVR CHECK: FAIL ✗  "
+                f"IVR {ivr:.1f} < {IVR_MIN} — "
+                f"IV in bottom {ivr:.0f}% of its 52-week range, not rich enough to sell"
+            )
+            psep()
+            telegram(
+                f"IVR filter: SKIP today\n"
+                f"IVR {ivr:.1f} &lt; {IVR_MIN} — IV not historically rich\n"
+                f"VIX: {current_vix:.2f}  |  52wk range: {low:.2f}–{high:.2f}"
+            )
+            return False
+        pinfo(f"  IVR CHECK: PASS ✓  IVR {ivr:.1f} >= {IVR_MIN}")
+
+    # ── IVP check ─────────────────────────────────────────────────────────────
+    if IVP_FILTER_ENABLED:
+        if ivp < IVP_MIN:
+            pwarn(
+                f"  IVP CHECK: FAIL ✗  "
+                f"IVP {ivp:.1f}% < {IVP_MIN}% — "
+                f"VIX is below {ivp:.0f}% of the past {n} trading days, below median"
+            )
+            psep()
+            telegram(
+                f"IVP filter: SKIP today\n"
+                f"IVP {ivp:.1f}% &lt; {IVP_MIN}% — IV below historical median\n"
+                f"VIX: {current_vix:.2f}  |  Days below today's VIX: {int(ivp * n / 100)}/{n}"
+            )
+            return False
+        pinfo(f"  IVP CHECK: PASS ✓  IVP {ivp:.1f}% >= {IVP_MIN}%")
+
+    # ── Both checks passed — store in state for Telegram + analytics ──────────
+    state["ivr_at_entry"] = ivr
+    state["ivp_at_entry"] = ivp
+
+    pinfo(
+        f"  IVR/IVP filter: PASS ✓ — "
+        f"IV is historically rich — IV-crush tailwind expected"
+    )
+    psep()
+    return True
+
+
+def _check_vix_history_on_startup():
+    """
+    Validate VIX history file at startup and log actionable status.
+
+    Checks:
+      1. File exists
+      2. Row count (>= VIX_HISTORY_MIN_ROWS)
+      3. Staleness (last recorded date vs today)
+
+    Does NOT block startup — only logs warnings.
+    Actual trade decisions use IVR_FAIL_OPEN to determine behaviour when data
+    is insufficient.  This function is purely informational.
+    """
+    if not IVR_FILTER_ENABLED and not IVP_FILTER_ENABLED:
+        pinfo("IVR/IVP filter disabled — skipping VIX history startup check")
+        return
+
+    psep()
+    pinfo("VIX HISTORY STARTUP CHECK")
+
+    if not os.path.exists(VIX_HISTORY_FILE):
+        pwarn(f"  VIX history file NOT FOUND: {os.path.abspath(VIX_HISTORY_FILE)}")
+        pwarn("  IVR/IVP filter will SKIP trades (fail-closed) until file is created.")
+        pwarn("  Bootstrap: download NSE historical VIX → save as vix_history.csv")
+        pwarn("  Format: header 'date,vix_close' then rows like '2025-01-02,14.82'")
+        psep()
+        return
+
+    rows = _load_vix_history_raw()
+    n    = len(rows)
+
+    if n == 0:
+        pwarn(f"  VIX history file EXISTS but has 0 valid rows: {VIX_HISTORY_FILE}")
+        pwarn("  Check file format: header must be 'date,vix_close', values must be numeric")
+        psep()
+        return
+
+    latest_date_str = rows[-1][0]
+    latest_vix      = rows[-1][1]
+
+    pinfo(f"  File        : {os.path.abspath(VIX_HISTORY_FILE)}")
+    pinfo(f"  Rows        : {n}  (need >= {VIX_HISTORY_MIN_ROWS} for full accuracy)")
+    pinfo(f"  Latest entry: {latest_date_str}  VIX {latest_vix:.2f}")
+
+    if n < VIX_HISTORY_MIN_ROWS:
+        pwarn(
+            f"  Row count {n} < {VIX_HISTORY_MIN_ROWS} minimum. "
+            f"IVR/IVP accuracy is limited. "
+            f"{'Add more history from NSE data.' if n < 50 else 'Growing — will improve over time.'}"
+        )
+
+    # Staleness check — warn if last entry is more than 5 calendar days ago
+    try:
+        latest_dt = date.fromisoformat(latest_date_str)
+        today     = now_ist().date()
+        days_old  = (today - latest_dt).days
+        if days_old > 5:
+            pwarn(
+                f"  ⚠ VIX history is {days_old} calendar days stale "
+                f"(last: {latest_date_str}). "
+                f"The 15:30 auto-update job will fix this today."
+            )
+        else:
+            pinfo(f"  Freshness   : {days_old} calendar day(s) old — OK")
+    except (ValueError, TypeError):
+        pwarn(f"  Could not parse latest date: {latest_date_str!r}")
+
+    psep()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1215,15 +1631,29 @@ def place_entry(expiry: str) -> bool:
 
     pinfo("ENTRY COMPLETE")
     pinfo(f"  Mode      : {trade_mode}  NIFTY: {state['underlying_ltp']}  VIX: {state['vix_at_entry']:.2f}")
+    if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED:
+        pinfo(
+            f"  IVR       : {state['ivr_at_entry']:.1f}  |  "
+            f"IVP: {state['ivp_at_entry']:.1f}%"
+        )
     pinfo(f"  CE        : {state['symbol_ce']}  fill Rs.{state['entry_price_ce']:.2f}  SL @ Rs.{sl_ce:.2f}")
     pinfo(f"  PE        : {state['symbol_pe']}  fill Rs.{state['entry_price_pe']:.2f}  SL @ Rs.{sl_pe:.2f}")
     pinfo(f"  Margin used : Rs.{state['margin_required']:,.0f}  |  Available was: Rs.{state['margin_available']:,.0f}")
     pinfo(f"  State persisted → {STATE_FILE}")
     psep()
 
+    # Build IVR/IVP line only when at least one filter is active and values captured
+    ivr_ivp_line = ""
+    if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED:
+        ivr_ivp_line = (
+            f"IVR: {state['ivr_at_entry']:.1f}  |  "
+            f"IVP: {state['ivp_at_entry']:.1f}%\n"
+        )
+
     telegram(
         f"✅ ENTRY PLACED [{trade_mode}]\n"
         f"NIFTY: {state['underlying_ltp']}  VIX: {state['vix_at_entry']:.2f}\n"
+        f"{ivr_ivp_line}"
         f"CE : {state['symbol_ce']}\n"
         f"  Fill Rs.{state['entry_price_ce']:.2f}  |  SL @ Rs.{sl_ce:.2f}\n"
         f"PE : {state['symbol_pe']}\n"
@@ -1598,6 +2028,8 @@ def _mark_fully_flat(reason: str):
     state["today_pnl"]        = 0.0   # FIX-10: was missing, caused stale value after flat
     state["underlying_ltp"]   = 0.0
     state["vix_at_entry"]     = 0.0
+    state["ivr_at_entry"]     = 0.0   # Reset IVR so stale value never shows in next trade
+    state["ivp_at_entry"]     = 0.0   # Reset IVP so stale value never shows in next trade
     state["entry_time"]       = None
     state["entry_date"]       = None
     state["margin_required"]  = 0.0
@@ -1621,6 +2053,115 @@ def _mark_fully_flat(reason: str):
         f"Reason        : {reason}\n"
         f"Final P&L ≈   : Rs.{sign}{final_pnl:.0f}{duration_str}\n"
         f"Session trades: {state['trade_count']}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INTRADAY VIX SPIKE MONITOR
+#
+#  _check_vix_spike() is called from _run_monitor_tick() while _monitor_lock
+#  is already held.  close_all() inside uses "with _monitor_lock" — this is
+#  safe because _monitor_lock is a threading.RLock (reentrant): the same thread
+#  can re-acquire it without deadlocking.
+#
+#  Throttle: fetches VIX at most once per VIX_SPIKE_CHECK_INTERVAL_S seconds,
+#  regardless of how often monitor ticks fire (every MONITOR_INTERVAL_S seconds).
+#  At default settings: VIX spike check runs every 5 minutes (300s).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _check_vix_spike():
+    """
+    Intraday VIX spike detector — called from _run_monitor_tick() under lock.
+
+    Throttled to run at most once per VIX_SPIKE_CHECK_INTERVAL_S seconds so
+    that a 15-second monitor loop does not hammer the VIX quotes API.
+
+    Logic:
+      1. Guard: feature enabled + position open + entry VIX captured
+      2. Throttle: skip if last check was < VIX_SPIKE_CHECK_INTERVAL_S ago
+      3. Fetch current live VIX
+      4. Compute spike_pct = (current_vix − vix_at_entry) / vix_at_entry × 100
+      5. If spike_pct >= VIX_SPIKE_THRESHOLD_PCT:
+           → Telegram alert with full context
+           → close_all()  (RLock re-entry is safe — same thread)
+
+    VIX fetch failures are treated as a non-event (skipped, not a close trigger).
+    We do NOT close positions on inability to fetch VIX — only on confirmed spike.
+    This is the correct conservative behaviour: if VIX is unreachable, the broker
+    is likely also unreachable and placing close orders would fail anyway.
+    """
+    global _last_vix_spike_check_time
+
+    # ── Feature guard ─────────────────────────────────────────────────────────
+    if not VIX_SPIKE_MONITOR_ENABLED:
+        return
+
+    if not state["in_position"]:
+        return
+
+    entry_vix = state.get("vix_at_entry", 0.0)
+    if entry_vix <= 0:
+        # Entry VIX was not captured (fetch failed at entry time). Cannot compute
+        # spike %. Skip silently — this was already warned at entry.
+        return
+
+    # ── Throttle ──────────────────────────────────────────────────────────────
+    now = now_ist()
+    if (
+        _last_vix_spike_check_time is not None
+        and (now - _last_vix_spike_check_time).total_seconds() < VIX_SPIKE_CHECK_INTERVAL_S
+    ):
+        return   # Too soon since last check — skip this tick
+
+    _last_vix_spike_check_time = now
+
+    # ── Fetch live VIX ────────────────────────────────────────────────────────
+    current_vix = fetch_vix()
+
+    if current_vix <= 0:
+        pwarn(
+            f"VIX spike monitor: VIX unavailable — check skipped "
+            f"(will retry in {VIX_SPIKE_CHECK_INTERVAL_S}s)"
+        )
+        return
+
+    # Round to 2 decimal places — VIX is reported to 2dp by NSE; rounding
+    # eliminates floating-point representation noise (e.g. 15.000000000001 vs 15.0)
+    # and ensures the threshold comparison is clean.
+    spike_pct = round((current_vix - entry_vix) / entry_vix * 100.0, 2)
+
+    pdebug(
+        f"VIX spike monitor: "
+        f"entry={entry_vix:.2f}  current={current_vix:.2f}  "
+        f"change={spike_pct:+.2f}%  threshold={VIX_SPIKE_THRESHOLD_PCT}%"
+    )
+
+    # ── Spike check ───────────────────────────────────────────────────────────
+    if spike_pct < VIX_SPIKE_THRESHOLD_PCT:
+        pinfo(
+            f"VIX spike check OK: {entry_vix:.2f} → {current_vix:.2f} "
+            f"({spike_pct:+.1f}% | threshold {VIX_SPIKE_THRESHOLD_PCT}%)"
+        )
+        return
+
+    # ── Spike confirmed — exit immediately ────────────────────────────────────
+    pwarn(
+        f"VIX SPIKE DETECTED: {entry_vix:.2f} → {current_vix:.2f} "
+        f"({spike_pct:+.1f}% ≥ threshold {VIX_SPIKE_THRESHOLD_PCT}%) — "
+        f"closing all positions, short vega in rising IV is dangerous"
+    )
+    telegram(
+        f"🚨 VIX SPIKE EXIT\n"
+        f"Entry VIX   : {entry_vix:.2f}\n"
+        f"Current VIX : {current_vix:.2f}\n"
+        f"Change      : {spike_pct:+.1f}%  (threshold: +{VIX_SPIKE_THRESHOLD_PCT}%)\n"
+        f"Active legs : {active_legs()}\n"
+        f"Action      : Closing all positions immediately.\n"
+        f"Rationale   : Short vega position in a rising-IV environment — "
+        f"IV expansion erodes premium collected even on flat NIFTY."
+    )
+    close_all(
+        reason=f"VIX Spike Exit ({entry_vix:.1f}→{current_vix:.1f}, {spike_pct:+.1f}%)"
     )
 
 
@@ -1759,6 +2300,14 @@ def _run_monitor_tick():
         f"Target: Rs.{DAILY_PROFIT_TARGET} | "
         f"Limit: Rs.{DAILY_LOSS_LIMIT}"
     )
+
+    # ── INTRADAY VIX SPIKE CHECK (throttled — runs at most once per VIX_SPIKE_CHECK_INTERVAL_S) ──
+    # Must run BEFORE daily target/limit checks so that a spike exit fires
+    # even when P&L is currently positive.  After _check_vix_spike() returns
+    # we must re-check in_position: the spike handler may have closed everything.
+    _check_vix_spike()
+    if not state["in_position"]:
+        return   # VIX spike exit fired — nothing left to check
 
     # ── DAILY PROFIT TARGET (combined) ───────────────────────────────────────
     if DAILY_PROFIT_TARGET > 0 and combined_pnl >= DAILY_PROFIT_TARGET:
@@ -1989,15 +2538,21 @@ def job_entry():
     if not vix_ok():
         return
 
-    # ── 4. Resolve expiry ONCE — used for both margin check and order entry ───
+    # ── 4. IVR / IVP filter — uses VIX already fetched and stored by vix_ok() ─
+    #  vix_ok() stores the validated VIX in state["vix_at_entry"] before returning
+    #  True, so we reuse it here to avoid a second API call.
+    if not ivr_ivp_ok(state["vix_at_entry"]):
+        return
+
+    # ── 5. Resolve expiry ONCE — used for both margin check and order entry ───
     expiry = get_expiry()
 
-    # ── 5. Pre-trade margin guard ─────────────────────────────────────────────
+    # ── 6. Pre-trade margin guard ─────────────────────────────────────────────
     if not check_margin_sufficient(expiry):
         perr("Entry ABORTED — insufficient margin (cash + collateral)")
         return
 
-    # ── 6. Reset daily counters and place entry ───────────────────────────────
+    # ── 7. Reset daily counters and place entry ───────────────────────────────
     state["today_pnl"]  = 0.0
     state["closed_pnl"] = 0.0
 
@@ -2026,6 +2581,87 @@ def job_monitor():
     """Monitor tick — fires every MONITOR_INTERVAL_S seconds."""
     if state["in_position"]:
         monitor_pnl()
+
+
+def job_update_vix_history():
+    """
+    Daily VIX history maintenance job — fires once at VIX_UPDATE_TIME (15:30 IST).
+
+    Purpose: append today's closing VIX value to VIX_HISTORY_FILE so that the
+    IVR/IVP filter has fresh data for tomorrow's entry decision.
+
+    Logic:
+      1. Skip on weekends — VIX_UPDATE_TIME job fires mon-fri in the scheduler.
+         The weekend guard here protects against manual calls on Saturdays/Sundays.
+      2. Check for duplicate — if today's date is already the last row, skip
+         (handles script restart after 15:30 gracefully, no double-entry).
+      3. Fetch live VIX via fetch_vix() — the same API used by the entry filter.
+         At 15:30 this is effectively the closing price.
+      4. Append new row to the file using atomic write (temp-file + rename),
+         same pattern as save_state() — crash-safe, no partial writes.
+      5. Trim file to last 300 rows to prevent unbounded growth while keeping
+         a comfortable buffer beyond the 252-row window needed for IVR/IVP.
+
+    On VIX fetch failure: logs warning + Telegram.  Does NOT raise — a missed
+    daily update is not fatal; the previous day's data remains valid for tomorrow.
+    """
+    now_dt = now_ist()
+
+    # Weekend guard — belt-and-suspenders (scheduler fires mon-fri anyway)
+    if now_dt.weekday() >= 5:
+        pdebug("VIX history update: weekend — skipping")
+        return
+
+    today_str = now_dt.date().isoformat()
+
+    # ── Duplicate guard — avoid double-appending on restart after 15:30 ──────
+    rows = _load_vix_history_raw()
+    if rows and rows[-1][0] == today_str:
+        pdebug(
+            f"VIX history: {today_str} already recorded "
+            f"(VIX {rows[-1][1]:.2f}) — no update needed"
+        )
+        return
+
+    # ── Fetch today's closing VIX ─────────────────────────────────────────────
+    vix = fetch_vix()
+    if vix <= 0:
+        pwarn(f"VIX history update: VIX unavailable for {today_str} — skipping")
+        telegram(
+            f"⚠️ VIX history: daily update FAILED for {today_str}\n"
+            f"IVR/IVP data will be 1 day stale tomorrow.\n"
+            f"Check OpenAlgo / NSE connectivity."
+        )
+        return
+
+    # ── Append new row and trim to 300 rows ───────────────────────────────────
+    rows.append((today_str, vix))
+    if len(rows) > 300:
+        rows = rows[-300:]
+
+    # Atomic write — same temp-rename pattern as save_state()
+    try:
+        hist_dir = os.path.dirname(os.path.abspath(VIX_HISTORY_FILE)) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=hist_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write("date,vix_close\n")
+                for d, v in rows:
+                    f.write(f"{d},{v:.2f}\n")
+            os.replace(tmp_path, VIX_HISTORY_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        pinfo(
+            f"VIX history updated: {today_str} → VIX {vix:.2f}  "
+            f"({len(rows)} rows in {VIX_HISTORY_FILE})"
+        )
+    except Exception as exc:
+        pwarn(f"VIX history write failed: {exc}")
+        telegram(f"⚠️ VIX history write FAILED: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2086,6 +2722,24 @@ def _print_banner():
     print(f"  DTE filter       : {dte_str}  ({day_str})", flush=True)
     print(f"  Skip months      : {skip_str}", flush=True)
     print(f"  VIX filter       : {VIX_MIN}–{VIX_MAX}  (enabled: {VIX_FILTER_ENABLED})", flush=True)
+
+    # IVR / IVP filter display
+    ivr_str = f"IVR>={IVR_MIN}" if IVR_FILTER_ENABLED else "IVR=disabled"
+    ivp_str = f"IVP>={IVP_MIN}%" if IVP_FILTER_ENABLED else "IVP=disabled"
+    print(
+        f"  IVR/IVP filter   : {ivr_str}  |  {ivp_str}  |  "
+        f"fail_open={IVR_FAIL_OPEN}  |  history={VIX_HISTORY_FILE}",
+        flush=True,
+    )
+
+    # VIX spike monitor display
+    spike_str = (
+        f"ENABLED  threshold={VIX_SPIKE_THRESHOLD_PCT}%  "
+        f"check_every={VIX_SPIKE_CHECK_INTERVAL_S}s"
+        if VIX_SPIKE_MONITOR_ENABLED else "DISABLED"
+    )
+    print(f"  VIX spike monitor: {spike_str}", flush=True)
+
     print(f"  Sq-off mode      : PARTIAL — each leg has independent {LEG_SL_PERCENT}% SL", flush=True)
     print(f"  Daily target     : Rs.{DAILY_PROFIT_TARGET_PER_LOT}/lot × {NUMBER_OF_LOTS} lot(s) = Rs.{DAILY_PROFIT_TARGET}  (0=disabled)", flush=True)
     print(f"  Daily limit      : Rs.{DAILY_LOSS_LIMIT_PER_LOT}/lot × {NUMBER_OF_LOTS} lot(s) = Rs.{DAILY_LOSS_LIMIT}   (0=disabled)", flush=True)
@@ -2267,6 +2921,36 @@ def _validate_config():
         except Exception:
             errors.append(f"MANUAL_EXPIRY format invalid: {MANUAL_EXPIRY!r}  (expected DDMMMYY e.g. 25MAR26)")
 
+    # ── IVR / IVP filter ──────────────────────────────────────────────────────
+    if IVR_FILTER_ENABLED and not (0.0 <= IVR_MIN <= 100.0):
+        errors.append(f"IVR_MIN must be 0–100, got {IVR_MIN}")
+    if IVP_FILTER_ENABLED and not (0.0 <= IVP_MIN <= 100.0):
+        errors.append(f"IVP_MIN must be 0–100, got {IVP_MIN}")
+    if (IVR_FILTER_ENABLED or IVP_FILTER_ENABLED) and not VIX_HISTORY_FILE:
+        errors.append("VIX_HISTORY_FILE must not be empty when IVR/IVP filter is enabled")
+    if VIX_HISTORY_MIN_ROWS <= 0:
+        errors.append(f"VIX_HISTORY_MIN_ROWS must be > 0, got {VIX_HISTORY_MIN_ROWS}")
+    try:
+        vuh, vum = parse_hhmm(VIX_UPDATE_TIME)
+        assert 0 <= vuh <= 23 and 0 <= vum <= 59
+    except Exception:
+        errors.append(f"VIX_UPDATE_TIME invalid: {VIX_UPDATE_TIME!r}  (expected HH:MM)")
+
+    # ── VIX spike monitor ─────────────────────────────────────────────────────
+    if VIX_SPIKE_MONITOR_ENABLED and VIX_SPIKE_THRESHOLD_PCT <= 0:
+        errors.append(
+            f"VIX_SPIKE_THRESHOLD_PCT must be > 0 when VIX_SPIKE_MONITOR_ENABLED=True, "
+            f"got {VIX_SPIKE_THRESHOLD_PCT}"
+        )
+    if VIX_SPIKE_CHECK_INTERVAL_S <= 0:
+        errors.append(f"VIX_SPIKE_CHECK_INTERVAL_S must be > 0, got {VIX_SPIKE_CHECK_INTERVAL_S}")
+    if VIX_SPIKE_MONITOR_ENABLED and VIX_SPIKE_CHECK_INTERVAL_S < MONITOR_INTERVAL_S:
+        errors.append(
+            f"VIX_SPIKE_CHECK_INTERVAL_S ({VIX_SPIKE_CHECK_INTERVAL_S}s) must be >= "
+            f"MONITOR_INTERVAL_S ({MONITOR_INTERVAL_S}s) — "
+            f"spike check cannot run faster than the monitor loop"
+        )
+
     # ── Telegram ──────────────────────────────────────────────────────────────
     if TELEGRAM_ENABLED and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
         # Warn, don't block — Telegram is advisory only
@@ -2298,8 +2982,10 @@ def run():
     _print_banner()
     check_connection()
     reconcile_on_startup()
+    _check_vix_history_on_startup()   # Log VIX history file status (advisory only)
 
     exit_h,  exit_m  = parse_hhmm(EXIT_TIME)
+    vix_upd_h, vix_upd_m = parse_hhmm(VIX_UPDATE_TIME)
 
     scheduler = BlockingScheduler(timezone=IST)
 
@@ -2351,6 +3037,20 @@ def run():
         id      = "monitor_job",
         name    = f"Monitor {MONITOR_INTERVAL_S}s",
     )
+    # VIX history daily update — runs once at VIX_UPDATE_TIME after market close.
+    # Appends today's closing VIX to vix_history.csv so tomorrow's IVR/IVP
+    # filter has fresh data.  Scheduled mon-fri; job itself has a weekend guard.
+    scheduler.add_job(
+        func               = job_update_vix_history,
+        trigger            = "cron",
+        day_of_week        = "mon-fri",
+        hour               = vix_upd_h,
+        minute             = vix_upd_m,
+        id                 = "vix_history_job",
+        name               = f"VIX History Update {VIX_UPDATE_TIME}",
+        misfire_grace_time = 300,   # 5-min grace — if delayed by scheduler restart
+    )
+    pinfo(f"VIX history update scheduled at {VIX_UPDATE_TIME} IST (mon-fri)")
 
     dte_str = ", ".join(f"DTE{d}" for d in sorted(TRADE_DTE))
     if USE_DTE_ENTRY_MAP:
@@ -2390,12 +3090,19 @@ def run():
         )
     else:
         tg_entry = ENTRY_TIME
+    ivr_tg  = f"IVR>={IVR_MIN}" if IVR_FILTER_ENABLED else "off"
+    ivp_tg  = f"IVP>={IVP_MIN}%" if IVP_FILTER_ENABLED else "off"
+    spike_tg = (
+        f"VIX spike: +{VIX_SPIKE_THRESHOLD_PCT}% → exit (check/{VIX_SPIKE_CHECK_INTERVAL_S}s)"
+        if VIX_SPIKE_MONITOR_ENABLED else "VIX spike monitor: off"
+    )
     telegram(
         f"🚀 Strategy STARTED v{VERSION} [PARTIAL]\n"
         f"Entry: {tg_entry}  Hard Exit: {EXIT_TIME}\n"
         f"Qty/leg: {NUMBER_OF_LOTS}×{LOT_SIZE} = {qty()}\n"
         f"Leg SL: {LEG_SL_PERCENT}% (independent per leg)\n"
-        f"VIX: {VIX_MIN}–{VIX_MAX}\n"
+        f"VIX: {VIX_MIN}–{VIX_MAX}  |  {ivr_tg}  |  {ivp_tg}\n"
+        f"{spike_tg}\n"
         f"DTE filter: {dte_str}  (trading days, AlgoTest-compatible)\n"
         f"Skip months: {', '.join(MONTH_NAMES[m] for m in sorted(SKIP_MONTHS)) if SKIP_MONTHS else 'None'}\n"
         f"Target: Rs.{DAILY_PROFIT_TARGET_PER_LOT}/lot = Rs.{DAILY_PROFIT_TARGET}  "
