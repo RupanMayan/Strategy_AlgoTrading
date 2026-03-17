@@ -2990,7 +2990,7 @@ def bootstrap_vix_history() -> bool:
     Returns True on success (file written with >= 1 row), False on failure.
     Never raises — all errors are logged as warnings.
 
-    NSE API: https://www.nseindia.com/api/historical/vixhistory
+    NSE API: https://www.nseindia.com/api/historicalOR/vixhistory
     Params : from=DD-MM-YYYY&to=DD-MM-YYYY
     Auth   : requires NSE session cookies (grabbed via two warm-up GETs).
 
@@ -3032,7 +3032,7 @@ def bootstrap_vix_history() -> bool:
             from_str = chunk_from.strftime("%d-%m-%Y")
             to_str   = chunk_to.strftime("%d-%m-%Y")
             url = (
-                f"https://www.nseindia.com/api/historical/vixhistory"
+                f"https://www.nseindia.com/api/historicalOR/vixhistory"
                 f"?from={from_str}&to={to_str}"
             )
             r = sess.get(url, headers=hdrs, timeout=20)
