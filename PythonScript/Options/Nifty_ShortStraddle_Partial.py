@@ -1282,11 +1282,15 @@ def _check_vix_history_on_startup():
 
     if not os.path.exists(VIX_HISTORY_FILE):
         pwarn(f"  VIX history file NOT FOUND: {os.path.abspath(VIX_HISTORY_FILE)}")
-        pwarn("  IVR/IVP filter will SKIP trades (fail-closed) until file is created.")
-        pwarn("  Bootstrap: download NSE historical VIX → save as vix_history.csv")
-        pwarn("  Format: header 'date,vix_close' then rows like '2025-01-02,14.82'")
-        psep()
-        return
+        pinfo("  Auto-bootstrapping from NSE historical VIX data...")
+        success = bootstrap_vix_history()
+        if not success:
+            pwarn("  Auto-bootstrap FAILED.")
+            pwarn("  IVR/IVP filter will SKIP trades (fail-closed) until file is created.")
+            pwarn("  Manual fix: uncomment bootstrap_vix_history() in __main__ and run once.")
+            psep()
+            return
+        # Bootstrap succeeded — fall through to normal row/staleness checks
 
     rows = _load_vix_history_raw()
     n    = len(rows)
@@ -2926,6 +2930,153 @@ def job_update_vix_history():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  VIX HISTORY AUTO-BOOTSTRAP
+#
+#  Fetches up to 2 years of NSE historical VIX closing data and writes
+#  vix_history.csv automatically — no manual download required.
+#
+#  Called automatically at startup when VIX_HISTORY_FILE does not exist.
+#  Also callable manually: uncomment bootstrap_vix_history() in __main__.
+#
+#  Uses the NSE historical VIX API with the same cookie-auth pattern as
+#  the fetch_vix() fallback.  On failure the existing IVR_FAIL_OPEN policy
+#  applies — no trades are blocked by the bootstrap itself.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def bootstrap_vix_history() -> bool:
+    """
+    Fetch 2 years of NSE historical VIX data and write vix_history.csv.
+
+    Returns True on success (file written with >= 1 row), False on failure.
+    Never raises — all errors are logged as warnings.
+
+    NSE API: https://www.nseindia.com/api/historical/vixhistory
+    Params : from=DD-MM-YYYY&to=DD-MM-YYYY
+    Auth   : requires NSE session cookies (grabbed via two warm-up GETs).
+    """
+    psep()
+    pinfo("VIX HISTORY AUTO-BOOTSTRAP — fetching 2 years from NSE")
+
+    today     = now_ist().date()
+    from_date = today - timedelta(days=730)
+    from_str  = from_date.strftime("%d-%m-%Y")
+    to_str    = today.strftime("%d-%m-%Y")
+
+    pinfo(f"  Date range  : {from_str} → {to_str}")
+    pinfo(f"  Target file : {os.path.abspath(VIX_HISTORY_FILE)}")
+
+    hdrs = {
+        "User-Agent"      : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept"          : "application/json, text/plain, */*",
+        "Accept-Language" : "en-US,en;q=0.9",
+        "Referer"         : "https://www.nseindia.com/",
+    }
+
+    try:
+        sess = requests.Session()
+        # NSE requires cookie warm-up before API calls
+        sess.get("https://www.nseindia.com", headers=hdrs, timeout=10)
+        sess.get(
+            "https://www.nseindia.com/market-data/historical-volatility-india-vix",
+            headers=hdrs, timeout=10,
+        )
+
+        url = (
+            f"https://www.nseindia.com/api/historical/vixhistory"
+            f"?from={from_str}&to={to_str}"
+        )
+        r = sess.get(url, headers=hdrs, timeout=20)
+        r.raise_for_status()
+        raw = r.json().get("data", [])
+
+    except Exception as exc:
+        pwarn(f"  Bootstrap: NSE request failed — {exc}")
+        psep()
+        return False
+
+    if not raw:
+        pwarn("  Bootstrap: NSE returned empty data array")
+        psep()
+        return False
+
+    # ── Parse rows — NSE field names vary by endpoint version ─────────────────
+    rows = []
+    for item in raw:
+        # Date field: try known NSE key names
+        date_raw = (
+            item.get("EOD_TIMESTAMP") or
+            item.get("Date")          or
+            item.get("date")          or ""
+        )
+        # Close/value field: try known NSE key names
+        close_raw = (
+            item.get("EOD_INDEX_VALUE") or
+            item.get("CLOSE")           or
+            item.get("Close")           or
+            item.get("close")           or ""
+        )
+        if not date_raw or not close_raw:
+            continue
+
+        # Parse date — NSE uses "17-Mar-2026" or "17 Mar 2026" formats
+        parsed_date = None
+        for fmt in ("%d-%b-%Y", "%d %b %Y", "%Y-%m-%d", "%d-%m-%Y"):
+            try:
+                parsed_date = datetime.strptime(str(date_raw).strip(), fmt).date()
+                break
+            except ValueError:
+                continue
+        if parsed_date is None:
+            continue
+
+        try:
+            vix_val = float(str(close_raw).replace(",", "").strip())
+            if vix_val > 0:
+                rows.append((parsed_date.isoformat(), vix_val))
+        except (ValueError, TypeError):
+            continue
+
+    if not rows:
+        pwarn("  Bootstrap: parsed 0 valid rows from NSE response")
+        pwarn("  NSE API may have changed — please download manually from nseindia.com")
+        psep()
+        return False
+
+    rows.sort(key=lambda x: x[0])
+
+    # ── Atomic write — same temp-rename pattern as save_state() ───────────────
+    try:
+        hist_dir     = os.path.dirname(os.path.abspath(VIX_HISTORY_FILE)) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=hist_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write("date,vix_close\n")
+                for d, v in rows:
+                    f.write(f"{d},{v:.2f}\n")
+            os.replace(tmp_path, VIX_HISTORY_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        pwarn(f"  Bootstrap: file write failed — {exc}")
+        psep()
+        return False
+
+    pinfo(f"  Bootstrap SUCCESS: {len(rows)} rows written to {VIX_HISTORY_FILE}")
+    pinfo(f"  Range: {rows[0][0]} → {rows[-1][0]}  |  Latest VIX: {rows[-1][1]:.2f}")
+    telegram(
+        f"✅ VIX history bootstrapped from NSE\n"
+        f"{len(rows)} rows  |  {rows[0][0]} → {rows[-1][0]}\n"
+        f"IVR/IVP filter is now active."
+    )
+    psep()
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  STARTUP BANNER
 #  FIX-2 (v5.0.0): compute expiry date once, reuse for all DTE label lookups
 #  instead of calling get_expiry() (which logs) once per DTE value.
@@ -3111,6 +3262,17 @@ def check_margin_now():
     expiry = get_expiry()
     result = check_margin_sufficient(expiry)
     pinfo(f"Margin check result: {'PASS ✓' if result else 'FAIL ✗'}")
+
+
+def manual_bootstrap_vix():
+    """Force re-bootstrap of vix_history.csv from NSE — run once to refresh data."""
+    pinfo("MANUAL VIX HISTORY BOOTSTRAP triggered")
+    success = bootstrap_vix_history()
+    if success:
+        rows = _load_vix_history_raw()
+        pinfo(f"vix_history.csv ready: {len(rows)} rows")
+    else:
+        pwarn("Bootstrap failed — check NSE connectivity and try again")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3443,11 +3605,12 @@ if __name__ == "__main__":
     Default: run() — full production scheduler.
 
     For testing (comment run(), uncomment one):
-      check_connection()   → verify OpenAlgo + show funds + collateral
-      check_margin_now()   → test margin guard without placing a trade
-      manual_entry()       → force entry now (bypasses time, runs all filters)
-      manual_exit()        → close all active legs now
-      show_state()         → dump full state + SL levels + DTE info
+      check_connection()        → verify OpenAlgo + show funds + collateral
+      check_margin_now()        → test margin guard without placing a trade
+      manual_entry()            → force entry now (bypasses time, runs all filters)
+      manual_exit()             → close all active legs now
+      show_state()              → dump full state + SL levels + DTE info
+      manual_bootstrap_vix()   → fetch/refresh vix_history.csv from NSE
     """
 
     # ── Production ────────────────────────────────────────────────────────────
@@ -3459,3 +3622,4 @@ if __name__ == "__main__":
     # manual_entry()
     # manual_exit()
     # show_state()
+    # manual_bootstrap_vix()
