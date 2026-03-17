@@ -2994,15 +2994,15 @@ def bootstrap_vix_history() -> bool:
     Params : from=DD-MM-YYYY&to=DD-MM-YYYY
     Auth   : requires NSE session cookies (grabbed via two warm-up GETs).
 
-    NSE limits each request to ~365 days — we split the 2-year window into
-    two consecutive 365-day chunks and merge the results.
+    NSE supports up to ~1 year per request — we split the 2-year window
+    into two consecutive 365-day chunks and merge the results.
     """
     psep()
     pinfo("VIX HISTORY AUTO-BOOTSTRAP — fetching 2 years from NSE")
 
     today = now_ist().date()
 
-    # NSE rejects requests spanning > ~365 days; split into two 1-year chunks
+    # NSE supports up to ~1 year per request; split 2-year window into two chunks.
     chunks = [
         (today - timedelta(days=730), today - timedelta(days=366)),
         (today - timedelta(days=365), today),
@@ -3024,7 +3024,7 @@ def bootstrap_vix_history() -> bool:
         # NSE requires cookie warm-up before API calls
         sess.get("https://www.nseindia.com", headers=hdrs, timeout=10)
         sess.get(
-            "https://www.nseindia.com/market-data/historical-volatility-india-vix",
+            "https://www.nseindia.com/reports-indices-historical-vix",
             headers=hdrs, timeout=10,
         )
 
