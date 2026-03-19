@@ -3435,17 +3435,45 @@ def _run_monitor_tick():
         sl_lvl      = sl_level(leg)
         is_trailing = TRAILING_SL_ENABLED and state.get(f"trailing_active_{leg.lower()}", False)
 
+        # Determine which SL path is currently active — used for accurate logging.
+        # Priority mirrors sl_level(): trailing > breakeven > dynamic/fixed.
+        _be_sl_val = state.get(f"breakeven_sl_{leg.lower()}", 0.0)
+        _is_breakeven = (
+            not is_trailing
+            and BREAKEVEN_AFTER_PARTIAL_ENABLED
+            and state.get(f"breakeven_active_{leg.lower()}", False)
+            and _be_sl_val > 0
+            and sl_lvl == _be_sl_val   # sl_level() returned the breakeven value
+        )
+        _is_dynamic = not is_trailing and not _is_breakeven and DYNAMIC_SL_ENABLED
+
+        if is_trailing:
+            sl_mode_label = "[TRAIL]"
+        elif _is_breakeven:
+            sl_mode_label = "[BREAKEVEN]"
+        elif _is_dynamic:
+            sl_mode_label = f"[DYNAMIC {_dynamic_sl_percent():.0f}%]"
+        else:
+            sl_mode_label = "[FIXED]"
+
         pdebug(
             f"  {leg} | entry Rs.{entry_px:.2f} | ltp Rs.{ltp:.2f} | "
             f"mtm Rs.{leg_mtm:.0f} | sl @ Rs.{sl_lvl:.2f}"
-            + (" [TRAIL]" if is_trailing else " [FIXED]")
+            + f" {sl_mode_label}"
         )
 
         # ── PER-LEG SL CHECK ─────────────────────────────────────────────────
         # Fires only if: SL enabled, entry price captured, LTP breached SL level.
-        # Works identically for fixed AND trailing SL — sl_level() abstracts both.
+        # sl_level() already abstracts trailing / breakeven / dynamic / fixed.
         if LEG_SL_PERCENT > 0 and sl_lvl > 0 and ltp >= sl_lvl:
-            sl_type = "Trailing SL" if is_trailing else f"Fixed SL {LEG_SL_PERCENT}%"
+            if is_trailing:
+                sl_type = "Trailing SL"
+            elif _is_breakeven:
+                sl_type = "Breakeven SL"
+            elif _is_dynamic:
+                sl_type = f"Dynamic SL {_dynamic_sl_percent():.0f}%"
+            else:
+                sl_type = f"Fixed SL {LEG_SL_PERCENT}%"
             pwarn(
                 f"SL HIT [{sl_type}]: {leg}  |  "
                 f"LTP Rs.{ltp:.2f} >= SL Rs.{sl_lvl:.2f}  "
