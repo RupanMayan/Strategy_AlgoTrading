@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.8.0                        ║
+║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.9.0                        ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -141,6 +141,51 @@
 ║           startup Telegram. Operator had no visibility of the active floor     ║
 ║           value at launch. Fixed: added to spike monitor display line in       ║
 ║           both banner and Telegram startup notification.                        ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║   v5.9.0 PRODUCTION HARDENING  (pre-live audit fixes)                          ║
+║                                                                                  ║
+║   FIX-X  CRITICAL — monitor_pnl() silently skipped overlapping ticks with      ║
+║           only a pwarn() log.  In a fast market, SL checks could be paused      ║
+║           for 60+ seconds with no operator visibility.                          ║
+║           Fixed: added _consecutive_monitor_skips counter; after 3 skips a     ║
+║           Telegram 🚨 MONITOR BLOCKED alert fires.  Counter resets on first    ║
+║           tick that acquires the lock successfully.                              ║
+║                                                                                  ║
+║   FIX-XI CRITICAL — Case B restart: _capture_fill_prices() re-fetch could      ║
+║           also fail (broker API down), leaving entry_price = 0.0 and SL        ║
+║           silently disabled.  No operator alert was sent.                       ║
+║           Fixed: after re-fetch, if prices are still 0 for any active leg,     ║
+║           a 🚨 CRITICAL Telegram fires and _emergency_close_all() is called    ║
+║           immediately to prevent unprotected exposure.                          ║
+║                                                                                  ║
+║   FIX-XII HIGH — _emergency_close_all() returned None; on closeposition()      ║
+║           failure the calling code (partial entry, orphan close) had no         ║
+║           way to know the close failed and left the position orphaned.          ║
+║           Fixed: returns True/False; failure path sends a 🚨 Telegram alert    ║
+║           and the partial-entry caller logs a CRITICAL orphan warning.          ║
+║                                                                                  ║
+║   FIX-XIII HIGH — _fetch_broker_positions() returned ALL NFO positions          ║
+║           regardless of underlying.  A BANKNIFTY Iron Butterfly on the same    ║
+║           account would trigger Case D and emergency-close the wrong legs.      ║
+║           Fixed: added UNDERLYING prefix filter so only NIFTY* symbols are     ║
+║           included in the reconciliation set.                                   ║
+║                                                                                  ║
+║   FIX-XIV MEDIUM — Trailing SL safety cap fired silently (pwarn only).         ║
+║           Misconfigured TRAIL_LOCK_PCT produces no operator alert.              ║
+║           Fixed: added Telegram ⚠️ alert when cap fires.                       ║
+║                                                                                  ║
+║   FIX-XV  LOW — Combined decay check used raw float arithmetic for decay_pct.  ║
+║           Floating-point noise (60.00000001 >= 60.0) could trigger premature   ║
+║           exits. Fixed: round(decay_pct, 2) before threshold comparison.        ║
+║                                                                                  ║
+║   FIX-XVI MEDIUM — _check_spot_move() used (CE_entry + PE_entry) as the spot  ║
+║           move threshold even after one leg was closed (partial position).      ║
+║           Example: CE SL hit, PE survives at Rs.100 entry; old code set        ║
+║           threshold = Rs.200 (both legs) instead of Rs.100 (PE only),          ║
+║           allowing NIFTY to move Rs.100 further than warranted before the       ║
+║           exit fired — compounding loss on the surviving PE leg.                ║
+║           Fixed: compute active_combined_premium using only ACTIVE legs'        ║
+║           entry prices; full combined_premium is used only if both active.      ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   v5.8.0 PHASE-2 MARKET-MOVEMENT ENHANCEMENTS                                  ║
 ║                                                                                  ║
@@ -891,7 +936,7 @@ QUOTE_FAIL_ALERT_THRESHOLD = 3
 #  INTERNAL CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "5.8.0"
+VERSION     = "5.9.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -931,6 +976,12 @@ _first_tick_fired = False
 # The alert flag prevents repeated alerts for the same outage window.
 _consecutive_quote_fail_ticks = 0
 _quote_fail_alerted           = False
+
+# Counts consecutive monitor ticks that were SKIPPED because the previous
+# tick was still running (lock contention).  When this reaches 3, a Telegram
+# alert fires so the operator knows SL monitoring has been paused.
+# Resets to 0 on the first tick that acquires the lock successfully.
+_consecutive_monitor_skips = 0
 
 # ── Effective daily target / limit (auto-scaled with NUMBER_OF_LOTS) ──────────
 #  DO NOT edit these — change DAILY_PROFIT_TARGET_PER_LOT / DAILY_LOSS_LIMIT_PER_LOT
@@ -2240,7 +2291,17 @@ def place_entry(expiry: str) -> bool:
             missing_leg = "PE" if filled_leg == "CE" else "CE"
             perr(f"PARTIAL ENTRY FILL — {filled_leg} placed but {missing_leg} failed. Emergency close triggered.")
             telegram(f"PARTIAL ENTRY FILL — {filled_leg} placed, {missing_leg} failed. Emergency close triggered. Check logs.")
-            _emergency_close_all()
+            # FIX-X (v5.9.0): If emergency close fails, the filled leg is left
+            # open at the broker with no state tracking — a true orphan.
+            # Alert the operator explicitly (Telegram alert is now inside
+            # _emergency_close_all() on failure path).
+            close_ok = _emergency_close_all()
+            if not close_ok:
+                perr(
+                    f"CRITICAL: Emergency close FAILED for {filled_leg}. "
+                    f"Position is ORPHANED at broker with no monitoring. "
+                    f"MANUAL CLOSE REQUIRED immediately in broker terminal."
+                )
         return False
 
     # ── Populate state — BOTH legs now active ─────────────────────────────────
@@ -2762,23 +2823,46 @@ def _close_all_locked(reason: str):
         close_one_leg(leg, reason=reason, current_ltp=ltp)
 
 
-def _emergency_close_all():
+def _emergency_close_all() -> bool:
     """
     Best-effort close for emergency scenarios (partial entry fill, orphan positions).
     Uses closeposition(). Does NOT update state — caller is responsible.
+
+    FIX-X (v5.9.0): Now returns True on success, False on failure.
+    Sends a Telegram alert on failure so the operator is immediately notified
+    and can intervene manually.  Previously failures were only logged locally.
+
+    Returns
+    -------
+    bool : True if closeposition() returned success, False otherwise.
     """
     pinfo("Emergency close via closeposition()...")
     try:
         resp = client.closeposition(strategy=STRATEGY_NAME)
         if isinstance(resp, dict) and resp.get("status") == "success":
             pinfo("Emergency close: SUCCESS")
+            return True
         else:
             err = resp.get("message", str(resp)) if isinstance(resp, dict) else str(resp)
             perr(f"Emergency close FAILED: {err}")
             perr("*** MANUAL ACTION REQUIRED in broker terminal ***")
+            telegram(
+                f"🚨 EMERGENCY CLOSE FAILED\n"
+                f"closeposition() returned an error: {err}\n"
+                f"Strategy: {STRATEGY_NAME}\n"
+                f"MANUAL ACTION REQUIRED — close positions in broker terminal immediately."
+            )
+            return False
     except Exception as exc:
         perr(f"Emergency close EXCEPTION: {exc}")
         perr("*** MANUAL ACTION REQUIRED in broker terminal ***")
+        telegram(
+            f"🚨 EMERGENCY CLOSE EXCEPTION\n"
+            f"closeposition() raised: {exc}\n"
+            f"Strategy: {STRATEGY_NAME}\n"
+            f"MANUAL ACTION REQUIRED — close positions in broker terminal immediately."
+        )
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2999,6 +3083,17 @@ def _update_trailing_sl(leg: str, ltp: float, entry_px: float):
                 f">= fixed SL Rs.{fixed_sl:.2f} — "
                 f"TRAIL_LOCK_PCT={TRAIL_LOCK_PCT}% may be too high. "
                 f"Capping at fixed SL Rs.{fixed_sl:.2f}."
+            )
+            # FIX-X (v5.9.0): Also send Telegram — a log warning at midnight
+            # is invisible; the operator needs to know TRAIL_LOCK_PCT is
+            # misconfigured so they can fix it before the next trade.
+            telegram(
+                f"⚠️ TRAILING SL CONFIG WARNING — {leg_label} leg\n"
+                f"Initial trail SL Rs.{initial_trail_sl:.2f} was WORSE than fixed SL "
+                f"Rs.{fixed_sl:.2f}.\n"
+                f"Capped at fixed SL.\n"
+                f"TRAIL_LOCK_PCT={TRAIL_LOCK_PCT}% appears too high — "
+                f"review Section 7C configuration."
             )
             initial_trail_sl = fixed_sl
 
@@ -3284,7 +3379,9 @@ def _check_spot_move():
       mechanism to save it.
 
     CALCULATION:
-      combined_premium = CE_entry_price + PE_entry_price  (per unit)
+      combined_premium = sum of ACTIVE legs' entry prices only (FIX-XVI v5.9.0)
+        Both legs active → CE_entry + PE_entry
+        One leg closed   → surviving leg's entry price only
       move_threshold   = combined_premium × BREAKEVEN_SPOT_MULTIPLIER
       move_abs         = |current_NIFTY − spot_at_entry|
       if move_abs >= move_threshold → close_all()
@@ -3309,7 +3406,20 @@ def _check_spot_move():
 
     ce_entry = state.get("entry_price_ce", 0.0)
     pe_entry = state.get("entry_price_pe", 0.0)
-    combined_premium = ce_entry + pe_entry
+
+    # FIX-XVI (v5.9.0): Use only the ACTIVE legs' combined premium.
+    # When one leg is already closed (partial position), using both entry
+    # prices produces a threshold that is too wide — it allows NIFTY to
+    # continue moving in the losing direction without triggering an exit.
+    # Example: CE SL hit (closed), PE still open at Rs.100 entry.
+    #   Old: threshold = (100 + 100) × 1.0 = Rs.200 — wrong, threshold is too loose
+    #   Fix: threshold = 100 × 1.0 = Rs.100         — correct for surviving PE only
+    active_combined_premium = (
+        (ce_entry if state.get("ce_active", False) else 0.0)
+        + (pe_entry if state.get("pe_active", False) else 0.0)
+    )
+    # Fall back to full combined if active sum is not available yet
+    combined_premium = active_combined_premium if active_combined_premium > 0 else (ce_entry + pe_entry)
     if combined_premium <= 0:
         return   # Fill prices not yet captured — skip until captured
 
@@ -3363,15 +3473,40 @@ def monitor_pnl():
     """
     Monitor tick — runs every MONITOR_INTERVAL_S seconds.
     Non-blocking lock ensures overlapping ticks are safely skipped.
+
+    FIX-X (v5.9.0): Tracks consecutive skipped ticks and sends a Telegram
+    alert after 3 consecutive skips so the operator knows SL monitoring has
+    been paused.  Resets the counter on the first tick that runs normally.
     """
+    global _consecutive_monitor_skips
+
     if not state["in_position"]:
+        _consecutive_monitor_skips = 0
         return
 
     acquired = _monitor_lock.acquire(blocking=False)
     if not acquired:
-        pwarn("Monitor tick skipped — previous tick still running (lock contention)")
+        _consecutive_monitor_skips += 1
+        pwarn(
+            f"Monitor tick skipped — previous tick still running "
+            f"(lock contention, skip #{_consecutive_monitor_skips})"
+        )
+        if _consecutive_monitor_skips == 3:
+            elapsed_s = _consecutive_monitor_skips * MONITOR_INTERVAL_S
+            perr(
+                f"Monitor BLOCKED for {_consecutive_monitor_skips} consecutive ticks "
+                f"(~{elapsed_s}s) — SL protection is paused!"
+            )
+            telegram(
+                f"🚨 MONITOR BLOCKED\n"
+                f"Previous monitor tick has been running for ~{elapsed_s}s.\n"
+                f"SL checks are PAUSED — {_consecutive_monitor_skips} ticks skipped.\n"
+                f"Active legs: {active_legs()}\n"
+                f"Check logs immediately. Consider manual monitoring."
+            )
         return
 
+    _consecutive_monitor_skips = 0   # Successful lock — reset skip counter
     try:
         _run_monitor_tick()
     finally:
@@ -3544,7 +3679,9 @@ def _run_monitor_tick():
         ):
             combined_entry   = ce_entry + pe_entry
             combined_current = leg_ltps["CE"] + leg_ltps["PE"]
-            decay_pct        = (1.0 - combined_current / combined_entry) * 100.0
+            # Round to 2dp to avoid floating-point noise triggering early exit
+            # (e.g. 60.00000001 >= 60.0 when premium is exactly at target).
+            decay_pct        = round((1.0 - combined_current / combined_entry) * 100.0, 2)
             if decay_pct >= COMBINED_DECAY_TARGET_PCT:
                 pinfo(
                     f"COMBINED DECAY EXIT: {decay_pct:.1f}% decay "
@@ -3758,6 +3895,34 @@ def reconcile_on_startup():
             save_state()
             pinfo(f"  Fill re-fetch : CE Rs.{state['entry_price_ce']:.2f}  PE Rs.{state['entry_price_pe']:.2f}")
 
+            # FIX-X (v5.9.0): If re-capture also fails, SL would be silently
+            # disabled.  Alert the operator with a CRITICAL telegram and
+            # emergency-close the affected legs — it is safer to exit than to
+            # let the position run without stop-loss protection.
+            still_missing = (
+                (state.get("ce_active", False) and state.get("entry_price_ce", 0.0) <= 0.0)
+                or (state.get("pe_active", False) and state.get("entry_price_pe", 0.0) <= 0.0)
+            )
+            if still_missing:
+                perr(
+                    "CRITICAL: Fill re-capture FAILED on restart — "
+                    "SL CANNOT be armed. Emergency closing position."
+                )
+                telegram(
+                    f"🚨 CRITICAL — FILL CAPTURE FAILED ON RESTART\n"
+                    f"CE fill: Rs.{state.get('entry_price_ce', 0.0):.2f}  "
+                    f"PE fill: Rs.{state.get('entry_price_pe', 0.0):.2f}\n"
+                    f"SL cannot be computed — emergency closing ALL legs\n"
+                    f"to prevent unprotected exposure.\n"
+                    f"Check broker terminal and re-enter manually if needed."
+                )
+                _emergency_close_all()
+                state["in_position"] = False
+                state["exit_reason"] = "Emergency close: fill capture failed on restart"
+                clear_state_file()
+                psep()
+                return
+
         active = active_legs()
         pinfo(f"  Active legs   : {active}")
         pinfo(f"  CE symbol     : {state['symbol_ce']}  active={state['ce_active']}")
@@ -3831,10 +3996,17 @@ def _fetch_broker_positions() -> list:
             return []
 
         all_pos  = resp.get("data", [])
+        # FIX-X (v5.9.0): Filter by both exchange AND underlying symbol prefix.
+        # Without the symbol prefix check, positions from OTHER strategies on the
+        # same account (e.g. an Iron Butterfly on BANKNIFTY) would be detected as
+        # "our" positions, causing Case D to emergency-close the wrong legs.
+        # UNDERLYING (e.g. "NIFTY") is a reliable prefix for all NIFTY option
+        # symbols regardless of strike or expiry (NIFTY25MAR2623000CE etc.).
         open_nfo = [
             p for p in all_pos
             if p.get("exchange", "") == OPTION_EXCH
             and int(p.get("quantity", 0) or 0) != 0
+            and str(p.get("symbol", "")).upper().startswith(UNDERLYING.upper())
         ]
 
         if open_nfo:
