@@ -2147,9 +2147,15 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
         pdebug(f"  Actual fill unavailable — using trigger LTP Rs.{current_ltp:.2f} for P&L")
 
     # ── Order placed successfully — update state ──────────────────────────────
-    # Record exit price for trade log: actual fill if available, else trigger LTP
+    # Record exit price for trade log: actual fill → trigger LTP → entry price.
+    # Entry price is last resort so the trade log audit trail is never 0.0.
+    # (P&L is unaffected — it uses realised_pnl computed above, not this field.)
     exit_px_key = f"exit_price_{leg_upper.lower()}"
-    state[exit_px_key] = actual_fill_px if actual_fill_px > 0 else current_ltp
+    state[exit_px_key] = (
+        actual_fill_px if actual_fill_px > 0
+        else current_ltp if current_ltp > 0
+        else entry_px
+    )
 
     state[active_key]   = False
     state["closed_pnl"] = state["closed_pnl"] + realised_pnl
