@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.6.0                        ║
+║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.7.0                        ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -141,6 +141,33 @@
 ║           startup Telegram. Operator had no visibility of the active floor     ║
 ║           value at launch. Fixed: added to spike monitor display line in       ║
 ║           both banner and Telegram startup notification.                        ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║   v5.7.0 PHASE-1 MARKET-MOVEMENT ENHANCEMENTS                                  ║
+║                                                                                  ║
+║   ENH-A  DYNAMIC SL TIGHTENING (SECTION 7D):                                  ║
+║           Fixed 20% SL is replaced by a time-graduated schedule when            ║
+║           DYNAMIC_SL_ENABLED=True.  Default schedule:                           ║
+║             Before 12:00 → 20% (LEG_SL_PERCENT)                                ║
+║             12:00–13:30  → 15%  |  13:30–14:30 → 10%  |  14:30+ → 7%          ║
+║           Affects only legs where trailing SL has NOT yet activated.            ║
+║           _dynamic_sl_percent() helper computes the current value;              ║
+║           sl_level() calls it instead of using LEG_SL_PERCENT directly.        ║
+║                                                                                  ║
+║   ENH-B  COMBINED PREMIUM DECAY EXIT (SECTION 7E):                             ║
+║           When BOTH legs are active and their combined LTP has decayed by       ║
+║           COMBINED_DECAY_TARGET_PCT (default 60%), close_all() fires.           ║
+║           Prevents holding a 60%-profitable position through afternoon gamma.   ║
+║           Check runs every monitor tick; requires valid LTPs for both legs.     ║
+║           Most impactful on DTE2/DTE3 where 60% combined decay often occurs    ║
+║           before noon, well ahead of the 15:15 hard exit.                      ║
+║                                                                                  ║
+║   ENH-C  WINNER-LEG EARLY BOOKING (SECTION 7F):                                ║
+║           After one leg's SL fires, if the surviving leg has decayed to <=      ║
+║           WINNER_LEG_DECAY_THRESHOLD_PCT (default 30%) of its entry price,      ║
+║           close_one_leg() fires immediately — locking in 70%+ premium capture  ║
+║           and removing gamma risk from the naked survivor.                      ║
+║           Triggered every tick when len(active_legs()) == 1; uses a fresh LTP  ║
+║           fetch so it never acts on stale data from the SL check loop.          ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   v5.6.0 ENHANCEMENTS  (post-audit improvements)                               ║
 ║                                                                                  ║
@@ -571,6 +598,106 @@ TRAIL_TRIGGER_PCT    = 50.0   # Activate when LTP falls to this % of entry price
 TRAIL_LOCK_PCT       = 30.0   # Trailing SL = current_LTP × (1 + TRAIL_LOCK_PCT/100)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7D — DYNAMIC SL TIGHTENING  (time-of-day graduated SL)
+#
+#  WHY THIS EXISTS:
+#    The fixed 20% SL is calibrated for the morning session when full-day risk
+#    justifies a wide stop.  By afternoon, theta has already captured most of the
+#    premium and holding a 20% SL exposes hard-earned profits to a late gamma
+#    surprise.  Tightening the SL progressively through the day locks in more
+#    profit as the position matures.
+#
+#    Most effective on DTE0/DTE1 (expiry day and Monday) where intraday theta
+#    acceleration is steepest and late-session reversals are most damaging.
+#
+#  HOW IT WORKS:
+#    When DYNAMIC_SL_ENABLED = True, _dynamic_sl_percent() replaces the flat
+#    LEG_SL_PERCENT in the FIXED-SL calculation path of sl_level().
+#    The trailing SL (when active) always takes precedence — this setting only
+#    affects legs that have NOT yet triggered trailing.
+#
+#    DYNAMIC_SL_SCHEDULE is a list of (HH:MM, sl_pct) tuples evaluated in
+#    descending time order.  The FIRST tuple whose time <= now() wins.
+#    Before the earliest threshold, LEG_SL_PERCENT (default 20%) is used.
+#
+#  SCHEDULE GUIDANCE (NIFTY intraday):
+#    After 14:30 → 7%  : Last 45 min; premium largely decayed, protect gains
+#    After 13:30 → 10% : Afternoon session; reduce exposure
+#    After 12:00 → 15% : Mid-session; moderate tightening
+#    Before 12:00 → LEG_SL_PERCENT (20%) : Morning; full width needed
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DYNAMIC_SL_ENABLED   = True
+
+# (time_threshold_HH:MM, sl_pct) — evaluated in order, first match wins.
+# Must be sorted in DESCENDING time order (latest time first).
+DYNAMIC_SL_SCHEDULE  = [
+    ("14:30", 7.0),    # After 2:30 PM → very tight (last 45 min, max theta harvested)
+    ("13:30", 10.0),   # After 1:30 PM → medium-tight
+    ("12:00", 15.0),   # After 12:00 PM → slightly tighter than morning
+]
+# Before earliest threshold above (12:00) → falls back to LEG_SL_PERCENT (20%)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7E — COMBINED PREMIUM DECAY EXIT
+#
+#  WHY THIS EXISTS:
+#    When BOTH legs are still active and have collectively decayed by a large
+#    percentage, continuing to hold exposes the position to afternoon gamma risk
+#    for diminishing remaining theta.  Locking in profits at a combined decay
+#    target removes event risk in the final session hours.
+#
+#    Most useful on DTE2/DTE3 (Thu/Fri) where 60% combined decay often occurs
+#    by 11:30–12:00 AM — well before the 15:15 hard exit.  On DTE0/DTE1 (peak
+#    theta days) the remaining premium is valuable enough to hold longer.
+#
+#  HOW IT WORKS:
+#    combined_entry  = CE_entry_price + PE_entry_price
+#    combined_ltp    = CE_ltp + PE_ltp  (fetched fresh each monitor tick)
+#    decay_pct       = (1 − combined_ltp / combined_entry) × 100
+#    If decay_pct >= COMBINED_DECAY_TARGET_PCT → close_all() fires.
+#
+#  NOTE: Fires only when BOTH CE and PE legs are still active.
+#        Single-leg survivors are managed by trailing SL or winner booking.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+COMBINED_DECAY_EXIT_ENABLED = True
+COMBINED_DECAY_TARGET_PCT   = 60.0   # Exit when combined premium has decayed by 60%
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7F — WINNER-LEG EARLY BOOKING
+#
+#  WHY THIS EXISTS:
+#    After one leg hits SL (e.g. CE closes on upside move), the surviving PE is
+#    often deeply profitable — having decayed to 20–30% of its entry price.
+#    Holding this leg to 15:15 exposes a large unrealised gain to gamma risk:
+#    a market reversal can push PE from Rs.15 back to Rs.60+ rapidly.
+#    Booking early at high decay locks the profit and removes residual exposure.
+#
+#  HOW IT WORKS:
+#    Every monitor tick, when exactly ONE leg is active, a fresh LTP is fetched
+#    for the surviving leg.  If its LTP is <= WINNER_LEG_DECAY_THRESHOLD_PCT of
+#    its entry price, close_one_leg() fires immediately.
+#
+#    Example: PE entry Rs.100, threshold 30% → book when LTP <= Rs.30 (70%+ decay)
+#
+#  THRESHOLD GUIDANCE:
+#    20% → aggressive — books when 80%+ of premium captured (higher profit lock,
+#          misses final 20% decay if market stays quiet)
+#    30% → balanced  — books at 70%+ decay; protects against common reversals
+#          (recommended)
+#    40% → conservative — books at 60%+ decay; allows more premium capture but
+#          exposes larger unrealised gain to reversal risk
+#
+#  SAFETY: Winner booking uses a FRESH LTP fetch — never acts on stale LTP from
+#          the per-leg SL check.  If the LTP fetch fails, booking is skipped and
+#          normal monitoring continues safely.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+WINNER_LEG_EARLY_EXIT_ENABLED  = True
+WINNER_LEG_DECAY_THRESHOLD_PCT = 30.0   # Book surviving leg when LTP <= 30% of entry
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 8 — EXPIRY
 #  Format : DDMMMYY uppercase  e.g. "25MAR26"
 #  AUTO_EXPIRY = True resolves the nearest Tuesday automatically every day.
@@ -624,7 +751,7 @@ QUOTE_FAIL_ALERT_THRESHOLD = 3
 #  INTERNAL CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "5.6.0"
+VERSION     = "5.7.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -882,6 +1009,30 @@ def active_legs() -> list:
     if state["pe_active"]: result.append("PE")
     return result
 
+def _dynamic_sl_percent() -> float:
+    """
+    Return the effective per-leg SL percentage based on the current time of day.
+
+    When DYNAMIC_SL_ENABLED = True, the fixed LEG_SL_PERCENT is replaced by a
+    time-graduated value from DYNAMIC_SL_SCHEDULE.  DYNAMIC_SL_SCHEDULE is
+    evaluated in descending time order — the first entry whose threshold is <=
+    the current HH:MM wins.  If no entry matches (i.e. we're before the earliest
+    threshold), LEG_SL_PERCENT is returned unchanged.
+
+    When DYNAMIC_SL_ENABLED = False, LEG_SL_PERCENT is always returned.
+
+    Called exclusively from sl_level() on the FIXED-SL path — trailing SL takes
+    precedence over this value once trailing is activated.
+    """
+    if not DYNAMIC_SL_ENABLED:
+        return LEG_SL_PERCENT
+    now_hm = datetime.now(IST).strftime("%H:%M")
+    for threshold, sl_pct in DYNAMIC_SL_SCHEDULE:
+        if now_hm >= threshold:
+            return sl_pct
+    return LEG_SL_PERCENT   # Before earliest threshold — use the configured default
+
+
 def sl_level(leg: str) -> float:
     """
     Return the CURRENT effective SL trigger price for a given leg.
@@ -893,7 +1044,9 @@ def sl_level(leg: str) -> float:
       This value is always <= the fixed SL level (never worse).
 
     FIXED SL (default / pre-trail):
-      Returns entry_price × (1 + LEG_SL_PERCENT / 100).
+      Returns entry_price × (1 + _dynamic_sl_percent() / 100).
+      _dynamic_sl_percent() returns LEG_SL_PERCENT when DYNAMIC_SL_ENABLED=False,
+      or a time-graduated tighter value when DYNAMIC_SL_ENABLED=True.
 
     Returns 0.0 if entry price was not captured — SL check is skipped at 0.0.
 
@@ -915,8 +1068,8 @@ def sl_level(leg: str) -> float:
         if trail_sl > 0:
             return trail_sl
 
-    # Fixed SL — default before trailing activation
-    return round(entry * (1.0 + LEG_SL_PERCENT / 100.0), 2)
+    # Fixed SL — default before trailing activation (time-of-day dynamic if enabled)
+    return round(entry * (1.0 + _dynamic_sl_percent() / 100.0), 2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2860,6 +3013,7 @@ def _run_monitor_tick():
     open_mtm         = 0.0
     legs_checked     = 0   # Active legs we attempted to fetch LTP for
     legs_ltp_ok      = 0   # Active legs where LTP fetch succeeded
+    leg_ltps: dict   = {}  # Collects valid LTPs for post-loop checks (decay exits)
 
     for leg in ["CE", "PE"]:
         active_key = f"{leg.lower()}_active"
@@ -2879,6 +3033,7 @@ def _run_monitor_tick():
             continue
 
         legs_ltp_ok += 1
+        leg_ltps[leg] = ltp   # Store for post-loop combined-decay check
 
         leg_mtm = (entry_px - ltp) * qty() if entry_px > 0 else 0.0
 
@@ -2956,6 +3111,80 @@ def _run_monitor_tick():
     # ── If both legs closed by SL(s) this tick → already flat, done ──────────
     if not state["in_position"]:
         return
+
+    # ── COMBINED PREMIUM DECAY EXIT ───────────────────────────────────────────
+    # When BOTH legs are active and their combined LTP has decayed by
+    # COMBINED_DECAY_TARGET_PCT, close the entire position.  Protects hard-earned
+    # theta profits from afternoon gamma risk on DTE2/DTE3.
+    # Only fires when we have valid LTPs for both legs this tick.
+    if COMBINED_DECAY_EXIT_ENABLED and state["ce_active"] and state["pe_active"]:
+        ce_entry = state["entry_price_ce"]
+        pe_entry = state["entry_price_pe"]
+        if (
+            ce_entry > 0
+            and pe_entry > 0
+            and "CE" in leg_ltps
+            and "PE" in leg_ltps
+        ):
+            combined_entry   = ce_entry + pe_entry
+            combined_current = leg_ltps["CE"] + leg_ltps["PE"]
+            decay_pct        = (1.0 - combined_current / combined_entry) * 100.0
+            if decay_pct >= COMBINED_DECAY_TARGET_PCT:
+                pinfo(
+                    f"COMBINED DECAY EXIT: {decay_pct:.1f}% decay "
+                    f"(CE Rs.{leg_ltps['CE']:.2f} + PE Rs.{leg_ltps['PE']:.2f} = "
+                    f"Rs.{combined_current:.2f} vs entry Rs.{combined_entry:.2f}) "
+                    f">= target {COMBINED_DECAY_TARGET_PCT:.0f}% — closing all"
+                )
+                telegram(
+                    f"🎯 COMBINED DECAY EXIT\n"
+                    f"Combined premium decayed {decay_pct:.1f}% "
+                    f"(target {COMBINED_DECAY_TARGET_PCT:.0f}%)\n"
+                    f"CE ltp Rs.{leg_ltps['CE']:.2f}  |  PE ltp Rs.{leg_ltps['PE']:.2f}\n"
+                    f"Combined: Rs.{combined_current:.2f} vs entry Rs.{combined_entry:.2f}\n"
+                    f"Locking in profits — closing both legs now."
+                )
+                close_all(reason=f"Combined Premium {decay_pct:.1f}% Decay Target Reached")
+                return
+
+    # ── WINNER-LEG EARLY BOOKING ──────────────────────────────────────────────
+    # When exactly ONE leg is active (the other closed via SL this tick or a
+    # prior tick) and the surviving leg has decayed to <= WINNER_LEG_DECAY_THRESHOLD_PCT
+    # of its entry price, close it immediately to lock in profits.
+    # Uses a FRESH LTP fetch — never relies on the per-leg SL loop's LTP.
+    if WINNER_LEG_EARLY_EXIT_ENABLED and state["in_position"]:
+        active = active_legs()
+        if len(active) == 1:
+            winner       = active[0]
+            winner_entry = state[f"entry_price_{winner.lower()}"]
+            if winner_entry > 0:
+                winner_ltp = _fetch_ltp(winner)
+                if winner_ltp > 0:
+                    decay_pct = (winner_ltp / winner_entry) * 100.0
+                    if decay_pct <= WINNER_LEG_DECAY_THRESHOLD_PCT:
+                        pinfo(
+                            f"WINNER LEG EARLY BOOKING: {winner} decayed to "
+                            f"Rs.{winner_ltp:.2f} ({decay_pct:.1f}% of entry "
+                            f"Rs.{winner_entry:.2f}) <= {WINNER_LEG_DECAY_THRESHOLD_PCT:.0f}% "
+                            f"threshold — booking now to lock profit"
+                        )
+                        telegram(
+                            f"💰 WINNER LEG EARLY BOOKING\n"
+                            f"Surviving {winner} leg deeply profitable\n"
+                            f"LTP Rs.{winner_ltp:.2f} = {decay_pct:.1f}% of entry "
+                            f"Rs.{winner_entry:.2f}\n"
+                            f"Booking at <= {WINNER_LEG_DECAY_THRESHOLD_PCT:.0f}% threshold "
+                            f"to lock gains and remove gamma risk."
+                        )
+                        close_one_leg(
+                            winner,
+                            reason=(
+                                f"Winner Leg Early Booking "
+                                f"({decay_pct:.1f}% of entry Rs.{winner_entry:.2f})"
+                            ),
+                            current_ltp=winner_ltp,
+                        )
+                        return
 
     # ── Combined P&L = closed (realised) + open (unrealised) ─────────────────
     combined_pnl       = state["closed_pnl"] + open_mtm
@@ -3938,6 +4167,57 @@ def _validate_config():
             f"MONITOR_INTERVAL_S ({MONITOR_INTERVAL_S}s) — "
             f"spike check cannot run faster than the monitor loop"
         )
+
+    # ── Dynamic SL schedule ───────────────────────────────────────────────────
+    if DYNAMIC_SL_ENABLED:
+        if not DYNAMIC_SL_SCHEDULE:
+            errors.append("DYNAMIC_SL_SCHEDULE is empty — must have at least one entry when DYNAMIC_SL_ENABLED=True")
+        for i, entry in enumerate(DYNAMIC_SL_SCHEDULE):
+            if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+                errors.append(f"DYNAMIC_SL_SCHEDULE[{i}] must be a (HH:MM, sl_pct) pair, got {entry!r}")
+                continue
+            t_str, sl_pct = entry
+            try:
+                th, tm = parse_hhmm(t_str)
+                assert 0 <= th <= 23 and 0 <= tm <= 59
+            except Exception:
+                errors.append(f"DYNAMIC_SL_SCHEDULE[{i}] time {t_str!r} is invalid (expected HH:MM)")
+            if sl_pct <= 0:
+                errors.append(f"DYNAMIC_SL_SCHEDULE[{i}] sl_pct must be > 0, got {sl_pct}")
+            if sl_pct > LEG_SL_PERCENT:
+                errors.append(
+                    f"DYNAMIC_SL_SCHEDULE[{i}] sl_pct ({sl_pct}%) > LEG_SL_PERCENT ({LEG_SL_PERCENT}%) "
+                    f"— scheduled SL must be <= base SL (tightening only)"
+                )
+        # Warn if schedule is not in descending time order (logic still works but is confusing)
+        times = []
+        for entry in DYNAMIC_SL_SCHEDULE:
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                try:
+                    times.append(entry[0])
+                except Exception:
+                    pass
+        if times != sorted(times, reverse=True):
+            pwarn(
+                "CONFIG WARNING: DYNAMIC_SL_SCHEDULE entries are not in descending time order. "
+                "First-match logic may give unexpected results — sort latest time first."
+            )
+
+    # ── Combined decay exit ────────────────────────────────────────────────────
+    if COMBINED_DECAY_EXIT_ENABLED:
+        if not (0.0 < COMBINED_DECAY_TARGET_PCT < 100.0):
+            errors.append(
+                f"COMBINED_DECAY_TARGET_PCT must be between 0 and 100 (exclusive), "
+                f"got {COMBINED_DECAY_TARGET_PCT}"
+            )
+
+    # ── Winner-leg early booking ───────────────────────────────────────────────
+    if WINNER_LEG_EARLY_EXIT_ENABLED:
+        if not (0.0 < WINNER_LEG_DECAY_THRESHOLD_PCT < 100.0):
+            errors.append(
+                f"WINNER_LEG_DECAY_THRESHOLD_PCT must be between 0 and 100 (exclusive), "
+                f"got {WINNER_LEG_DECAY_THRESHOLD_PCT}"
+            )
 
     # ── Trade log + connectivity ───────────────────────────────────────────────
     if QUOTE_FAIL_ALERT_THRESHOLD <= 0:
