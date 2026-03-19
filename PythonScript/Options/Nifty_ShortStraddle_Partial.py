@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.4.0                        ║
+║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.5.1                        ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -87,6 +87,60 @@
 ║   FIX-11 In dte_filter_ok(), telegram() is called only on SKIP_MONTHS.        ║
 ║          DTE-filtered skip days produce no Telegram alert. This is intentional ║
 ║          (DTE filter fires every non-trade day). No change.                     ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║   v5.5.0 LOGICAL FIXES  (post-audit second-pass)
+║                                                                                  ║
+║   FIX-I   CRITICAL — fill capture blocked place_entry() for up to 20s,        ║
+║           keeping entry_price = 0 and SL DISABLED during that window.          ║
+║           Fixed: _capture_fills_and_notify() runs in a background daemon       ║
+║           thread. place_entry() returns in <0.5s; monitoring begins at         ║
+║           the next scheduler tick; fills typically arrive within 1–2s.         ║
+║                                                                                  ║
+║   FIX-II  CRITICAL — closeposition() failure had no fallback; both legs        ║
+║           stayed open indefinitely when the atomic close was rejected.          ║
+║           Fixed: on any closeposition() failure (exception or REJECTED),        ║
+║           _close_all_locked() falls back to per-leg close_one_leg() calls.     ║
+║                                                                                  ║
+║   FIX-III Trailing SL Phase 2 updates were not persisted.  On crash/restart   ║
+║           the trailing SL reverted to the Phase 1 activation level, which      ║
+║           could be Rs.50+ looser than the last tightened value on expiry day.  ║
+║           Fixed: save_state() added to Phase 2 update path.                    ║
+║                                                                                  ║
+║   FIX-IV  close_one_leg() used trigger LTP as fill price for closed_pnl.      ║
+║           BUY MARKET fills Rs.5–15 above trigger in fast markets, causing      ║
+║           daily loss limit to miss by Rs.1,000–2,000 across both legs.         ║
+║           Fixed: _fetch_close_fill_price() fetches actual avg fill (2 tries);  ║
+║           falls back to trigger LTP only if orderstatus() is unavailable.      ║
+║                                                                                  ║
+║   FIX-V   VIX spike monitor used a relative % threshold only.  At VIX=14      ║
+║           a 15% spike fires at VIX=16.1, which is a normal fluctuation         ║
+║           and NOT dangerous for a short straddle.                               ║
+║           Fixed: VIX_SPIKE_ABS_FLOOR=18.0 added — exit fires only when        ║
+║           BOTH spike_pct >= threshold AND current_vix >= floor.                ║
+║                                                                                  ║
+║   FIX-VI  NSE bootstrap fired 8 API requests with 0 delay between chunks.     ║
+║           NSE rate-limiting caused session drop after 2–3 chunks, producing    ║
+║           a truncated vix_history.csv with <200 rows (IVR/IVP degraded).      ║
+║           Fixed: 1.5s inter-chunk pause added.                                 ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║   v5.5.1 PATCH  (post-audit third-pass)                                        ║
+║                                                                                  ║
+║   FIX-VII MEDIUM — FIX-I (background fill thread) introduced a regression     ║
+║           in Case B reconciliation: if the process crashed during fill          ║
+║           capture, state was saved with entry_price=0.0.  On restart Case B   ║
+║           detected a valid in_position state but SL armed at 0 (disabled).    ║
+║           Fixed: reconcile_on_startup() Case B now detects entry_price=0.0    ║
+║           with a valid order ID and re-runs _capture_fill_prices() + save()   ║
+║           before arming the monitor. SL is always valid before first tick.    ║
+║                                                                                  ║
+║   FIX-VIII LOW — VIX_SPIKE_ABS_FLOOR was not validated in _validate_config(). ║
+║           A negative value would silently disable the floor check without      ║
+║           warning. Fixed: added >= 0 guard; warns if floor is 0.               ║
+║                                                                                  ║
+║   FIX-IX  LOW — VIX_SPIKE_ABS_FLOOR not displayed in _print_banner() or       ║
+║           startup Telegram. Operator had no visibility of the active floor     ║
+║           value at launch. Fixed: added to spike monitor display line in       ║
+║           both banner and Telegram startup notification.                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   v5.2.0 PRODUCTION-GRADE HARDENING  (third-pass audit)                         ║
 ║                                                                                  ║
@@ -339,7 +393,7 @@ IVR_FILTER_ENABLED   = True
 IVR_MIN              = 30.0    # Skip if IVR < 30  (IV in bottom 30% of 52wk range)
 IVP_FILTER_ENABLED   = True
 IVP_MIN              = 40.0    # Skip if IVP < 40% (IV below 40th percentile)
-IVR_FAIL_OPEN        = True    # True = allow trade when history file unavailable (paper trading)
+IVR_FAIL_OPEN        = False   # False = skip trade if history unavailable (production-safe fail-closed)
 VIX_HISTORY_FILE     = "vix_history.csv"   # Path to daily VIX closing data file
 VIX_HISTORY_MIN_ROWS = 100     # Minimum rows needed for a meaningful IVR/IVP calc
 VIX_UPDATE_TIME      = "15:30" # IST time to auto-append today's VIX to history file
@@ -428,6 +482,15 @@ ATM_STRIKE_ROUNDING    = 50      # NIFTY=50, BANKNIFTY=100, FINNIFTY=50
 VIX_SPIKE_MONITOR_ENABLED    = True
 VIX_SPIKE_THRESHOLD_PCT      = 15.0   # % rise from entry VIX triggers exit
 VIX_SPIKE_CHECK_INTERVAL_S   = 300    # Seconds between VIX spike checks (5 min)
+VIX_SPIKE_ABS_FLOOR          = 18.0   # Minimum absolute VIX required to confirm a spike exit
+                                        # FIX-V (v5.5.0): relative-only threshold is misleading
+                                        # at low VIX — e.g. 14→16.1 = 15% spike but VIX 16 is
+                                        # normal and NOT dangerous for a short straddle.
+                                        # Exit fires only when BOTH:
+                                        #   spike_pct  >= VIX_SPIKE_THRESHOLD_PCT  (15% relative rise)
+                                        #   current_vix >= VIX_SPIKE_ABS_FLOOR     (18 absolute floor)
+                                        # At VIX_MIN=14: spike fires at 16.1 → blocked by floor ✓
+                                        # At VIX=20:     spike fires at 23.0 → allowed (genuinely dangerous) ✓
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 7C — TRAILING STOP-LOSS / PROFIT LOCK-IN
@@ -526,7 +589,7 @@ STATE_FILE = "strategy_state.json"
 #  INTERNAL CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "5.4.0"
+VERSION     = "5.5.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -547,6 +610,13 @@ _monitor_lock = threading.RLock()
 # across monitor ticks but resets on each new Python process (correct behaviour:
 # we want a fresh check timer for every trading session, not persisted to disk).
 _last_vix_spike_check_time = None
+
+# Tracks whether at least one monitor tick has completed after the current entry.
+# Used in _close_all_locked() to detect the 0–15s window between entry and the
+# first tick — avoids the fragile today_pnl==0.0 heuristic which could falsely
+# trigger when real MTM happens to be exactly Rs.0.
+# Reset to False in place_entry() on each new trade. Set to True on first tick.
+_first_tick_fired = False
 
 # ── Effective daily target / limit (auto-scaled with NUMBER_OF_LOTS) ──────────
 #  DO NOT edit these — change DAILY_PROFIT_TARGET_PER_LOT / DAILY_LOSS_LIMIT_PER_LOT
@@ -1097,6 +1167,15 @@ def _load_vix_history_raw() -> list:
                     continue   # Skip malformed rows silently
         # ISO date strings sort lexicographically = chronologically — no datetime parse needed
         rows.sort(key=lambda x: x[0])
+
+        # Deduplicate by date — keep last occurrence per date.
+        # Prevents duplicate rows (e.g. from manual CSV edits or a restart after
+        # 15:30 that somehow triggers the update job twice) from skewing IVP counts.
+        seen = {}
+        for date_str, vix_val in rows:
+            seen[date_str] = vix_val   # later value overwrites earlier duplicate
+        rows = [(d, v) for d, v in seen.items()]   # dict preserves insertion order (Python 3.7+)
+
         return rows
     except Exception as exc:
         pwarn(f"VIX history raw load failed: {exc}")
@@ -1208,6 +1287,10 @@ def ivr_ivp_ok(current_vix: float) -> bool:
     if history_values is None:
         # Insufficient or missing data — apply fail-open/closed policy
         if IVR_FAIL_OPEN:
+            # Set sentinel -1.0 so Telegram/log display shows "N/A" instead of
+            # the misleading 0.0 that would otherwise be shown (stale from reset).
+            state["ivr_at_entry"] = -1.0
+            state["ivp_at_entry"] = -1.0
             pwarn(
                 "IVR/IVP: VIX history insufficient — fail-open policy, "
                 "proceeding with entry. Bootstrap vix_history.csv for full protection."
@@ -1729,6 +1812,9 @@ def place_entry(expiry: str) -> bool:
         return False
 
     # ── Populate state — BOTH legs now active ─────────────────────────────────
+    global _first_tick_fired
+    _first_tick_fired = False   # Reset so no_tick_yet detection works for this trade
+
     now_dt = now_ist()
     state["in_position"]       = True
     state["ce_active"]         = True
@@ -1750,48 +1836,24 @@ def place_entry(expiry: str) -> bool:
     state["trailing_sl_ce"]     = 0.0
     state["trailing_sl_pe"]     = 0.0
 
-    # ── Fetch average fill prices with retry (SL depends on accuracy) ────────
-    _capture_fill_prices()
-
-    # ── Persist atomically to disk immediately ────────────────────────────────
+    # ── Persist initial state immediately (entry_price = 0.0 until fills arrive) ─
+    # FIX-I (v5.5.0): save_state() is called HERE — before fill capture — so a
+    # crash during fill capture still leaves a valid in_position=True state file.
+    # The monitor disables SL for any leg whose entry_price == 0 (existing guard).
     save_state()
+    pinfo(f"  Initial state saved → {STATE_FILE}  (fills pending, SL arms on next tick)")
 
-    trade_mode = (results[0].get("mode", "live") if results else "live").upper()
-    sl_ce      = sl_level("CE")
-    sl_pe      = sl_level("PE")
+    # ── Launch fill capture + entry notification in background thread ─────────
+    # place_entry() returns immediately so the APScheduler monitor thread can
+    # start the first SL-protected tick within MONITOR_INTERVAL_S seconds.
+    # _capture_fills_and_notify() writes entry prices to state and calls
+    # save_state() again once fills are known (typically within 1–2 seconds).
+    threading.Thread(
+        target = _capture_fills_and_notify,
+        args   = (expiry, results),
+        daemon = True,
+    ).start()
 
-    pinfo("ENTRY COMPLETE")
-    pinfo(f"  Mode      : {trade_mode}  NIFTY: {state['underlying_ltp']}  VIX: {state['vix_at_entry']:.2f}")
-    if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED:
-        pinfo(
-            f"  IVR       : {state['ivr_at_entry']:.1f}  |  "
-            f"IVP: {state['ivp_at_entry']:.1f}%"
-        )
-    pinfo(f"  CE        : {state['symbol_ce']}  fill Rs.{state['entry_price_ce']:.2f}  SL @ Rs.{sl_ce:.2f}")
-    pinfo(f"  PE        : {state['symbol_pe']}  fill Rs.{state['entry_price_pe']:.2f}  SL @ Rs.{sl_pe:.2f}")
-    pinfo(f"  Margin used : Rs.{state['margin_required']:,.0f}  |  Available was: Rs.{state['margin_available']:,.0f}")
-    pinfo(f"  State persisted → {STATE_FILE}")
-    psep()
-
-    # Build IVR/IVP line only when at least one filter is active and values captured
-    ivr_ivp_line = ""
-    if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED:
-        ivr_ivp_line = (
-            f"IVR: {state['ivr_at_entry']:.1f}  |  "
-            f"IVP: {state['ivp_at_entry']:.1f}%\n"
-        )
-
-    telegram(
-        f"✅ ENTRY PLACED [{trade_mode}]\n"
-        f"NIFTY: {state['underlying_ltp']}  VIX: {state['vix_at_entry']:.2f}\n"
-        f"{ivr_ivp_line}"
-        f"CE : {state['symbol_ce']}\n"
-        f"  Fill Rs.{state['entry_price_ce']:.2f}  |  SL @ Rs.{sl_ce:.2f}\n"
-        f"PE : {state['symbol_pe']}\n"
-        f"  Fill Rs.{state['entry_price_pe']:.2f}  |  SL @ Rs.{sl_pe:.2f}\n"
-        f"Expiry: {expiry}  Qty/leg: {qty()}\n"
-        f"Margin used: Rs.{state['margin_required']:,.0f}"
-    )
     return True
 
 
@@ -1846,12 +1908,93 @@ def _capture_fill_prices():
             )
 
 
+def _capture_fills_and_notify(expiry: str, results: list):
+    """
+    Background daemon thread target — runs after place_entry() returns.
+
+    FIX-I (v5.5.0): Moving fill capture + entry notification out of
+    place_entry() eliminates the 0–20s SL-offline window that existed
+    because the sequential CE→PE orderstatus() retries blocked the main
+    APScheduler thread.  Now place_entry() returns in <0.5s, the monitor
+    starts protecting the position at the next scheduled tick, and fills
+    typically arrive within 1–2s (attempt 1 succeeds on most brokers).
+
+    Thread-safety:
+      state["entry_price_ce/pe"] are plain float assignments — GIL-atomic.
+      The monitor's `if entry_px > 0` guard means a 0.0 (unfilled) value
+      simply disables SL for that tick — no incorrect SL can fire.
+    """
+    _capture_fill_prices()   # Writes state["entry_price_ce/pe"] in-place
+    save_state()             # Overwrite the 0.0 save with real fill prices
+
+    trade_mode = (results[0].get("mode", "live") if results else "live").upper()
+    sl_ce      = sl_level("CE")
+    sl_pe      = sl_level("PE")
+
+    pinfo("ENTRY COMPLETE (fills captured)")
+    pinfo(f"  Mode      : {trade_mode}  NIFTY: {state['underlying_ltp']}  VIX: {state['vix_at_entry']:.2f}")
+    if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED:
+        _ivr_disp = "N/A (no history)" if state["ivr_at_entry"] < 0 else f"{state['ivr_at_entry']:.1f}"
+        _ivp_disp = "N/A (no history)" if state["ivp_at_entry"] < 0 else f"{state['ivp_at_entry']:.1f}%"
+        pinfo(f"  IVR       : {_ivr_disp}  |  IVP: {_ivp_disp}")
+    pinfo(f"  CE        : {state['symbol_ce']}  fill Rs.{state['entry_price_ce']:.2f}  SL @ Rs.{sl_ce:.2f}")
+    pinfo(f"  PE        : {state['symbol_pe']}  fill Rs.{state['entry_price_pe']:.2f}  SL @ Rs.{sl_pe:.2f}")
+    pinfo(f"  Margin used : Rs.{state['margin_required']:,.0f}  |  Available was: Rs.{state['margin_available']:,.0f}")
+    pinfo(f"  State persisted → {STATE_FILE}")
+    psep()
+
+    ivr_ivp_line = ""
+    if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED:
+        _ivr_tg = "N/A (no history)" if state["ivr_at_entry"] < 0 else f"{state['ivr_at_entry']:.1f}"
+        _ivp_tg = "N/A (no history)" if state["ivp_at_entry"] < 0 else f"{state['ivp_at_entry']:.1f}%"
+        ivr_ivp_line = f"IVR: {_ivr_tg}  |  IVP: {_ivp_tg}\n"
+
+    telegram(
+        f"✅ ENTRY PLACED [{trade_mode}]\n"
+        f"NIFTY: {state['underlying_ltp']}  VIX: {state['vix_at_entry']:.2f}\n"
+        f"{ivr_ivp_line}"
+        f"CE : {state['symbol_ce']}\n"
+        f"  Fill Rs.{state['entry_price_ce']:.2f}  |  SL @ Rs.{sl_ce:.2f}\n"
+        f"PE : {state['symbol_pe']}\n"
+        f"  Fill Rs.{state['entry_price_pe']:.2f}  |  SL @ Rs.{sl_pe:.2f}\n"
+        f"Expiry: {expiry}  Qty/leg: {qty()}\n"
+        f"Margin used: Rs.{state['margin_required']:,.0f}"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SINGLE-LEG CLOSE  ← CORE OF PARTIAL SQUARE OFF
 #
 #  When ONE leg hits its SL, ONLY that leg is closed.
 #  The other leg continues running with its own SL intact.
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_close_fill_price(orderid: str) -> float:
+    """
+    Fetch the average fill price of a close (BUY MARKET) order.
+
+    FIX-IV (v5.5.0): close_one_leg() previously used `current_ltp` (the LTP
+    that triggered the SL) as the fill price for closed_pnl.  In fast markets
+    a BUY MARKET order can fill Rs.5–15 above the trigger LTP, understating
+    the loss by Rs.325–975 per lot per leg and potentially allowing the daily
+    loss limit to miss by Rs.1,000–2,000.
+
+    Returns the actual average fill price (> 0) on success, 0.0 on failure
+    (caller falls back to current_ltp approximation).  2 attempts, 1s gap.
+    """
+    for attempt in range(1, 3):
+        try:
+            resp = client.orderstatus(order_id=orderid, strategy=STRATEGY_NAME)
+            if isinstance(resp, dict) and resp.get("status") == "success":
+                avg_px = float(resp.get("data", {}).get("average_price", 0) or 0)
+                if avg_px > 0:
+                    return avg_px
+        except Exception as exc:
+            pdebug(f"  close fill fetch attempt {attempt} exception: {exc}")
+        if attempt < 2:
+            time.sleep(1.0)
+    return 0.0
+
 
 def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
     """
@@ -1921,12 +2064,26 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
         )
         return  # State unchanged — leg still marked active
 
+    # ── Fetch actual close fill price for accurate P&L accounting ────────────
+    # FIX-IV (v5.5.0): BUY MARKET fill can differ materially from trigger LTP
+    # in fast markets (Rs.5–15 slippage per unit = Rs.325–975/lot).  Use the
+    # actual avg fill price if available; fall back to current_ltp otherwise.
+    close_orderid  = resp.get("orderid", "") if isinstance(resp, dict) else ""
+    actual_fill_px = _fetch_close_fill_price(close_orderid) if close_orderid else 0.0
+
+    if actual_fill_px > 0:
+        realised_pnl = (entry_px - actual_fill_px) * qty() if entry_px > 0 else 0.0
+        pinfo(f"  Actual fill  : Rs.{actual_fill_px:.2f}  (trigger LTP was Rs.{current_ltp:.2f})")
+    else:
+        realised_pnl = approx_pnl
+        pdebug(f"  Actual fill unavailable — using trigger LTP Rs.{current_ltp:.2f} for P&L")
+
     # ── Order placed successfully — update state ──────────────────────────────
     state[active_key]   = False
-    state["closed_pnl"] = state["closed_pnl"] + approx_pnl
+    state["closed_pnl"] = state["closed_pnl"] + realised_pnl
 
     pinfo(f"  {leg_upper} LEG CLOSED  |  Reason: {reason}")
-    pinfo(f"  Approx this-leg P&L    : Rs.{approx_pnl:.0f}")
+    pinfo(f"  Realised this-leg P&L  : Rs.{realised_pnl:.0f}")
     pinfo(f"  Cumulative closed_pnl  : Rs.{state['closed_pnl']:.0f}")
 
     # ── Inspect surviving leg ─────────────────────────────────────────────────
@@ -1952,7 +2109,7 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
             f"⚡ PARTIAL EXIT — {leg_upper} LEG CLOSED\n"
             f"Reason     : {reason}\n"
             f"Symbol     : {symbol}\n"
-            f"Approx P&L : Rs.{approx_pnl:.0f}\n"
+            f"Realised P&L: Rs.{realised_pnl:.0f}\n"
             f"───────────────────\n"
             f"{other_leg} STILL ACTIVE\n"
             f"Symbol     : {other_symbol}\n"
@@ -2017,21 +2174,18 @@ def _close_all_locked(reason: str):
     if len(active) == 2:
         # ── Both legs open — use closeposition() for atomic close ─────────────
         pinfo("Both legs active → closeposition() (atomic)")
+        closepos_ok = False
+        closepos_err = ""
         try:
             resp = client.closeposition(strategy=STRATEGY_NAME)
+            if isinstance(resp, dict) and resp.get("status") == "success":
+                closepos_ok = True
+            else:
+                closepos_err = resp.get("message", str(resp)) if isinstance(resp, dict) else str(resp)
         except Exception as exc:
-            perr(f"closeposition() EXCEPTION: {exc}")
-            perr("*** MANUAL ACTION REQUIRED in broker terminal ***")
-            telegram(
-                f"🚨 EXIT FAILED — closeposition() EXCEPTION\n"
-                f"MANUAL ACTION REQUIRED\n"
-                f"CE: {state['symbol_ce']}\n"
-                f"PE: {state['symbol_pe']}\n"
-                f"Error: {exc}"
-            )
-            return
+            closepos_err = str(exc)
 
-        if isinstance(resp, dict) and resp.get("status") == "success":
+        if closepos_ok:
             # ── Compute open_mtm for final P&L summary ────────────────────────
             #
             # FIX-B: If today_pnl == 0 AND both entry prices are known,
@@ -2044,9 +2198,11 @@ def _close_all_locked(reason: str):
             #
             ce_px = state["entry_price_ce"]
             pe_px = state["entry_price_pe"]
+            # Use _first_tick_fired flag instead of today_pnl==0 heuristic.
+            # The heuristic falsely triggers when real MTM is exactly Rs.0
+            # (e.g. perfectly balanced CE/PE on thin-premium expiry day).
             no_tick_yet = (
-                state["today_pnl"] == 0.0
-                and state["closed_pnl"] == 0.0
+                not _first_tick_fired
                 and ce_px > 0
                 and pe_px > 0
             )
@@ -2076,16 +2232,25 @@ def _close_all_locked(reason: str):
             state["pe_active"]   = False
             _mark_fully_flat(reason=reason)
         else:
-            err = resp.get("message", str(resp)) if isinstance(resp, dict) else str(resp)
-            perr(f"closeposition() REJECTED: {err}")
-            perr("*** MANUAL ACTION REQUIRED in broker terminal ***")
+            # ── FIX-II (v5.5.0): closeposition() failed — fall back to per-leg close ──
+            # atomic close is not available (network blip / broker API error).
+            # Re-fetch active legs in case one already closed independently,
+            # then close each remaining leg via close_one_leg().
+            pwarn(
+                f"closeposition() FAILED ({closepos_err}) — "
+                f"falling back to per-leg close"
+            )
             telegram(
-                f"🚨 EXIT FAILED — closeposition() REJECTED\n"
-                f"MANUAL ACTION REQUIRED\n"
+                f"⚠️ closeposition() FAILED — falling back to per-leg close\n"
                 f"CE: {state['symbol_ce']}\n"
                 f"PE: {state['symbol_pe']}\n"
-                f"Error: {err}"
+                f"Error: {closepos_err}"
             )
+            for fallback_leg in list(active_legs()):   # re-evaluate active at this moment
+                ltp = _fetch_ltp(fallback_leg)
+                if ltp <= 0:
+                    pwarn(f"  LTP fetch failed for {fallback_leg} fallback — P&L estimate will be Rs.0")
+                close_one_leg(fallback_leg, reason=f"{reason} [closepos fallback]", current_ltp=ltp)
 
     elif len(active) == 1:
         # ── One leg remaining — fetch LTP for accurate P&L then close ────────
@@ -2204,9 +2369,9 @@ def _mark_fully_flat(reason: str):
 #                          trailing_sl_{leg}     = initial level
 #                          save_state() called   — persist immediately (critical)
 #    Phase 2 (update):     trailing_sl_{leg} updated if new < current
-#                          No save_state() call — frequent ticks would over-write;
-#                          acceptable: on restart the SL is slightly looser but
-#                          always within the locked-profit window from last save.
+#                          save_state() called — FIX-III (v5.5.0): persists
+#                          every tightening so a crash/restart never reverts
+#                          to a significantly looser Phase 1 level.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _update_trailing_sl(leg: str, ltp: float, entry_px: float):
@@ -2239,7 +2404,7 @@ def _update_trailing_sl(leg: str, ltp: float, entry_px: float):
         1. Compute new_trail_sl = round(ltp × (1 + TRAIL_LOCK_PCT/100), 2)
         2. Update state["trailing_sl_{leg}"] to new_trail_sl
         3. pdebug log (no Telegram — would fire every 15s)
-        Note: save_state() NOT called here — see module docstring above.
+        4. save_state() — FIX-III (v5.5.0): persist every tightening
     """
     if not TRAILING_SL_ENABLED:
         return
@@ -2335,6 +2500,14 @@ def _update_trailing_sl(leg: str, ltp: float, entry_px: float):
             f"min profit now Rs.{locked_profit_per_unit:.2f}/unit"
         )
 
+        # FIX-III (v5.5.0): Persist Phase 2 update immediately.
+        # Previously only Phase 1 (activation) was saved.  On a crash/restart
+        # mid-trade, trailing_sl reverted to the Phase 1 value, which could be
+        # Rs.50+ looser than the last tightened level on expiry day.
+        # Overhead: one atomic JSON rename per 15-second tick while trailing
+        # is active — negligible for a trading script.
+        save_state()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  INTRADAY VIX SPIKE MONITOR
@@ -2416,18 +2589,33 @@ def _check_vix_spike():
         f"change={spike_pct:+.2f}%  threshold={VIX_SPIKE_THRESHOLD_PCT}%"
     )
 
-    # ── Spike check ───────────────────────────────────────────────────────────
-    if spike_pct < VIX_SPIKE_THRESHOLD_PCT:
+    # ── Spike check — dual condition (relative % AND absolute floor) ─────────
+    # FIX-V (v5.5.0): relative-only threshold fires prematurely at low VIX
+    # (e.g. entry at 14, 15% spike → 16.1 which is NOT dangerous).
+    # Both conditions must be true to trigger an exit.
+    relative_triggered = spike_pct >= VIX_SPIKE_THRESHOLD_PCT
+    absolute_triggered = current_vix >= VIX_SPIKE_ABS_FLOOR
+
+    if not relative_triggered:
         pinfo(
             f"VIX spike check OK: {entry_vix:.2f} → {current_vix:.2f} "
             f"({spike_pct:+.1f}% | threshold {VIX_SPIKE_THRESHOLD_PCT}%)"
         )
         return
 
-    # ── Spike confirmed — exit immediately ────────────────────────────────────
+    if not absolute_triggered:
+        pinfo(
+            f"VIX spike check OK (below abs floor): {entry_vix:.2f} → {current_vix:.2f} "
+            f"({spike_pct:+.1f}% ≥ threshold but current VIX {current_vix:.2f} "
+            f"< floor {VIX_SPIKE_ABS_FLOOR} — not dangerous at this level)"
+        )
+        return
+
+    # ── Both conditions met — spike confirmed, exit immediately ───────────────
     pwarn(
         f"VIX SPIKE DETECTED: {entry_vix:.2f} → {current_vix:.2f} "
-        f"({spike_pct:+.1f}% ≥ threshold {VIX_SPIKE_THRESHOLD_PCT}%) — "
+        f"({spike_pct:+.1f}% ≥ threshold {VIX_SPIKE_THRESHOLD_PCT}%, "
+        f"VIX {current_vix:.2f} ≥ floor {VIX_SPIKE_ABS_FLOOR}) — "
         f"closing all positions, short vega in rising IV is dangerous"
     )
     telegram(
@@ -2435,6 +2623,7 @@ def _check_vix_spike():
         f"Entry VIX   : {entry_vix:.2f}\n"
         f"Current VIX : {current_vix:.2f}\n"
         f"Change      : {spike_pct:+.1f}%  (threshold: +{VIX_SPIKE_THRESHOLD_PCT}%)\n"
+        f"Abs floor   : {VIX_SPIKE_ABS_FLOOR}  (both conditions met)\n"
         f"Active legs : {active_legs()}\n"
         f"Action      : Closing all positions immediately.\n"
         f"Rationale   : Short vega position in a rising-IV environment — "
@@ -2527,6 +2716,9 @@ def _run_monitor_tick():
       This guarantees the SL check always uses the freshest effective SL.
       Ordering is critical: sl_level() MUST be called AFTER _update_trailing_sl().
     """
+    global _first_tick_fired
+    _first_tick_fired = True   # At least one tick has run — used by _close_all_locked()
+
     open_mtm = 0.0
 
     for leg in ["CE", "PE"]:
@@ -2692,6 +2884,49 @@ def reconcile_on_startup():
                     state["entry_time"] = parsed.astimezone(IST)
             except Exception:
                 state["entry_time"] = now_ist()
+
+        # ── Symbol verification — confirm saved leg symbols exist at broker ──
+        # Without this check, Case B fires even when broker closed the position
+        # externally (e.g. MIS auto sq-off) while other NFO positions are open.
+        broker_symbols = {p.get("symbol", "") for p in broker_positions}
+        symbol_ce      = state.get("symbol_ce", "")
+        symbol_pe      = state.get("symbol_pe", "")
+        ce_active      = state.get("ce_active", False)
+        pe_active      = state.get("pe_active", False)
+
+        mismatch = []
+        if ce_active and symbol_ce and symbol_ce not in broker_symbols:
+            mismatch.append(f"CE ({symbol_ce}) not found at broker")
+        if pe_active and symbol_pe and symbol_pe not in broker_symbols:
+            mismatch.append(f"PE ({symbol_pe}) not found at broker")
+
+        if mismatch:
+            pwarn(f"Case B symbol mismatch: {'; '.join(mismatch)}")
+            pwarn("Saved symbols not confirmed at broker — treating as externally closed (Case C)")
+            state["in_position"] = False
+            state["exit_reason"] = "Symbol mismatch on restart — positions closed externally"
+            clear_state_file()
+            telegram(
+                f"⚠️ RESTART — Symbol Mismatch\n"
+                f"State showed open position but broker symbols not found:\n"
+                + "\n".join(f"  {m}" for m in mismatch)
+                + f"\nState cleared. Verify positions manually in broker terminal."
+            )
+            psep()
+            return
+
+        # FIX-VII (v5.5.1): If crash occurred during background fill capture,
+        # entry_price_ce/pe may be 0.0 in the saved state. Re-fetch fills now
+        # using the persisted order IDs so SL protection is immediately armed.
+        prices_missing = (
+            (state.get("ce_active", False) and state.get("entry_price_ce", 0.0) <= 0.0)
+            or (state.get("pe_active", False) and state.get("entry_price_pe", 0.0) <= 0.0)
+        )
+        if prices_missing and (state.get("orderid_ce") or state.get("orderid_pe")):
+            pwarn("Entry prices missing (crash during fill capture) — re-fetching fills now")
+            _capture_fill_prices()
+            save_state()
+            pinfo(f"  Fill re-fetch : CE Rs.{state['entry_price_ce']:.2f}  PE Rs.{state['entry_price_pe']:.2f}")
 
         active = active_legs()
         pinfo(f"  Active legs   : {active}")
@@ -3034,7 +3269,12 @@ def bootstrap_vix_history() -> bool:
             headers=hdrs, timeout=10,
         )
 
-        for chunk_from, chunk_to in chunks:
+        for i, (chunk_from, chunk_to) in enumerate(chunks):
+            # FIX-VI (v5.5.0): pause between requests — NSE rate-limits rapid
+            # programmatic calls; 0 delay caused 429/session-drop after chunk 2–3,
+            # resulting in a truncated vix_history.csv with <200 rows.
+            if i > 0:
+                time.sleep(1.5)
             from_str = chunk_from.strftime("%d-%m-%Y")
             to_str   = chunk_to.strftime("%d-%m-%Y")
             url = (
@@ -3206,6 +3446,7 @@ def _print_banner():
     # VIX spike monitor display
     spike_str = (
         f"ENABLED  threshold={VIX_SPIKE_THRESHOLD_PCT}%  "
+        f"floor={VIX_SPIKE_ABS_FLOOR}  "
         f"check_every={VIX_SPIKE_CHECK_INTERVAL_S}s"
         if VIX_SPIKE_MONITOR_ENABLED else "DISABLED"
     )
@@ -3505,6 +3746,10 @@ def _validate_config():
         )
     if VIX_SPIKE_CHECK_INTERVAL_S <= 0:
         errors.append(f"VIX_SPIKE_CHECK_INTERVAL_S must be > 0, got {VIX_SPIKE_CHECK_INTERVAL_S}")
+    if VIX_SPIKE_ABS_FLOOR < 0:
+        errors.append(f"VIX_SPIKE_ABS_FLOOR must be >= 0 (0 = disabled), got {VIX_SPIKE_ABS_FLOOR}")
+    elif VIX_SPIKE_ABS_FLOOR == 0:
+        pwarn("VIX_SPIKE_ABS_FLOOR=0 — absolute floor check disabled, relative threshold only")
     if VIX_SPIKE_MONITOR_ENABLED and VIX_SPIKE_CHECK_INTERVAL_S < MONITOR_INTERVAL_S:
         errors.append(
             f"VIX_SPIKE_CHECK_INTERVAL_S ({VIX_SPIKE_CHECK_INTERVAL_S}s) must be >= "
@@ -3654,7 +3899,8 @@ def run():
     ivr_tg     = f"IVR>={IVR_MIN}" if IVR_FILTER_ENABLED else "off"
     ivp_tg     = f"IVP>={IVP_MIN}%" if IVP_FILTER_ENABLED else "off"
     spike_tg   = (
-        f"VIX spike: +{VIX_SPIKE_THRESHOLD_PCT}% → exit (check/{VIX_SPIKE_CHECK_INTERVAL_S}s)"
+        f"VIX spike: +{VIX_SPIKE_THRESHOLD_PCT}% & VIX≥{VIX_SPIKE_ABS_FLOOR} → exit "
+        f"(check/{VIX_SPIKE_CHECK_INTERVAL_S}s)"
         if VIX_SPIKE_MONITOR_ENABLED else "VIX spike monitor: off"
     )
     trail_tg   = (
