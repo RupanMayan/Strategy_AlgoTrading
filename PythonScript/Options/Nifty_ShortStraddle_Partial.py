@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.5.0                        ║
+║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.5.1                        ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -122,6 +122,25 @@
 ║           NSE rate-limiting caused session drop after 2–3 chunks, producing    ║
 ║           a truncated vix_history.csv with <200 rows (IVR/IVP degraded).      ║
 ║           Fixed: 1.5s inter-chunk pause added.                                 ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║   v5.5.1 PATCH  (post-audit third-pass)                                        ║
+║                                                                                  ║
+║   FIX-VII MEDIUM — FIX-I (background fill thread) introduced a regression     ║
+║           in Case B reconciliation: if the process crashed during fill          ║
+║           capture, state was saved with entry_price=0.0.  On restart Case B   ║
+║           detected a valid in_position state but SL armed at 0 (disabled).    ║
+║           Fixed: reconcile_on_startup() Case B now detects entry_price=0.0    ║
+║           with a valid order ID and re-runs _capture_fill_prices() + save()   ║
+║           before arming the monitor. SL is always valid before first tick.    ║
+║                                                                                  ║
+║   FIX-VIII LOW — VIX_SPIKE_ABS_FLOOR was not validated in _validate_config(). ║
+║           A negative value would silently disable the floor check without      ║
+║           warning. Fixed: added >= 0 guard; warns if floor is 0.               ║
+║                                                                                  ║
+║   FIX-IX  LOW — VIX_SPIKE_ABS_FLOOR not displayed in _print_banner() or       ║
+║           startup Telegram. Operator had no visibility of the active floor     ║
+║           value at launch. Fixed: added to spike monitor display line in       ║
+║           both banner and Telegram startup notification.                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   v5.2.0 PRODUCTION-GRADE HARDENING  (third-pass audit)                         ║
 ║                                                                                  ║
@@ -2896,6 +2915,19 @@ def reconcile_on_startup():
             psep()
             return
 
+        # FIX-VII (v5.5.1): If crash occurred during background fill capture,
+        # entry_price_ce/pe may be 0.0 in the saved state. Re-fetch fills now
+        # using the persisted order IDs so SL protection is immediately armed.
+        prices_missing = (
+            (state.get("ce_active", False) and state.get("entry_price_ce", 0.0) <= 0.0)
+            or (state.get("pe_active", False) and state.get("entry_price_pe", 0.0) <= 0.0)
+        )
+        if prices_missing and (state.get("orderid_ce") or state.get("orderid_pe")):
+            pwarn("Entry prices missing (crash during fill capture) — re-fetching fills now")
+            _capture_fill_prices()
+            save_state()
+            pinfo(f"  Fill re-fetch : CE Rs.{state['entry_price_ce']:.2f}  PE Rs.{state['entry_price_pe']:.2f}")
+
         active = active_legs()
         pinfo(f"  Active legs   : {active}")
         pinfo(f"  CE symbol     : {state['symbol_ce']}  active={state['ce_active']}")
@@ -3414,6 +3446,7 @@ def _print_banner():
     # VIX spike monitor display
     spike_str = (
         f"ENABLED  threshold={VIX_SPIKE_THRESHOLD_PCT}%  "
+        f"floor={VIX_SPIKE_ABS_FLOOR}  "
         f"check_every={VIX_SPIKE_CHECK_INTERVAL_S}s"
         if VIX_SPIKE_MONITOR_ENABLED else "DISABLED"
     )
@@ -3713,6 +3746,10 @@ def _validate_config():
         )
     if VIX_SPIKE_CHECK_INTERVAL_S <= 0:
         errors.append(f"VIX_SPIKE_CHECK_INTERVAL_S must be > 0, got {VIX_SPIKE_CHECK_INTERVAL_S}")
+    if VIX_SPIKE_ABS_FLOOR < 0:
+        errors.append(f"VIX_SPIKE_ABS_FLOOR must be >= 0 (0 = disabled), got {VIX_SPIKE_ABS_FLOOR}")
+    elif VIX_SPIKE_ABS_FLOOR == 0:
+        pwarn("VIX_SPIKE_ABS_FLOOR=0 — absolute floor check disabled, relative threshold only")
     if VIX_SPIKE_MONITOR_ENABLED and VIX_SPIKE_CHECK_INTERVAL_S < MONITOR_INTERVAL_S:
         errors.append(
             f"VIX_SPIKE_CHECK_INTERVAL_S ({VIX_SPIKE_CHECK_INTERVAL_S}s) must be >= "
@@ -3862,7 +3899,8 @@ def run():
     ivr_tg     = f"IVR>={IVR_MIN}" if IVR_FILTER_ENABLED else "off"
     ivp_tg     = f"IVP>={IVP_MIN}%" if IVP_FILTER_ENABLED else "off"
     spike_tg   = (
-        f"VIX spike: +{VIX_SPIKE_THRESHOLD_PCT}% → exit (check/{VIX_SPIKE_CHECK_INTERVAL_S}s)"
+        f"VIX spike: +{VIX_SPIKE_THRESHOLD_PCT}% & VIX≥{VIX_SPIKE_ABS_FLOOR} → exit "
+        f"(check/{VIX_SPIKE_CHECK_INTERVAL_S}s)"
         if VIX_SPIKE_MONITOR_ENABLED else "VIX spike monitor: off"
     )
     trail_tg   = (
