@@ -339,7 +339,7 @@ IVR_FILTER_ENABLED   = True
 IVR_MIN              = 30.0    # Skip if IVR < 30  (IV in bottom 30% of 52wk range)
 IVP_FILTER_ENABLED   = True
 IVP_MIN              = 40.0    # Skip if IVP < 40% (IV below 40th percentile)
-IVR_FAIL_OPEN        = True    # True = allow trade when history file unavailable (paper trading)
+IVR_FAIL_OPEN        = False   # False = skip trade if history unavailable (production-safe fail-closed)
 VIX_HISTORY_FILE     = "vix_history.csv"   # Path to daily VIX closing data file
 VIX_HISTORY_MIN_ROWS = 100     # Minimum rows needed for a meaningful IVR/IVP calc
 VIX_UPDATE_TIME      = "15:30" # IST time to auto-append today's VIX to history file
@@ -547,6 +547,13 @@ _monitor_lock = threading.RLock()
 # across monitor ticks but resets on each new Python process (correct behaviour:
 # we want a fresh check timer for every trading session, not persisted to disk).
 _last_vix_spike_check_time = None
+
+# Tracks whether at least one monitor tick has completed after the current entry.
+# Used in _close_all_locked() to detect the 0–15s window between entry and the
+# first tick — avoids the fragile today_pnl==0.0 heuristic which could falsely
+# trigger when real MTM happens to be exactly Rs.0.
+# Reset to False in place_entry() on each new trade. Set to True on first tick.
+_first_tick_fired = False
 
 # ── Effective daily target / limit (auto-scaled with NUMBER_OF_LOTS) ──────────
 #  DO NOT edit these — change DAILY_PROFIT_TARGET_PER_LOT / DAILY_LOSS_LIMIT_PER_LOT
@@ -1097,6 +1104,15 @@ def _load_vix_history_raw() -> list:
                     continue   # Skip malformed rows silently
         # ISO date strings sort lexicographically = chronologically — no datetime parse needed
         rows.sort(key=lambda x: x[0])
+
+        # Deduplicate by date — keep last occurrence per date.
+        # Prevents duplicate rows (e.g. from manual CSV edits or a restart after
+        # 15:30 that somehow triggers the update job twice) from skewing IVP counts.
+        seen = {}
+        for date_str, vix_val in rows:
+            seen[date_str] = vix_val   # later value overwrites earlier duplicate
+        rows = [(d, v) for d, v in seen.items()]   # dict preserves insertion order (Python 3.7+)
+
         return rows
     except Exception as exc:
         pwarn(f"VIX history raw load failed: {exc}")
@@ -1208,6 +1224,10 @@ def ivr_ivp_ok(current_vix: float) -> bool:
     if history_values is None:
         # Insufficient or missing data — apply fail-open/closed policy
         if IVR_FAIL_OPEN:
+            # Set sentinel -1.0 so Telegram/log display shows "N/A" instead of
+            # the misleading 0.0 that would otherwise be shown (stale from reset).
+            state["ivr_at_entry"] = -1.0
+            state["ivp_at_entry"] = -1.0
             pwarn(
                 "IVR/IVP: VIX history insufficient — fail-open policy, "
                 "proceeding with entry. Bootstrap vix_history.csv for full protection."
@@ -1729,6 +1749,9 @@ def place_entry(expiry: str) -> bool:
         return False
 
     # ── Populate state — BOTH legs now active ─────────────────────────────────
+    global _first_tick_fired
+    _first_tick_fired = False   # Reset so no_tick_yet detection works for this trade
+
     now_dt = now_ist()
     state["in_position"]       = True
     state["ce_active"]         = True
@@ -1763,23 +1786,22 @@ def place_entry(expiry: str) -> bool:
     pinfo("ENTRY COMPLETE")
     pinfo(f"  Mode      : {trade_mode}  NIFTY: {state['underlying_ltp']}  VIX: {state['vix_at_entry']:.2f}")
     if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED:
-        pinfo(
-            f"  IVR       : {state['ivr_at_entry']:.1f}  |  "
-            f"IVP: {state['ivp_at_entry']:.1f}%"
-        )
+        _ivr_disp = "N/A (no history)" if state["ivr_at_entry"] < 0 else f"{state['ivr_at_entry']:.1f}"
+        _ivp_disp = "N/A (no history)" if state["ivp_at_entry"] < 0 else f"{state['ivp_at_entry']:.1f}%"
+        pinfo(f"  IVR       : {_ivr_disp}  |  IVP: {_ivp_disp}")
     pinfo(f"  CE        : {state['symbol_ce']}  fill Rs.{state['entry_price_ce']:.2f}  SL @ Rs.{sl_ce:.2f}")
     pinfo(f"  PE        : {state['symbol_pe']}  fill Rs.{state['entry_price_pe']:.2f}  SL @ Rs.{sl_pe:.2f}")
     pinfo(f"  Margin used : Rs.{state['margin_required']:,.0f}  |  Available was: Rs.{state['margin_available']:,.0f}")
     pinfo(f"  State persisted → {STATE_FILE}")
     psep()
 
-    # Build IVR/IVP line only when at least one filter is active and values captured
+    # Build IVR/IVP line only when at least one filter is active and values captured.
+    # -1.0 sentinel means "unavailable" (fail-open path) — display as N/A.
     ivr_ivp_line = ""
     if IVR_FILTER_ENABLED or IVP_FILTER_ENABLED:
-        ivr_ivp_line = (
-            f"IVR: {state['ivr_at_entry']:.1f}  |  "
-            f"IVP: {state['ivp_at_entry']:.1f}%\n"
-        )
+        _ivr_tg = "N/A (no history)" if state["ivr_at_entry"] < 0 else f"{state['ivr_at_entry']:.1f}"
+        _ivp_tg = "N/A (no history)" if state["ivp_at_entry"] < 0 else f"{state['ivp_at_entry']:.1f}%"
+        ivr_ivp_line = f"IVR: {_ivr_tg}  |  IVP: {_ivp_tg}\n"
 
     telegram(
         f"✅ ENTRY PLACED [{trade_mode}]\n"
@@ -2044,9 +2066,11 @@ def _close_all_locked(reason: str):
             #
             ce_px = state["entry_price_ce"]
             pe_px = state["entry_price_pe"]
+            # Use _first_tick_fired flag instead of today_pnl==0 heuristic.
+            # The heuristic falsely triggers when real MTM is exactly Rs.0
+            # (e.g. perfectly balanced CE/PE on thin-premium expiry day).
             no_tick_yet = (
-                state["today_pnl"] == 0.0
-                and state["closed_pnl"] == 0.0
+                not _first_tick_fired
                 and ce_px > 0
                 and pe_px > 0
             )
@@ -2527,6 +2551,9 @@ def _run_monitor_tick():
       This guarantees the SL check always uses the freshest effective SL.
       Ordering is critical: sl_level() MUST be called AFTER _update_trailing_sl().
     """
+    global _first_tick_fired
+    _first_tick_fired = True   # At least one tick has run — used by _close_all_locked()
+
     open_mtm = 0.0
 
     for leg in ["CE", "PE"]:
@@ -2692,6 +2719,36 @@ def reconcile_on_startup():
                     state["entry_time"] = parsed.astimezone(IST)
             except Exception:
                 state["entry_time"] = now_ist()
+
+        # ── Symbol verification — confirm saved leg symbols exist at broker ──
+        # Without this check, Case B fires even when broker closed the position
+        # externally (e.g. MIS auto sq-off) while other NFO positions are open.
+        broker_symbols = {p.get("symbol", "") for p in broker_positions}
+        symbol_ce      = state.get("symbol_ce", "")
+        symbol_pe      = state.get("symbol_pe", "")
+        ce_active      = state.get("ce_active", False)
+        pe_active      = state.get("pe_active", False)
+
+        mismatch = []
+        if ce_active and symbol_ce and symbol_ce not in broker_symbols:
+            mismatch.append(f"CE ({symbol_ce}) not found at broker")
+        if pe_active and symbol_pe and symbol_pe not in broker_symbols:
+            mismatch.append(f"PE ({symbol_pe}) not found at broker")
+
+        if mismatch:
+            pwarn(f"Case B symbol mismatch: {'; '.join(mismatch)}")
+            pwarn("Saved symbols not confirmed at broker — treating as externally closed (Case C)")
+            state["in_position"] = False
+            state["exit_reason"] = "Symbol mismatch on restart — positions closed externally"
+            clear_state_file()
+            telegram(
+                f"⚠️ RESTART — Symbol Mismatch\n"
+                f"State showed open position but broker symbols not found:\n"
+                + "\n".join(f"  {m}" for m in mismatch)
+                + f"\nState cleared. Verify positions manually in broker terminal."
+            )
+            psep()
+            return
 
         active = active_legs()
         pinfo(f"  Active legs   : {active}")
