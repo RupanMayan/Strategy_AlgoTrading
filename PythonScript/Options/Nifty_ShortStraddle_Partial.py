@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.7.0                        ║
+║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.8.0                        ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -141,6 +141,35 @@
 ║           startup Telegram. Operator had no visibility of the active floor     ║
 ║           value at launch. Fixed: added to spike monitor display line in       ║
 ║           both banner and Telegram startup notification.                        ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║   v5.8.0 PHASE-2 MARKET-MOVEMENT ENHANCEMENTS                                  ║
+║                                                                                  ║
+║   ENH-D  OPENING RANGE FILTER (SECTION 6B):                                   ║
+║           job_orb_capture() fires at ORB_CAPTURE_TIME (09:17) to store        ║
+║           live NIFTY spot as state["orb_price"].  orb_filter_ok() in           ║
+║           job_entry() fetches spot again and rejects if NIFTY has moved        ║
+║           > ORB_MAX_MOVE_PCT (default 0.5%) — skips trending opens where       ║
+║           one leg is immediately deep ITM and the straddle starts losing.      ║
+║           Fail-open: if ORB capture or LTP fetch fails, filter is bypassed.   ║
+║           Scheduler registers the ORB job only when ORB_FILTER_ENABLED=True.  ║
+║                                                                                  ║
+║   ENH-E  BREAKEVEN SL AFTER PARTIAL EXIT (SECTION 7G):                        ║
+║           When one leg hits SL, the surviving leg's SL is moved to the price   ║
+║           where TOTAL combined P&L = 0: be_sl = entry + closed_pnl/qty.       ║
+║           Example: CE entry Rs.100, closed at Rs.120 (−Rs.1300 on 65 qty).    ║
+║           PE entry Rs.100 → be_sl = Rs.80; PE can bounce to Rs.80 before      ║
+║           triggering — at that point combined P&L is exactly Rs.0.             ║
+║           Only activates when closed_pnl < 0 (SL hit, not winner booking).    ║
+║           Persisted in state JSON; sl_level() checks breakeven after trailing. ║
+║                                                                                  ║
+║   ENH-F  BREAKEVEN/SPOT-MOVE EXIT (SECTION 7G):                               ║
+║           Each monitor tick (throttled to SPOT_CHECK_INTERVAL_S = 60s),        ║
+║           NIFTY spot is fetched and compared to state["underlying_ltp"]         ║
+║           (entry spot).  If |current − entry| >= combined_premium ×            ║
+║           BREAKEVEN_SPOT_MULTIPLIER (default 1.0), close_all() fires.          ║
+║           At multiplier=1.0 the position exits exactly at the straddle's       ║
+║           theoretical breakeven — before further losses compound.              ║
+║           _check_spot_move() runs after _check_vix_spike() in the monitor loop.║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   v5.7.0 PHASE-1 MARKET-MOVEMENT ENHANCEMENTS                                  ║
 ║                                                                                  ║
@@ -451,6 +480,45 @@ VIX_HISTORY_MIN_ROWS = 100     # Minimum rows needed for a meaningful IVR/IVP ca
 VIX_UPDATE_TIME      = "15:30" # IST time to auto-append today's VIX to history file
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 6B — OPENING RANGE FILTER  (directional gap guard)
+#
+#  WHY THIS EXISTS:
+#    A short straddle profits from IV crush and theta decay, not from direction.
+#    On days where NIFTY gaps sharply at open (budget, RBI policy, global cues),
+#    one leg is immediately deep ITM and the position starts underwater.
+#    The IVR/VIX filters screen historical regime; this filter screens the
+#    INTRADAY opening impulse — complementary, not redundant.
+#
+#    Data: ~35–40% of straddle losses on DTE0/DTE1 follow mornings where NIFTY
+#    moved > 0.5% in the first 15 minutes. Skipping those days eliminates a
+#    disproportionate share of drawdown with minimal win-rate sacrifice.
+#
+#  HOW IT WORKS:
+#    1. job_orb_capture() fires at ORB_CAPTURE_TIME (default 09:17 IST).
+#       It fetches the live NIFTY spot and stores it as state["orb_price"].
+#       09:17 is 2 minutes after open — enough for the first quote stabilisation.
+#
+#    2. orb_filter_ok() is called inside job_entry() just before the trade.
+#       It fetches NIFTY spot again and computes:
+#         move_pct = |entry_spot − orb_price| / orb_price × 100
+#       If move_pct > ORB_MAX_MOVE_PCT → trade is skipped for the day.
+#
+#  FAIL-OPEN BEHAVIOUR:
+#    If ORB capture or the entry-time spot fetch fails, the filter is bypassed
+#    (fail-open). Safe for production — a missing ORB check is advisory, unlike
+#    a missing margin check which could blow the account.
+#
+#  ORB_MAX_MOVE_PCT GUIDANCE (NIFTY weekly straddle):
+#    0.30% → aggressive  — catches even moderate gaps (more skips, +win-rate)
+#    0.50% → balanced    — catches meaningful directional opens (recommended)
+#    0.75% → relaxed     — only catches large gaps; few skips
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ORB_FILTER_ENABLED = True
+ORB_CAPTURE_TIME   = "09:17"   # Capture NIFTY reference price 2 min after open
+ORB_MAX_MOVE_PCT   = 0.5       # Skip trade if NIFTY moved > 0.5% from ORB price
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 7 — RISK MANAGEMENT
 #
 #  LEG_SL_PERCENT — applied to EACH LEG INDEPENDENTLY
@@ -698,6 +766,78 @@ WINNER_LEG_EARLY_EXIT_ENABLED  = True
 WINNER_LEG_DECAY_THRESHOLD_PCT = 30.0   # Book surviving leg when LTP <= 30% of entry
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7G — BREAKEVEN SL AFTER PARTIAL EXIT
+#
+#  WHY THIS EXISTS:
+#    When one leg hits its SL (e.g., CE closes at Rs.120 vs entry Rs.100, a
+#    Rs.20/unit loss), the surviving PE is still open at, say, Rs.50.  The
+#    default fixed PE SL of Rs.120 (20% above PE entry Rs.100) remains — so the
+#    position could still lose Rs.20/unit on PE as well, creating a combined
+#    loss of Rs.40/unit × qty.
+#
+#    Breakeven SL protection prevents this: the surviving leg's SL is tightened
+#    to the exact price where the total position (both legs combined) breaks even.
+#
+#  HOW IT WORKS:
+#    Immediately after a partial exit (close_one_leg()):
+#      closed_pnl = realised P&L from the closed leg (negative if SL hit)
+#      be_sl = other_entry_px + closed_pnl / qty()
+#
+#    Example: CE entry Rs.100, CE closed at Rs.120 → closed_pnl = -Rs.1300 (65 qty)
+#      PE entry Rs.100 → be_sl = 100 + (-1300/65) = 100 - 20 = Rs.80
+#      PE SL now Rs.80 instead of Rs.120 — max additional loss = Rs.0 net on position.
+#
+#    The breakeven SL is only activated when closed_pnl < 0 (net loss so far):
+#      • If the first leg closed profitably (winner booking → closed_pnl > 0),
+#        breakeven is irrelevant — the position is already net positive.
+#
+#    Priority in sl_level():
+#      1. Trailing SL (if active)             — always highest priority
+#      2. Breakeven SL (if active AND tighter) — protects combined position
+#      3. Fixed/dynamic SL                    — default
+#
+#  STATE PERSISTENCE:
+#    breakeven_active_ce/pe and breakeven_sl_ce/pe are in JSON state.
+#    On restart mid-trade: breakeven resumes exactly where it left off.
+#
+#  SPOT-MOVE EXIT (SECTION 7G continued):
+#    Tracks NIFTY spot at entry time (state["underlying_ltp"]).  Each monitor
+#    tick (throttled), if NIFTY has moved > SPOT_MOVE_EXIT_PCT from entry spot,
+#    close_all() fires — the position has directional risk beyond SL design.
+#
+#  SPOT_MOVE_EXIT_PCT GUIDANCE (NIFTY weekly straddle):
+#    1.0% → tight  — exits on moderate intraday trends (many exits, high safety)
+#    1.5% → balanced — catches significant directional moves (recommended)
+#    2.0% → relaxed — large move before exit; closer to "let SL handle it"
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BREAKEVEN_AFTER_PARTIAL_ENABLED = True   # Tighten surviving leg SL to combined breakeven
+
+# ── Spot / breakeven exit ─────────────────────────────────────────────────────
+#
+#  Exit when NIFTY moves far enough from the straddle entry spot that the
+#  combined premium is effectively breached (the position is at or near loss).
+#
+#  Calculation:
+#    combined_premium = CE_entry_price + PE_entry_price  (per unit)
+#    move_threshold   = combined_premium × BREAKEVEN_SPOT_MULTIPLIER
+#    if |current_NIFTY − spot_at_entry| >= move_threshold → close_all()
+#
+#  BREAKEVEN_SPOT_MULTIPLIER guidance:
+#    0.8 → exit slightly BEFORE theoretical breakeven (conservative — fewer
+#          losses but may exit some recoverable situations)
+#    1.0 → exit exactly AT theoretical breakeven (balanced, recommended)
+#    1.2 → exit slightly AFTER — allows some breathing room past breakeven
+#          (if individual SLs are not yet hit; closer to daily loss limit role)
+#
+#  SPOT_CHECK_INTERVAL_S: throttle frequency.  60s means one NIFTY LTP
+#  fetch per minute — negligible API load while catching intraday trends.
+
+BREAKEVEN_SPOT_EXIT_ENABLED  = True
+BREAKEVEN_SPOT_MULTIPLIER    = 1.0    # Exit when NIFTY moves >= 1.0× combined premium
+SPOT_CHECK_INTERVAL_S        = 60     # Throttle: fetch NIFTY spot at most once per 60s
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 8 — EXPIRY
 #  Format : DDMMMYY uppercase  e.g. "25MAR26"
 #  AUTO_EXPIRY = True resolves the nearest Tuesday automatically every day.
@@ -751,7 +891,7 @@ QUOTE_FAIL_ALERT_THRESHOLD = 3
 #  INTERNAL CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "5.7.0"
+VERSION     = "5.8.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -772,6 +912,11 @@ _monitor_lock = threading.RLock()
 # across monitor ticks but resets on each new Python process (correct behaviour:
 # we want a fresh check timer for every trading session, not persisted to disk).
 _last_vix_spike_check_time = None
+
+# Timestamp of the last intraday spot-move check — same throttle pattern.
+# SPOT_CHECK_INTERVAL_S controls how often NIFTY LTP is fetched for the
+# spot-move exit guard.  Resetting on each new process gives a fresh baseline.
+_last_spot_check_time = None
 
 # Tracks whether at least one monitor tick has completed after the current entry.
 # Used in _close_all_locked() to detect the 0–15s window between entry and the
@@ -863,8 +1008,22 @@ state = {
     "trailing_sl_ce"     : 0.0,    # Current trailing SL price level for CE
     "trailing_sl_pe"     : 0.0,    # Current trailing SL price level for PE
 
+    # ── Breakeven SL state (per leg — activated after partial exit at a loss) ─
+    # Set when one leg closes at a loss; moves the surviving leg's SL to the
+    # price where total combined P&L = 0. Persisted so a restart resumes it.
+    "breakeven_active_ce" : False, # True once breakeven SL armed for CE
+    "breakeven_active_pe" : False, # True once breakeven SL armed for PE
+    "breakeven_sl_ce"     : 0.0,   # Breakeven price level for CE (buy-back price)
+    "breakeven_sl_pe"     : 0.0,   # Breakeven price level for PE (buy-back price)
+
+    # ── Opening range reference price ─────────────────────────────────────────
+    # Captured by job_orb_capture() at ORB_CAPTURE_TIME (default 09:17).
+    # Used by orb_filter_ok() in job_entry() to skip directional opens.
+    # Reset at end of each trade; rewritten fresh each trading day by the job.
+    "orb_price"        : 0.0,      # NIFTY spot at ORB_CAPTURE_TIME
+
     # ── Context at entry ─────────────────────────────────────────────────────
-    "underlying_ltp"   : 0.0,
+    "underlying_ltp"   : 0.0,      # NIFTY spot at straddle entry — also serves as spot_at_entry
     "vix_at_entry"     : 0.0,
     "ivr_at_entry"     : 0.0,     # IV Rank at entry time (0–100)
     "ivp_at_entry"     : 0.0,     # IV Percentile at entry time (0–100)
@@ -1037,16 +1196,20 @@ def sl_level(leg: str) -> float:
     """
     Return the CURRENT effective SL trigger price for a given leg.
 
-    Two modes depending on trailing state:
+    Priority order (highest to lowest):
 
-    TRAILING ACTIVE (state["trailing_active_{leg}"] == True):
-      Returns state["trailing_sl_{leg}"] — the dynamically updated trailing level.
-      This value is always <= the fixed SL level (never worse).
+    1. TRAILING SL (if TRAILING_SL_ENABLED and activated for this leg):
+         Returns state["trailing_sl_{leg}"] — never worse than fixed SL.
 
-    FIXED SL (default / pre-trail):
-      Returns entry_price × (1 + _dynamic_sl_percent() / 100).
-      _dynamic_sl_percent() returns LEG_SL_PERCENT when DYNAMIC_SL_ENABLED=False,
-      or a time-graduated tighter value when DYNAMIC_SL_ENABLED=True.
+    2. BREAKEVEN SL (if BREAKEVEN_AFTER_PARTIAL_ENABLED and activated):
+         Returns state["breakeven_sl_{leg}"] when it is tighter (lower price)
+         than the fixed SL.  Activated after a partial exit where the closed
+         leg realised a loss — ensures total position cannot lose beyond Rs.0.
+
+    3. FIXED SL (default / pre-trail):
+         Returns entry_price × (1 + _dynamic_sl_percent() / 100).
+         _dynamic_sl_percent() returns LEG_SL_PERCENT when DYNAMIC_SL_ENABLED=False,
+         or a time-graduated tighter value when DYNAMIC_SL_ENABLED=True.
 
     Returns 0.0 if entry price was not captured — SL check is skipped at 0.0.
 
@@ -1062,13 +1225,21 @@ def sl_level(leg: str) -> float:
     if entry <= 0:
         return 0.0
 
-    # Trailing SL takes precedence over fixed SL once activated
+    # 1. Trailing SL takes precedence over all others once activated
     if TRAILING_SL_ENABLED and state.get(f"trailing_active_{leg_lower}", False):
         trail_sl = state.get(f"trailing_sl_{leg_lower}", 0.0)
         if trail_sl > 0:
             return trail_sl
 
-    # Fixed SL — default before trailing activation (time-of-day dynamic if enabled)
+    # 2. Breakeven SL — only applies when it is tighter than the fixed SL
+    #    (breakeven_sl is set to a price BELOW entry after a partial exit at loss)
+    if BREAKEVEN_AFTER_PARTIAL_ENABLED and state.get(f"breakeven_active_{leg_lower}", False):
+        be_sl     = state.get(f"breakeven_sl_{leg_lower}", 0.0)
+        fixed_sl  = round(entry * (1.0 + _dynamic_sl_percent() / 100.0), 2)
+        if be_sl > 0 and be_sl < fixed_sl:
+            return be_sl   # Breakeven SL is tighter — use it
+
+    # 3. Fixed SL — default before trailing activation (time-of-day dynamic if enabled)
     return round(entry * (1.0 + _dynamic_sl_percent() / 100.0), 2)
 
 
@@ -1643,6 +1814,67 @@ def _check_vix_history_on_startup():
         pwarn(f"  Could not parse latest date: {latest_date_str!r}")
 
     psep()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  OPENING RANGE FILTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def orb_filter_ok() -> bool:
+    """
+    Opening range filter — called from job_entry() after IVR/IVP passes.
+
+    Compares live NIFTY spot at entry time to the reference price captured
+    by job_orb_capture() at ORB_CAPTURE_TIME (default 09:17 IST).
+
+    If NIFTY has moved more than ORB_MAX_MOVE_PCT from the ORB reference:
+      → returns False (skip trade — directional open detected)
+
+    FAIL-OPEN behaviour:
+      If ORB price was not captured (state["orb_price"] == 0) OR if the
+      entry-time LTP fetch fails, the filter is bypassed (returns True).
+      This ensures ORB failure never silently blocks all trades.
+
+    Returns True (OK to trade) / False (skip).
+    """
+    if not ORB_FILTER_ENABLED:
+        return True
+
+    orb_px = state.get("orb_price", 0.0)
+    if orb_px <= 0:
+        pwarn(
+            "ORB filter: opening reference price not captured "
+            f"(check that ORB capture job ran at {ORB_CAPTURE_TIME}) — bypassed (fail-open)"
+        )
+        return True
+
+    current_spot = _fetch_spot_ltp()
+    if current_spot <= 0:
+        pwarn("ORB filter: NIFTY LTP fetch failed — bypassed (fail-open)")
+        return True
+
+    move_pct  = abs(current_spot - orb_px) / orb_px * 100.0
+    direction = "↑" if current_spot > orb_px else "↓"
+
+    if move_pct > ORB_MAX_MOVE_PCT:
+        pwarn(
+            f"ORB filter: NIFTY {direction} {move_pct:.2f}% "
+            f"(ORB Rs.{orb_px:.2f} → now Rs.{current_spot:.2f}) "
+            f"> {ORB_MAX_MOVE_PCT}% — directional open, skipping trade"
+        )
+        telegram(
+            f"📊 ORB FILTER — Trade SKIPPED\n"
+            f"NIFTY {direction} {move_pct:.2f}% since {ORB_CAPTURE_TIME}\n"
+            f"ORB ref: Rs.{orb_px:.2f}  |  Now: Rs.{current_spot:.2f}\n"
+            f"Threshold: {ORB_MAX_MOVE_PCT}% — trending open, straddle risk too high."
+        )
+        return False
+
+    pinfo(
+        f"ORB filter: NIFTY {direction} {move_pct:.2f}% from ORB Rs.{orb_px:.2f} "
+        f"(Rs.{current_spot:.2f}) ≤ {ORB_MAX_MOVE_PCT}% — OK to trade"
+    )
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2322,20 +2554,57 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
     other_active   = state[f"{other_leg.lower()}_active"]
     other_symbol   = state[f"symbol_{other_leg.lower()}"]
     other_entry_px = state[f"entry_price_{other_leg.lower()}"]
-    other_sl       = sl_level(other_leg)
 
     if other_active:
         # ── PARTIAL EXIT — surviving leg continues ────────────────────────────
+
+        # ── BREAKEVEN SL ACTIVATION ───────────────────────────────────────────
+        # If this leg closed at a NET LOSS (closed_pnl < 0), activate breakeven
+        # SL for the survivor.  The breakeven price is the exact exit price for
+        # the surviving leg where TOTAL combined P&L = 0.
+        #
+        # Formula:  be_sl = other_entry_px + closed_pnl / qty()
+        #   (closed_pnl < 0 so be_sl < other_entry_px — below entry price)
+        #
+        # Only activated when be_sl > 0 and be_sl < other_entry_px
+        #   (i.e. the surviving leg needs to generate profit to cover the loss)
+        # Ignored when be_sl >= other_entry_px (position already net positive
+        #   before this leg closed — no protection needed from breakeven).
+        be_activated = False
+        be_price     = 0.0
+        if BREAKEVEN_AFTER_PARTIAL_ENABLED and other_entry_px > 0 and state["closed_pnl"] < 0:
+            be_price = round(other_entry_px + state["closed_pnl"] / qty(), 2)
+            if 0 < be_price < other_entry_px:
+                other_leg_lower = other_leg.lower()
+                state[f"breakeven_active_{other_leg_lower}"] = True
+                state[f"breakeven_sl_{other_leg_lower}"]     = be_price
+                be_activated = True
+                pinfo(
+                    f"  BREAKEVEN SL activated for {other_leg}: "
+                    f"Rs.{be_price:.2f}  "
+                    f"(position breaks even when {other_leg} exits at ≤ Rs.{be_price:.2f})"
+                )
+
+        # sl_level() now returns breakeven SL if it's tighter than fixed
+        other_sl = sl_level(other_leg)
+
         state["in_position"] = True
         save_state()
 
         pinfo(f"  {other_leg} leg still ACTIVE — continues with independent SL")
         pinfo(f"  {other_leg} symbol    : {other_symbol}")
         pinfo(f"  {other_leg} entry     : Rs.{other_entry_px:.2f}")
-        pinfo(f"  {other_leg} SL level  : Rs.{other_sl:.2f}  ({LEG_SL_PERCENT}%)")
+        if be_activated:
+            pinfo(f"  {other_leg} SL level  : Rs.{other_sl:.2f}  (breakeven protection)")
+        else:
+            pinfo(f"  {other_leg} SL level  : Rs.{other_sl:.2f}  ({LEG_SL_PERCENT}%)")
         pinfo(f"  {other_leg} hard exit : {EXIT_TIME} IST")
         psep()
 
+        sl_label = (
+            f"Rs.{other_sl:.2f} (breakeven)" if be_activated
+            else f"Rs.{other_sl:.2f} ({LEG_SL_PERCENT}%)"
+        )
         telegram(
             f"⚡ PARTIAL EXIT — {leg_upper} LEG CLOSED\n"
             f"Reason     : {reason}\n"
@@ -2345,7 +2614,7 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
             f"{other_leg} STILL ACTIVE\n"
             f"Symbol     : {other_symbol}\n"
             f"Entry      : Rs.{other_entry_px:.2f}\n"
-            f"SL @       : Rs.{other_sl:.2f}  ({LEG_SL_PERCENT}%)\n"
+            f"SL @       : {sl_label}\n"
             f"Hard exit  : {EXIT_TIME} IST"
         )
 
@@ -2622,6 +2891,11 @@ def _mark_fully_flat(reason: str):
     state["trailing_active_pe"] = False
     state["trailing_sl_ce"]     = 0.0
     state["trailing_sl_pe"]     = 0.0
+    state["breakeven_active_ce"] = False  # Reset breakeven SL — clean state for next trade
+    state["breakeven_active_pe"] = False
+    state["breakeven_sl_ce"]     = 0.0
+    state["breakeven_sl_pe"]     = 0.0
+    state["orb_price"]           = 0.0   # Reset ORB — rewritten fresh each day by job_orb_capture
     state["entry_time"]        = None
     state["entry_date"]        = None
     state["margin_required"]   = 0.0
@@ -2971,6 +3245,120 @@ def _fetch_ltp(leg: str) -> float:
         return 0.0
 
 
+def _fetch_spot_ltp() -> float:
+    """
+    Fetch live NIFTY spot LTP via quotes() on NSE_INDEX exchange.
+
+    Used by:
+      • job_orb_capture()    — capture opening reference price at 09:17
+      • orb_filter_ok()      — check opening range at entry time
+      • _check_spot_move()   — throttled intraday spot-move guard in monitor loop
+
+    Returns float > 0 on success, 0.0 on failure (caller handles gracefully).
+    """
+    try:
+        q = client.quotes(symbol=UNDERLYING, exchange=INDEX_EXCH)
+        if isinstance(q, dict) and q.get("status") == "success":
+            ltp = float(q.get("data", {}).get("ltp", 0) or 0)
+            return ltp if ltp > 0 else 0.0
+        pwarn(
+            f"_fetch_spot_ltp: quotes({UNDERLYING}) failed: "
+            f"{q.get('message', '') if isinstance(q, dict) else str(q)}"
+        )
+        return 0.0
+    except Exception as exc:
+        pwarn(f"_fetch_spot_ltp: exception: {exc}")
+        return 0.0
+
+
+def _check_spot_move():
+    """
+    Intraday breakeven/spot-move guard — called from _run_monitor_tick()
+    while _monitor_lock is held (same threading pattern as _check_vix_spike).
+
+    WHAT IT CHECKS:
+      The straddle's theoretical breakeven = entry_spot ± combined_premium.
+      If NIFTY moves >= combined_premium × BREAKEVEN_SPOT_MULTIPLIER from the
+      entry spot, both legs of the straddle are near or past their individual
+      breakeven and holding further increases combined loss without a mean-revert
+      mechanism to save it.
+
+    CALCULATION:
+      combined_premium = CE_entry_price + PE_entry_price  (per unit)
+      move_threshold   = combined_premium × BREAKEVEN_SPOT_MULTIPLIER
+      move_abs         = |current_NIFTY − spot_at_entry|
+      if move_abs >= move_threshold → close_all()
+
+    THROTTLED to SPOT_CHECK_INTERVAL_S (default 60s) — one NIFTY spot fetch
+    per minute is sufficient to detect intraday directional trends.
+
+    No-ops immediately when:
+      • BREAKEVEN_SPOT_EXIT_ENABLED = False
+      • spot_at_entry == 0.0 (entry not yet taken)
+      • combined_premium == 0.0 (fill prices not yet captured)
+      • Too soon since last check (throttle guard)
+      • LTP fetch fails (fail-open — normal SL monitoring continues)
+    """
+    global _last_spot_check_time
+    if not BREAKEVEN_SPOT_EXIT_ENABLED:
+        return
+
+    spot_at_entry = state.get("underlying_ltp", 0.0)
+    if spot_at_entry <= 0:
+        return   # Entry spot not captured yet
+
+    ce_entry = state.get("entry_price_ce", 0.0)
+    pe_entry = state.get("entry_price_pe", 0.0)
+    combined_premium = ce_entry + pe_entry
+    if combined_premium <= 0:
+        return   # Fill prices not yet captured — skip until captured
+
+    now = now_ist()
+    if (
+        _last_spot_check_time is not None
+        and (now - _last_spot_check_time).total_seconds() < SPOT_CHECK_INTERVAL_S
+    ):
+        return   # Throttle: too soon since last check
+
+    _last_spot_check_time = now
+    current_spot = _fetch_spot_ltp()
+    if current_spot <= 0:
+        pwarn("Breakeven/spot guard: NIFTY LTP unavailable — skipping this check")
+        return
+
+    move_abs       = abs(current_spot - spot_at_entry)
+    move_threshold = combined_premium * BREAKEVEN_SPOT_MULTIPLIER
+    direction      = "↑" if current_spot > spot_at_entry else "↓"
+
+    pdebug(
+        f"Spot-move check: NIFTY {direction} Rs.{current_spot:.2f} "
+        f"(moved Rs.{move_abs:.2f} vs threshold Rs.{move_threshold:.2f} "
+        f"= premium Rs.{combined_premium:.2f} × {BREAKEVEN_SPOT_MULTIPLIER})"
+    )
+
+    if move_abs >= move_threshold:
+        pinfo(
+            f"BREAKEVEN BREACH EXIT: NIFTY {direction} Rs.{current_spot:.2f} "
+            f"(moved Rs.{move_abs:.2f} from entry Rs.{spot_at_entry:.2f}) "
+            f">= threshold Rs.{move_threshold:.2f} "
+            f"(premium Rs.{combined_premium:.2f} × {BREAKEVEN_SPOT_MULTIPLIER}) — closing all"
+        )
+        telegram(
+            f"⚠️ BREAKEVEN BREACH EXIT\n"
+            f"NIFTY {direction} Rs.{current_spot:.2f} — moved Rs.{move_abs:.2f} "
+            f"from entry Rs.{spot_at_entry:.2f}\n"
+            f"Combined premium collected: Rs.{combined_premium:.2f}/unit\n"
+            f"Threshold: Rs.{move_threshold:.2f} ({BREAKEVEN_SPOT_MULTIPLIER}× premium)\n"
+            f"Position at/past theoretical breakeven — closing all."
+        )
+        close_all(
+            reason=(
+                f"Breakeven Breach — NIFTY {direction} Rs.{move_abs:.2f} "
+                f"vs premium Rs.{combined_premium:.2f}"
+            )
+        )
+
+
 def monitor_pnl():
     """
     Monitor tick — runs every MONITOR_INTERVAL_S seconds.
@@ -3208,6 +3596,14 @@ def _run_monitor_tick():
     if not state["in_position"]:
         return   # VIX spike exit fired — nothing left to check
 
+    # ── BREAKEVEN / SPOT-MOVE CHECK (throttled — at most once per SPOT_CHECK_INTERVAL_S) ─
+    # Exits when NIFTY has moved >= combined_premium × BREAKEVEN_SPOT_MULTIPLIER
+    # from entry spot — position is at or past theoretical straddle breakeven.
+    # Runs after VIX spike (which is more urgent) but before daily target/limit.
+    _check_spot_move()
+    if not state["in_position"]:
+        return   # Breakeven breach exit fired — nothing left to check
+
     # ── DAILY PROFIT TARGET (combined) ───────────────────────────────────────
     if DAILY_PROFIT_TARGET > 0 and combined_pnl >= DAILY_PROFIT_TARGET:
         pinfo(f"DAILY PROFIT TARGET Rs.{DAILY_PROFIT_TARGET} REACHED — closing all")
@@ -3431,6 +3827,51 @@ def _fetch_broker_positions() -> list:
 #  SCHEDULED JOBS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def job_orb_capture():
+    """
+    Opening Range capture job — fires once at ORB_CAPTURE_TIME (default 09:17).
+
+    Fetches live NIFTY spot and stores it as state["orb_price"].
+    This reference price is used by orb_filter_ok() inside job_entry() to
+    detect directional opening moves before committing to a straddle.
+
+    Failure behaviour:
+      If the NIFTY LTP fetch fails, state["orb_price"] is set to 0.0.
+      orb_filter_ok() treats 0.0 as "data unavailable" and bypasses the filter
+      (fail-open) — a connectivity blip at 09:17 never silently blocks the trade.
+    """
+    if not ORB_FILTER_ENABLED:
+        pdebug("ORB capture job: ORB_FILTER_ENABLED=False — skipping")
+        return
+
+    # Weekend guard (scheduler fires mon-fri, but belt-and-suspenders)
+    if now_ist().weekday() >= 5:
+        pdebug("ORB capture job: weekend — skipping")
+        return
+
+    psep()
+    pinfo(f"ORB CAPTURE | {now_ist().strftime('%H:%M:%S IST')} — fetching NIFTY opening reference")
+
+    spot = _fetch_spot_ltp()
+    if spot > 0:
+        state["orb_price"] = spot
+        save_state()
+        pinfo(f"  ORB reference captured: NIFTY Rs.{spot:.2f}")
+        pinfo(f"  Entry-time filter: skip if NIFTY moves >{ORB_MAX_MOVE_PCT}% from this level")
+    else:
+        state["orb_price"] = 0.0
+        pwarn(
+            "  ORB capture FAILED — NIFTY LTP unavailable. "
+            "ORB filter will be bypassed at entry time (fail-open)."
+        )
+        telegram(
+            f"⚠️ ORB Capture FAILED at {ORB_CAPTURE_TIME}\n"
+            f"NIFTY spot unavailable — ORB filter bypassed today.\n"
+            f"Check OpenAlgo / NSE connectivity."
+        )
+    psep()
+
+
 def job_entry():
     """
     Entry job — fires once at ENTRY_TIME on configured DTE days.
@@ -3439,8 +3880,10 @@ def job_entry():
       1. Duplicate guard
       2. DTE filter (trading days, AlgoTest-compatible) + month filter
       3. VIX filter
-      4. Margin guard (cash + collateral >= required × buffer)
-      5. Reset daily counters and place straddle entry
+      4. IVR / IVP filter
+      5. Opening range filter (ORB)
+      6. Margin guard (cash + collateral >= required × buffer)
+      7. Reset daily counters and place straddle entry
 
     FIX-A (v5.1.0): expiry resolved ONCE here, passed to both
     check_margin_sufficient() and place_entry() — single source of truth,
@@ -3490,15 +3933,22 @@ def job_entry():
     if not ivr_ivp_ok(state["vix_at_entry"]):
         return
 
-    # ── 5. Resolve expiry ONCE — used for both margin check and order entry ───
+    # ── 5. Opening range filter — skip if NIFTY has moved too much since open ─
+    #  orb_filter_ok() fetches live NIFTY spot and compares to the reference
+    #  price captured at ORB_CAPTURE_TIME.  Bypassed (fail-open) if ORB not
+    #  captured or LTP unavailable.
+    if not orb_filter_ok():
+        return
+
+    # ── 6. Resolve expiry ONCE — used for both margin check and order entry ───
     expiry = get_expiry()
 
-    # ── 6. Pre-trade margin guard ─────────────────────────────────────────────
+    # ── 7. Pre-trade margin guard ─────────────────────────────────────────────
     if not check_margin_sufficient(expiry):
         perr("Entry ABORTED — insufficient margin (cash + collateral)")
         return
 
-    # ── 7. Reset daily counters and place entry ───────────────────────────────
+    # ── 8. Reset daily counters and place entry ───────────────────────────────
     state["today_pnl"]  = 0.0
     state["closed_pnl"] = 0.0
 
@@ -4219,6 +4669,58 @@ def _validate_config():
                 f"got {WINNER_LEG_DECAY_THRESHOLD_PCT}"
             )
 
+    # ── ORB filter ────────────────────────────────────────────────────────────
+    if ORB_FILTER_ENABLED:
+        try:
+            oh, om = parse_hhmm(ORB_CAPTURE_TIME)
+            assert 0 <= oh <= 23 and 0 <= om <= 59
+        except Exception:
+            errors.append(f"ORB_CAPTURE_TIME invalid: {ORB_CAPTURE_TIME!r}  (expected HH:MM)")
+        if not (0.0 < ORB_MAX_MOVE_PCT < 100.0):
+            errors.append(
+                f"ORB_MAX_MOVE_PCT must be between 0 and 100 (exclusive), "
+                f"got {ORB_MAX_MOVE_PCT}"
+            )
+        # Validate ORB_CAPTURE_TIME is before the earliest entry time
+        try:
+            oh2, om2 = parse_hhmm(ORB_CAPTURE_TIME)
+            if USE_DTE_ENTRY_MAP:
+                earliest = min(
+                    (parse_hhmm(t) for t in DTE_ENTRY_TIME_MAP.values()),
+                    default=parse_hhmm(ENTRY_TIME),
+                )
+            else:
+                earliest = parse_hhmm(ENTRY_TIME)
+            if (oh2, om2) >= earliest:
+                errors.append(
+                    f"ORB_CAPTURE_TIME ({ORB_CAPTURE_TIME}) must be earlier than "
+                    f"all entry times — ORB capture must precede entry"
+                )
+        except Exception:
+            pass   # Format errors already caught above
+
+    # ── Breakeven after partial exit ──────────────────────────────────────────
+    # (BREAKEVEN_AFTER_PARTIAL_ENABLED is a boolean toggle — no numeric range needed)
+    # Breakeven SL requires entry prices which are always positive after fill capture.
+
+    # ── Spot-move / breakeven breach exit ─────────────────────────────────────
+    if BREAKEVEN_SPOT_EXIT_ENABLED:
+        if BREAKEVEN_SPOT_MULTIPLIER <= 0:
+            errors.append(
+                f"BREAKEVEN_SPOT_MULTIPLIER must be > 0 when BREAKEVEN_SPOT_EXIT_ENABLED=True, "
+                f"got {BREAKEVEN_SPOT_MULTIPLIER}"
+            )
+        if SPOT_CHECK_INTERVAL_S <= 0:
+            errors.append(
+                f"SPOT_CHECK_INTERVAL_S must be > 0, got {SPOT_CHECK_INTERVAL_S}"
+            )
+        if SPOT_CHECK_INTERVAL_S < MONITOR_INTERVAL_S:
+            errors.append(
+                f"SPOT_CHECK_INTERVAL_S ({SPOT_CHECK_INTERVAL_S}s) must be >= "
+                f"MONITOR_INTERVAL_S ({MONITOR_INTERVAL_S}s) — "
+                f"spot check cannot run faster than the monitor loop"
+            )
+
     # ── Trade log + connectivity ───────────────────────────────────────────────
     if QUOTE_FAIL_ALERT_THRESHOLD <= 0:
         errors.append(f"QUOTE_FAIL_ALERT_THRESHOLD must be > 0, got {QUOTE_FAIL_ALERT_THRESHOLD}")
@@ -4258,6 +4760,7 @@ def run():
 
     exit_h,  exit_m  = parse_hhmm(EXIT_TIME)
     vix_upd_h, vix_upd_m = parse_hhmm(VIX_UPDATE_TIME)
+    orb_h, orb_m = parse_hhmm(ORB_CAPTURE_TIME)
 
     scheduler = BlockingScheduler(timezone=IST)
 
@@ -4309,6 +4812,23 @@ def run():
         id      = "monitor_job",
         name    = f"Monitor {MONITOR_INTERVAL_S}s",
     )
+    # Opening range capture — fires at ORB_CAPTURE_TIME (default 09:17) to store
+    # the NIFTY opening reference price used by orb_filter_ok() at entry time.
+    if ORB_FILTER_ENABLED:
+        scheduler.add_job(
+            func               = job_orb_capture,
+            trigger            = "cron",
+            day_of_week        = "mon-fri",
+            hour               = orb_h,
+            minute             = orb_m,
+            id                 = "orb_capture_job",
+            name               = f"ORB Capture {ORB_CAPTURE_TIME}",
+            misfire_grace_time = 120,
+        )
+        pinfo(f"ORB capture scheduled at {ORB_CAPTURE_TIME} IST (mon-fri)")
+    else:
+        pinfo("ORB filter: DISABLED — no opening range capture scheduled")
+
     # VIX history daily update — runs once at VIX_UPDATE_TIME after market close.
     # Appends today's closing VIX to vix_history.csv so tomorrow's IVR/IVP
     # filter has fresh data.  Scheduled mon-fri; job itself has a weekend guard.
