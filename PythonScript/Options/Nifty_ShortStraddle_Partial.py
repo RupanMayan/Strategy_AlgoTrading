@@ -2652,20 +2652,26 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
         state["in_position"] = True
         save_state()
 
+        # Determine the correct SL type label for log and Telegram.
+        # Priority mirrors sl_level(): trailing > breakeven > dynamic > fixed.
+        _other_leg_lower = other_leg.lower()
+        if be_activated:
+            _sl_type_label = "breakeven protection"
+        elif TRAILING_SL_ENABLED and state.get(f"trailing_active_{_other_leg_lower}", False):
+            _sl_type_label = "trailing SL"
+        elif DYNAMIC_SL_ENABLED:
+            _sl_type_label = f"dynamic {_dynamic_sl_percent():.0f}%"
+        else:
+            _sl_type_label = f"fixed {LEG_SL_PERCENT}%"
+
         pinfo(f"  {other_leg} leg still ACTIVE — continues with independent SL")
         pinfo(f"  {other_leg} symbol    : {other_symbol}")
         pinfo(f"  {other_leg} entry     : Rs.{other_entry_px:.2f}")
-        if be_activated:
-            pinfo(f"  {other_leg} SL level  : Rs.{other_sl:.2f}  (breakeven protection)")
-        else:
-            pinfo(f"  {other_leg} SL level  : Rs.{other_sl:.2f}  ({LEG_SL_PERCENT}%)")
+        pinfo(f"  {other_leg} SL level  : Rs.{other_sl:.2f}  ({_sl_type_label})")
         pinfo(f"  {other_leg} hard exit : {EXIT_TIME} IST")
         psep()
 
-        sl_label = (
-            f"Rs.{other_sl:.2f} (breakeven)" if be_activated
-            else f"Rs.{other_sl:.2f} ({LEG_SL_PERCENT}%)"
-        )
+        sl_label = f"Rs.{other_sl:.2f} ({_sl_type_label})"
         telegram(
             f"⚡ PARTIAL EXIT — {leg_upper} LEG CLOSED\n"
             f"Reason     : {reason}\n"
