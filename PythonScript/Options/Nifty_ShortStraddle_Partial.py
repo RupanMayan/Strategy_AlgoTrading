@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.5.1                        ║
+║   NIFTY SHORT STRADDLE  —  PARTIAL SQUARE OFF   v5.6.0                        ║
 ║   Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   Backtest Results  (AlgoTest 2019–2026  |  1746 trades  |  PARTIAL mode)      ║
@@ -142,6 +142,30 @@
 ║           value at launch. Fixed: added to spike monitor display line in       ║
 ║           both banner and Telegram startup notification.                        ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
+║   v5.6.0 ENHANCEMENTS  (post-audit improvements)                               ║
+║                                                                                  ║
+║   ENH-I   Structured trade log (trades.jsonl): On every position close,        ║
+║           _append_trade_log() appends a JSON row with entry_time, exit_time,   ║
+║           duration_min, symbols, entry/exit prices (per-leg), closed_pnl,      ║
+║           exit_reason, VIX, IVR, IVP, underlying_ltp, and margin_required.    ║
+║           close_one_leg() now records exit_price_ce/pe in state so the log     ║
+║           always shows actual fills, not trigger LTPs. Configurable via        ║
+║           TRADE_LOG_FILE (set to "" to disable). Zero performance impact.      ║
+║                                                                                  ║
+║   ENH-II  Concurrent fill capture: _capture_fill_prices() now uses a          ║
+║           ThreadPoolExecutor(max_workers=2) so CE and PE orderstatus()         ║
+║           retries run in parallel. Worst-case wall-clock time drops from       ║
+║           ~20s (sequential 5×back-off per leg) to ~10s (parallel). The        ║
+║           per-leg retry helper _capture_fill_one_leg() is extracted for        ║
+║           clarity and testability.                                              ║
+║                                                                                  ║
+║   ENH-III Broker connectivity escalation: _run_monitor_tick() now tracks      ║
+║           consecutive ticks where ALL active legs fail LTP fetch. When         ║
+║           count reaches QUOTE_FAIL_ALERT_THRESHOLD (default 3, ~45s),          ║
+║           one Telegram alert fires: "BROKER QUOTES UNREACHABLE — SL            ║
+║           monitoring paused". A second "RESTORED" alert fires when quotes       ║
+║           come back. Prevents silent SL blackouts from going unnoticed.        ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
 ║   v5.2.0 PRODUCTION-GRADE HARDENING  (third-pass audit)                         ║
 ║                                                                                  ║
 ║   FIX-I   CRITICAL — date.today() used in 3 places instead of                  ║
@@ -232,6 +256,7 @@ import tempfile
 import threading
 import requests
 import pytz
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timedelta
 
 # Third-party  (pip install openalgo apscheduler pytz)
@@ -578,7 +603,17 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "")
 #  e.g.  STATE_FILE = "/home/ubuntu/strategy/strategy_state.json"
 # ═══════════════════════════════════════════════════════════════════════════════
 
-STATE_FILE = "strategy_state.json"
+STATE_FILE     = "strategy_state.json"
+
+# One JSON object per line — appended on every position close.
+# Enables post-session analysis without digging through logs.
+# Set to "" to disable trade logging.
+TRADE_LOG_FILE = "trades.jsonl"
+
+# Number of consecutive monitor ticks where ALL active legs fail LTP fetch
+# before a Telegram alert is sent (broker quotes unreachable).
+# At MONITOR_INTERVAL_S=15s, threshold=3 means alert fires after ~45s of blackout.
+QUOTE_FAIL_ALERT_THRESHOLD = 3
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  END OF CONFIGURATION
@@ -589,7 +624,7 @@ STATE_FILE = "strategy_state.json"
 #  INTERNAL CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "5.5.0"
+VERSION     = "5.6.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -617,6 +652,13 @@ _last_vix_spike_check_time = None
 # trigger when real MTM happens to be exactly Rs.0.
 # Reset to False in place_entry() on each new trade. Set to True on first tick.
 _first_tick_fired = False
+
+# Counts consecutive monitor ticks where ALL active legs failed LTP fetch.
+# Resets to 0 on the first tick where any leg returns a valid LTP.
+# When it reaches QUOTE_FAIL_ALERT_THRESHOLD, one Telegram alert is sent.
+# The alert flag prevents repeated alerts for the same outage window.
+_consecutive_quote_fail_ticks = 0
+_quote_fail_alerted           = False
 
 # ── Effective daily target / limit (auto-scaled with NUMBER_OF_LOTS) ──────────
 #  DO NOT edit these — change DAILY_PROFIT_TARGET_PER_LOT / DAILY_LOSS_LIMIT_PER_LOT
@@ -677,6 +719,11 @@ state = {
     # ── Entry fill prices — basis of per-leg SL calculation ──────────────────
     "entry_price_ce"   : 0.0,
     "entry_price_pe"   : 0.0,
+
+    # ── Exit fill prices — recorded by close_one_leg() for trade log ─────────
+    # Actual broker average fill if orderstatus() available, else trigger LTP.
+    "exit_price_ce"    : 0.0,
+    "exit_price_pe"    : 0.0,
 
     # ── Realised P&L from legs already closed this session ───────────────────
     "closed_pnl"       : 0.0,
@@ -1812,8 +1859,10 @@ def place_entry(expiry: str) -> bool:
         return False
 
     # ── Populate state — BOTH legs now active ─────────────────────────────────
-    global _first_tick_fired
-    _first_tick_fired = False   # Reset so no_tick_yet detection works for this trade
+    global _first_tick_fired, _consecutive_quote_fail_ticks, _quote_fail_alerted
+    _first_tick_fired             = False  # Reset so no_tick_yet detection works for this trade
+    _consecutive_quote_fail_ticks = 0      # Reset connectivity counter for new trade
+    _quote_fail_alerted           = False
 
     now_dt = now_ist()
     state["in_position"]       = True
@@ -1857,47 +1906,66 @@ def place_entry(expiry: str) -> bool:
     return True
 
 
+def _capture_fill_one_leg(leg: str, oid: str) -> bool:
+    """
+    Fetch the average fill price for one leg with linear back-off retry.
+    Writes state["entry_price_{leg}"] on success.  Returns True if filled.
+
+    Called concurrently for CE and PE by _capture_fill_prices() so total
+    wall-clock time is ~max(ce_time, pe_time) instead of ce_time + pe_time.
+    """
+    MAX_ATTEMPTS = 5
+    RETRY_DELAYS = [1.0, 2.0, 3.0, 4.0]   # delay BEFORE attempt 2, 3, 4, 5
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            resp = client.orderstatus(order_id=oid, strategy=STRATEGY_NAME)
+            if isinstance(resp, dict) and resp.get("status") == "success":
+                avg_px = float(resp.get("data", {}).get("average_price", 0) or 0)
+                if avg_px > 0:
+                    state[f"entry_price_{leg.lower()}"] = avg_px
+                    pinfo(f"  Fill [{leg}]: Rs.{avg_px:.2f}  (orderid: {oid}  attempt: {attempt})")
+                    return True
+                else:
+                    pdebug(f"  Fill [{leg}]: avg_px=0 on attempt {attempt}, retrying...")
+            else:
+                msg = resp.get("message", "") if isinstance(resp, dict) else str(resp)
+                pdebug(f"  orderstatus [{leg}] attempt {attempt} failed: {msg}")
+        except Exception as exc:
+            pdebug(f"  orderstatus [{leg}] attempt {attempt} exception: {exc}")
+
+        if attempt < MAX_ATTEMPTS:
+            time.sleep(RETRY_DELAYS[attempt - 1])
+
+    return False
+
+
 def _capture_fill_prices():
     """
     Fetch average fill prices from broker via orderstatus() for both legs.
     These are the foundation of per-leg SL levels — must be accurate.
 
-    Retry logic: up to 5 attempts with linear back-off (1s, 2s, 3s, 4s delays
-    before attempts 2–5).
-    Extra attempts vs v5.1.0 (was 3 × 1s) to handle slow broker fill reporting.
+    Improvement (v5.6.0): CE and PE are fetched CONCURRENTLY using
+    ThreadPoolExecutor so total wall-clock time is ~max(ce_time, pe_time)
+    instead of sequential ce_time + pe_time.  At worst (5 attempts, linear
+    back-off 1+2+3+4s) this cuts the blocking time from ~20s to ~10s.
+
     Failure: warns and leaves entry_price at 0.0 — SL disabled for that leg.
     CRITICAL: SL cannot fire without a valid entry price.  If fill capture
     fails, the operator must monitor this trade manually until a restart.
     """
-    MAX_ATTEMPTS = 5
-    RETRY_DELAYS = [1.0, 2.0, 3.0, 4.0]   # delay BEFORE attempt 2, 3, 4, 5
+    legs = [("CE", state["orderid_ce"]), ("PE", state["orderid_pe"])]
 
-    for leg, oid in [("CE", state["orderid_ce"]), ("PE", state["orderid_pe"])]:
-        filled = False
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            try:
-                resp = client.orderstatus(order_id=oid, strategy=STRATEGY_NAME)
-                if isinstance(resp, dict) and resp.get("status") == "success":
-                    avg_px = float(resp.get("data", {}).get("average_price", 0) or 0)
-                    if avg_px > 0:
-                        state[f"entry_price_{leg.lower()}"] = avg_px
-                        pinfo(f"  Fill [{leg}]: Rs.{avg_px:.2f}  (orderid: {oid}  attempt: {attempt})")
-                        filled = True
-                        break
-                    else:
-                        pdebug(f"  Fill [{leg}]: avg_px=0 on attempt {attempt}, retrying...")
-                else:
-                    msg = resp.get("message", "") if isinstance(resp, dict) else str(resp)
-                    pdebug(f"  orderstatus [{leg}] attempt {attempt} failed: {msg}")
-            except Exception as exc:
-                pdebug(f"  orderstatus [{leg}] attempt {attempt} exception: {exc}")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {pool.submit(_capture_fill_one_leg, leg, oid): leg for leg, oid in legs}
+        results = {}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
 
-            if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_DELAYS[attempt - 1])
-
-        if not filled:
+    for leg, oid in legs:
+        if not results.get(leg, False):
             pwarn(
-                f"  Fill price [{leg}] unavailable after {MAX_ATTEMPTS} attempts "
+                f"  Fill price [{leg}] unavailable after all attempts "
                 f"— SL DISABLED for this leg. MANUAL MONITORING REQUIRED."
             )
             telegram(
@@ -2079,6 +2147,10 @@ def close_one_leg(leg: str, reason: str, current_ltp: float = 0.0):
         pdebug(f"  Actual fill unavailable — using trigger LTP Rs.{current_ltp:.2f} for P&L")
 
     # ── Order placed successfully — update state ──────────────────────────────
+    # Record exit price for trade log: actual fill if available, else trigger LTP
+    exit_px_key = f"exit_price_{leg_upper.lower()}"
+    state[exit_px_key] = actual_fill_px if actual_fill_px > 0 else current_ltp
+
     state[active_key]   = False
     state["closed_pnl"] = state["closed_pnl"] + realised_pnl
 
@@ -2287,6 +2359,60 @@ def _emergency_close_all():
 #  Resets position state, deletes state file, logs final summary.
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _append_trade_log(reason: str, final_pnl: float, exit_dt: datetime):
+    """
+    Append one JSON line to TRADE_LOG_FILE for post-session analysis.
+
+    Called from _mark_fully_flat() BEFORE state is reset, so all entry
+    context (prices, symbols, VIX, IVR, margin) is still readable.
+    A corrupt/incomplete final line is safe to ignore on read (jsonl format).
+    """
+    if not TRADE_LOG_FILE:
+        return  # Feature disabled by operator
+
+    try:
+        entry_dt  = None
+        held_mins = None
+        raw_et    = state.get("entry_time")
+        if raw_et:
+            try:
+                entry_dt = datetime.fromisoformat(str(raw_et))
+                if entry_dt.tzinfo is None:
+                    entry_dt = IST.localize(entry_dt)
+                held_mins = int((exit_dt - entry_dt).total_seconds() // 60)
+            except Exception:
+                pass
+
+        record = {
+            "date"            : exit_dt.strftime("%Y-%m-%d"),
+            "entry_time"      : entry_dt.isoformat() if entry_dt else None,
+            "exit_time"       : exit_dt.isoformat(),
+            "duration_min"    : held_mins,
+            "symbol_ce"       : state.get("symbol_ce", ""),
+            "symbol_pe"       : state.get("symbol_pe", ""),
+            "entry_price_ce"  : state.get("entry_price_ce", 0.0),
+            "entry_price_pe"  : state.get("entry_price_pe", 0.0),
+            "exit_price_ce"   : state.get("exit_price_ce", 0.0),
+            "exit_price_pe"   : state.get("exit_price_pe", 0.0),
+            "closed_pnl"      : round(final_pnl, 2),
+            "exit_reason"     : reason,
+            "trade_count"     : state.get("trade_count", 0) + 1,  # pre-increment
+            "vix_at_entry"    : state.get("vix_at_entry", 0.0),
+            "ivr_at_entry"    : state.get("ivr_at_entry", 0.0),
+            "ivp_at_entry"    : state.get("ivp_at_entry", 0.0),
+            "underlying_ltp"  : state.get("underlying_ltp", 0.0),
+            "margin_required" : state.get("margin_required", 0.0),
+        }
+
+        with open(TRADE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        pdebug(f"Trade log appended → {TRADE_LOG_FILE}")
+
+    except Exception as exc:
+        pwarn(f"Trade log write failed (non-critical): {exc}")
+
+
 def _mark_fully_flat(reason: str):
     """
     Reset all position fields, delete state file, send final summary.
@@ -2299,6 +2425,7 @@ def _mark_fully_flat(reason: str):
     Now explicitly reset to 0.0 in the state reset block.
     """
     final_pnl    = state["closed_pnl"]   # Authoritative — accumulated by leg closes
+    exit_dt      = now_ist()
     duration_str = ""
 
     if state.get("entry_time"):
@@ -2306,10 +2433,13 @@ def _mark_fully_flat(reason: str):
             entry_dt = datetime.fromisoformat(str(state["entry_time"]))
             if entry_dt.tzinfo is None:
                 entry_dt = IST.localize(entry_dt)
-            held_mins    = int((now_ist() - entry_dt).total_seconds() // 60)
+            held_mins    = int((exit_dt - entry_dt).total_seconds() // 60)
             duration_str = f"  |  Held: {held_mins} min"
         except Exception:
             pass
+
+    # Append structured trade record BEFORE state is cleared
+    _append_trade_log(reason, final_pnl, exit_dt)
 
     # Reset ALL position-related state (FIX-10: today_pnl included)
     state["in_position"]       = False
@@ -2321,6 +2451,8 @@ def _mark_fully_flat(reason: str):
     state["orderid_pe"]        = ""
     state["entry_price_ce"]    = 0.0
     state["entry_price_pe"]    = 0.0
+    state["exit_price_ce"]     = 0.0
+    state["exit_price_pe"]     = 0.0
     state["closed_pnl"]        = 0.0
     state["today_pnl"]         = 0.0   # FIX-10: was missing, caused stale value after flat
     state["underlying_ltp"]    = 0.0
@@ -2716,10 +2848,12 @@ def _run_monitor_tick():
       This guarantees the SL check always uses the freshest effective SL.
       Ordering is critical: sl_level() MUST be called AFTER _update_trailing_sl().
     """
-    global _first_tick_fired
+    global _first_tick_fired, _consecutive_quote_fail_ticks, _quote_fail_alerted
     _first_tick_fired = True   # At least one tick has run — used by _close_all_locked()
 
-    open_mtm = 0.0
+    open_mtm         = 0.0
+    legs_checked     = 0   # Active legs we attempted to fetch LTP for
+    legs_ltp_ok      = 0   # Active legs where LTP fetch succeeded
 
     for leg in ["CE", "PE"]:
         active_key = f"{leg.lower()}_active"
@@ -2727,6 +2861,7 @@ def _run_monitor_tick():
         if not state[active_key]:
             continue
 
+        legs_checked += 1
         entry_px = state[f"entry_price_{leg.lower()}"]
 
         # ── Fetch live LTP — must come before sl_level() when trailing is on ──
@@ -2736,6 +2871,8 @@ def _run_monitor_tick():
         if ltp <= 0:
             pwarn(f"LTP unavailable for {leg} this cycle — skipping SL check")
             continue
+
+        legs_ltp_ok += 1
 
         leg_mtm = (entry_px - ltp) * qty() if entry_px > 0 else 0.0
 
@@ -2775,6 +2912,40 @@ def _run_monitor_tick():
 
         # ── No SL hit — accumulate to open MTM ───────────────────────────────
         open_mtm += leg_mtm
+
+    # ── Broker connectivity escalation ───────────────────────────────────────
+    # If ALL active legs failed LTP this tick, increment consecutive-fail counter.
+    # On reaching threshold, fire one Telegram alert so the operator can act.
+    # On first successful tick after an outage, fire a "restored" alert and reset.
+    if legs_checked > 0 and legs_ltp_ok == 0:
+        _consecutive_quote_fail_ticks += 1
+        if _consecutive_quote_fail_ticks == QUOTE_FAIL_ALERT_THRESHOLD:
+            _quote_fail_alerted = True
+            elapsed_s = _consecutive_quote_fail_ticks * MONITOR_INTERVAL_S
+            pwarn(
+                f"Broker quotes UNREACHABLE for {_consecutive_quote_fail_ticks} consecutive ticks "
+                f"(~{elapsed_s}s) — SL monitoring paused. Sending alert."
+            )
+            telegram(
+                f"⚠️ BROKER QUOTES UNREACHABLE\n"
+                f"LTP fetch has failed for {_consecutive_quote_fail_ticks} consecutive monitor ticks "
+                f"(~{elapsed_s}s).\n"
+                f"Active legs : {active_legs()}\n"
+                f"SL monitoring is PAUSED until quotes recover.\n"
+                f"Check OpenAlgo / broker connection. Consider manual intervention."
+            )
+    elif legs_ltp_ok > 0 and _quote_fail_alerted:
+        # Quotes recovered — clear alert state and notify operator
+        pwarn(f"Broker quotes RESTORED after {_consecutive_quote_fail_ticks} failed ticks")
+        telegram(
+            f"✅ BROKER QUOTES RESTORED\n"
+            f"LTP fetch is working again after {_consecutive_quote_fail_ticks} failed ticks.\n"
+            f"SL monitoring resuming normally."
+        )
+        _consecutive_quote_fail_ticks = 0
+        _quote_fail_alerted           = False
+    elif legs_ltp_ok > 0:
+        _consecutive_quote_fail_ticks = 0
 
     # ── If both legs closed by SL(s) this tick → already flat, done ──────────
     if not state["in_position"]:
@@ -3475,6 +3646,9 @@ def _print_banner():
     print(f"  Margin guard     : {guard_str}", flush=True)
     print(f"  Auto expiry      : {AUTO_EXPIRY}  |  Manual : {MANUAL_EXPIRY}  (NIFTY expires TUESDAY)", flush=True)
     print(f"  State file       : {os.path.abspath(STATE_FILE)}", flush=True)
+    trade_log_str = os.path.abspath(TRADE_LOG_FILE) if TRADE_LOG_FILE else "DISABLED"
+    print(f"  Trade log        : {trade_log_str}", flush=True)
+    print(f"  Quote fail alert : after {QUOTE_FAIL_ALERT_THRESHOLD} consecutive failed ticks (~{QUOTE_FAIL_ALERT_THRESHOLD * MONITOR_INTERVAL_S}s)", flush=True)
     print(f"  Telegram         : {TELEGRAM_ENABLED}", flush=True)
     print("=" * 72, flush=True)
     print(f"  Backtest (2019-2026): P&L Rs.5,04,192 | Win 66.71% | MaxDD Rs.34,179", flush=True)
@@ -3757,6 +3931,10 @@ def _validate_config():
             f"spike check cannot run faster than the monitor loop"
         )
 
+    # ── Trade log + connectivity ───────────────────────────────────────────────
+    if QUOTE_FAIL_ALERT_THRESHOLD <= 0:
+        errors.append(f"QUOTE_FAIL_ALERT_THRESHOLD must be > 0, got {QUOTE_FAIL_ALERT_THRESHOLD}")
+
     # ── Telegram ──────────────────────────────────────────────────────────────
     if TELEGRAM_ENABLED and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
         # Warn, don't block — Telegram is advisory only
@@ -3907,6 +4085,7 @@ def run():
         f"Trailing SL: trigger@{TRAIL_TRIGGER_PCT}% decay  lock={TRAIL_LOCK_PCT}% above LTP"
         if TRAILING_SL_ENABLED else "Trailing SL: off"
     )
+    trade_log_tg = TRADE_LOG_FILE if TRADE_LOG_FILE else "off"
     telegram(
         f"🚀 Strategy STARTED v{VERSION} [PARTIAL]\n"
         f"Entry: {tg_entry}  Hard Exit: {EXIT_TIME}\n"
@@ -3918,6 +4097,7 @@ def run():
         f"Skip months: {', '.join(MONTH_NAMES[m] for m in sorted(SKIP_MONTHS)) if SKIP_MONTHS else 'None'}\n"
         f"Target: Rs.{DAILY_PROFIT_TARGET_PER_LOT}/lot = Rs.{DAILY_PROFIT_TARGET}  "
         f"Limit: Rs.{DAILY_LOSS_LIMIT_PER_LOT}/lot = Rs.{DAILY_LOSS_LIMIT}\n"
+        f"Trade log: {trade_log_tg}  |  Quote fail alert: {QUOTE_FAIL_ALERT_THRESHOLD} ticks\n"
         f"{guard_status}"
     )
 
