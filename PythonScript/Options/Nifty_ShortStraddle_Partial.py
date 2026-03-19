@@ -3797,6 +3797,8 @@ def _validate_config():
     # ── Risk parameters ───────────────────────────────────────────────────────
     if LEG_SL_PERCENT < 0:
         errors.append(f"LEG_SL_PERCENT must be >= 0, got {LEG_SL_PERCENT}")
+    elif LEG_SL_PERCENT == 0:
+        pwarn("LEG_SL_PERCENT=0 — per-leg stop-loss DISABLED. Position runs unhedged until hard exit or daily limit.")
     if DAILY_PROFIT_TARGET_PER_LOT < 0:
         errors.append(f"DAILY_PROFIT_TARGET_PER_LOT must be >= 0 (use 0 to disable), got {DAILY_PROFIT_TARGET_PER_LOT}")
     if DAILY_LOSS_LIMIT_PER_LOT > 0:
