@@ -528,7 +528,13 @@ class OrderEngine:
 
         if other_active:
             # ── Partial exit — surviving leg continues ────────────────────────
-            # Activate breakeven SL if this leg closed at a net loss
+            # FIX-XXIV: Context-aware breakeven SL activation.
+            # After partial exit at a loss, check whether the surviving leg is
+            # currently WINNING (LTP < entry for short) or LOSING (LTP >= entry).
+            #
+            # • Winning survivor: skip breakeven SL — it would kill a profitable
+            #   leg.  Trailing SL / fixed SL / winner-leg booking handle protection.
+            # • Losing survivor:  activate breakeven SL to cap total day's loss.
             be_activated = False
             be_price     = 0.0
             if (
@@ -536,33 +542,58 @@ class OrderEngine:
                 and other_entry_px > 0
                 and state["closed_pnl"] < 0
             ):
-                # Mathematical breakeven price (net P&L = 0 when surviving leg exits here)
-                raw_be_price = round(other_entry_px + state["closed_pnl"] / qty(), 2)
-                # Apply buffer: raise the breakeven SL so it doesn't fire at the exact
-                # breakeven — give the surviving leg breathing room to profit.
-                be_price = round(raw_be_price * (1.0 + cfg.BREAKEVEN_BUFFER_PCT / 100.0), 2)
-                if 0 < be_price < other_entry_px:
-                    other_lower = other_leg.lower()
-                    state[f"breakeven_active_{other_lower}"]       = True
-                    state[f"breakeven_sl_{other_lower}"]           = be_price
-                    state[f"breakeven_activated_at_{other_lower}"] = now_ist().isoformat()
-                    be_activated = True
-                    if cfg.BREAKEVEN_GRACE_PERIOD_MIN > 0:
-                        from datetime import timedelta
-                        arm_time = now_ist() + timedelta(minutes=cfg.BREAKEVEN_GRACE_PERIOD_MIN)
-                        grace_str = (
-                            f"  Grace period : {cfg.BREAKEVEN_GRACE_PERIOD_MIN} min "
-                            f"(SL arms at ~{arm_time.strftime('%H:%M:%S')} IST)"
-                        )
-                    else:
-                        grace_str = "  Grace period : NONE (armed immediately)"
+                # Fetch surviving leg's current LTP to determine win/loss status
+                survivor_ltp = self._fetch_ltp(other_leg)
+                survivor_is_winner = (
+                    survivor_ltp > 0 and survivor_ltp < other_entry_px
+                )
+
+                if survivor_is_winner:
+                    # Surviving leg is profitable for short — breakeven SL would
+                    # kill the profit.  Let trailing / fixed / winner-booking manage it.
+                    survivor_mtm = round((other_entry_px - survivor_ltp) * qty(), 0)
                     info(
-                        f"  BREAKEVEN SL activated for {other_leg}: "
-                        f"Rs.{be_price:.2f}  "
-                        f"(raw breakeven Rs.{raw_be_price:.2f} + "
-                        f"{cfg.BREAKEVEN_BUFFER_PCT}% buffer)"
+                        f"  BREAKEVEN SL SKIPPED for {other_leg}: survivor is WINNING "
+                        f"(LTP Rs.{survivor_ltp:.2f} < entry Rs.{other_entry_px:.2f}, "
+                        f"unrealised +Rs.{survivor_mtm:.0f})"
                     )
-                    info(grace_str)
+                    info(
+                        f"  Protection: trailing SL / fixed-dynamic SL / "
+                        f"winner-leg booking will manage this leg"
+                    )
+                else:
+                    # Surviving leg is at/above entry — losing or flat.
+                    # Activate breakeven SL to cap the combined position's loss.
+                    raw_be_price = round(other_entry_px + state["closed_pnl"] / qty(), 2)
+                    be_price = round(raw_be_price * (1.0 + cfg.BREAKEVEN_BUFFER_PCT / 100.0), 2)
+                    if 0 < be_price < other_entry_px:
+                        other_lower = other_leg.lower()
+                        state[f"breakeven_active_{other_lower}"]       = True
+                        state[f"breakeven_sl_{other_lower}"]           = be_price
+                        state[f"breakeven_activated_at_{other_lower}"] = now_ist().isoformat()
+                        be_activated = True
+                        if cfg.BREAKEVEN_GRACE_PERIOD_MIN > 0:
+                            from datetime import timedelta
+                            arm_time = now_ist() + timedelta(minutes=cfg.BREAKEVEN_GRACE_PERIOD_MIN)
+                            grace_str = (
+                                f"  Grace period : {cfg.BREAKEVEN_GRACE_PERIOD_MIN} min "
+                                f"(SL arms at ~{arm_time.strftime('%H:%M:%S')} IST)"
+                            )
+                        else:
+                            grace_str = "  Grace period : NONE (armed immediately)"
+                        info(
+                            f"  BREAKEVEN SL activated for {other_leg}: "
+                            f"Rs.{be_price:.2f}  "
+                            f"(raw breakeven Rs.{raw_be_price:.2f} + "
+                            f"{cfg.BREAKEVEN_BUFFER_PCT}% buffer)"
+                        )
+                        info(grace_str)
+                    elif survivor_ltp > 0:
+                        info(
+                            f"  BREAKEVEN SL not viable for {other_leg}: "
+                            f"computed be_price Rs.{be_price:.2f} out of range "
+                            f"(entry Rs.{other_entry_px:.2f}, LTP Rs.{survivor_ltp:.2f})"
+                        )
 
             other_sl = sl_level(other_leg)
             state["in_position"] = True

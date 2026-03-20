@@ -1,7 +1,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 #  NIFTY SHORT STRADDLE — PARTIAL SQUARE OFF  |  Configuration File
 #  Strategy : Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS
-#  Version  : 6.1.0
+#  Version  : 6.2.0
 #
 #  Sections:
 #    1.  OpenAlgo Connection
@@ -563,6 +563,12 @@ decay_threshold_pct = 30.0   # Book surviving leg when LTP <= 30% of entry price
 #    Only activates when closed_pnl < 0 (net loss so far):
 #      If the first leg closed profitably (winner booking → closed_pnl > 0),
 #      breakeven is irrelevant — the position is already net positive.
+#
+#    FIX-XXIV: Context-aware activation — skips when survivor is WINNING.
+#      After partial exit at loss, if surviving leg LTP < entry (profitable
+#      for short), breakeven SL is SKIPPED. Trailing SL / fixed SL / winner
+#      booking manage the profitable survivor.  Breakeven only arms when the
+#      survivor is LOSING (LTP >= entry) — where it's genuinely needed.
 #
 #  Priority in sl_level():
 #    1. Trailing SL (if active)              — always highest priority
