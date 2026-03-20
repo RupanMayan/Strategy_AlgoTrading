@@ -207,10 +207,11 @@ class Config:
     SPOT_CHECK_INTERVAL_S:       int
 
     # ── Section 7H — Re-entry ────────────────────────────────────────────────
-    REENTRY_ENABLED:              bool
-    REENTRY_COOLDOWN_MIN:         int
-    REENTRY_MAX_LOSS_FOR_REENTRY: float    # absolute Rs. threshold
-    REENTRY_MAX_PER_DAY:          int
+    REENTRY_ENABLED:                  bool
+    REENTRY_COOLDOWN_MIN:             int
+    REENTRY_MAX_LOSS_PER_LOT:         float   # per-lot Rs. threshold
+    REENTRY_MAX_LOSS_FOR_REENTRY:     float   # derived: per_lot × number_of_lots
+    REENTRY_MAX_PER_DAY:              int
 
     # ── Section 8 — Expiry ───────────────────────────────────────────────────
     AUTO_EXPIRY:   bool
@@ -445,8 +446,8 @@ class Config:
         if self.REENTRY_ENABLED:
             if self.REENTRY_COOLDOWN_MIN <= 0:
                 errors.append("[risk.reentry] cooldown_min must be > 0")
-            if self.REENTRY_MAX_LOSS_FOR_REENTRY <= 0:
-                errors.append("[risk.reentry] max_loss_for_reentry must be > 0")
+            if self.REENTRY_MAX_LOSS_PER_LOT <= 0:
+                errors.append("[risk.reentry] max_loss_per_lot must be > 0")
             if self.REENTRY_MAX_PER_DAY <= 0:
                 errors.append("[risk.reentry] max_reentries_per_day must be > 0")
 
@@ -808,7 +809,8 @@ class Config:
             # Section 7H — Re-entry
             REENTRY_ENABLED              = bool(reen.get("enabled",               False)),
             REENTRY_COOLDOWN_MIN         = int(reen.get("cooldown_min",            30)),
-            REENTRY_MAX_LOSS_FOR_REENTRY = float(reen.get("max_loss_for_reentry", 2000)),
+            REENTRY_MAX_LOSS_PER_LOT     = float(reen.get("max_loss_per_lot",     2000)),
+            REENTRY_MAX_LOSS_FOR_REENTRY = float(reen.get("max_loss_per_lot", 2000)) * number_of_lots,  # derived
             REENTRY_MAX_PER_DAY          = int(reen.get("max_reentries_per_day",   1)),
 
             # Section 8 — Expiry

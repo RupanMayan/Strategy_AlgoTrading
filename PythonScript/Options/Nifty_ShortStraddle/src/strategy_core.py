@@ -228,10 +228,10 @@ class StrategyCore:
                 errors.append(
                     f"REENTRY_COOLDOWN_MIN must be > 0, got {cfg.REENTRY_COOLDOWN_MIN}"
                 )
-            if cfg.REENTRY_MAX_LOSS_FOR_REENTRY <= 0:
+            if cfg.REENTRY_MAX_LOSS_PER_LOT <= 0:
                 errors.append(
-                    f"REENTRY_MAX_LOSS_FOR_REENTRY must be > 0, "
-                    f"got {cfg.REENTRY_MAX_LOSS_FOR_REENTRY}"
+                    f"REENTRY_MAX_LOSS_PER_LOT must be > 0, "
+                    f"got {cfg.REENTRY_MAX_LOSS_PER_LOT}"
                 )
             if cfg.REENTRY_MAX_PER_DAY <= 0:
                 errors.append(
@@ -669,7 +669,8 @@ class StrategyCore:
         if cfg.REENTRY_ENABLED:
             print(
                 f"  Re-entry       : ENABLED  cooldown={cfg.REENTRY_COOLDOWN_MIN}min  "
-                f"max_loss=Rs.{cfg.REENTRY_MAX_LOSS_FOR_REENTRY:.0f}  "
+                f"max_loss=Rs.{cfg.REENTRY_MAX_LOSS_PER_LOT:.0f}/lot "
+                f"(Rs.{cfg.REENTRY_MAX_LOSS_FOR_REENTRY:.0f} total)  "
                 f"max/day={cfg.REENTRY_MAX_PER_DAY}",
                 flush=True,
             )
@@ -882,7 +883,8 @@ class StrategyCore:
             if last_trade_pnl < 0 and abs(last_trade_pnl) > cfg.REENTRY_MAX_LOSS_FOR_REENTRY:
                 info(
                     f"Re-entry blocked: previous loss Rs.{last_trade_pnl:.0f} "
-                    f"exceeds max Rs.{cfg.REENTRY_MAX_LOSS_FOR_REENTRY:.0f}"
+                    f"exceeds max Rs.{cfg.REENTRY_MAX_LOSS_FOR_REENTRY:.0f} "
+                    f"({cfg.REENTRY_MAX_LOSS_PER_LOT:.0f}/lot × {cfg.NUMBER_OF_LOTS})"
                 )
                 return
 

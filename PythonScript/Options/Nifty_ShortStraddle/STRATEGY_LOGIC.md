@@ -695,7 +695,7 @@ morning volatility, re-entering after stabilisation can recover the loss.
 [risk.reentry]
 enabled               = true
 cooldown_min          = 30      # Wait 30 min after close
-max_loss_for_reentry  = 2000    # Only re-enter if loss ≤ Rs.2000
+max_loss_per_lot      = 2000    # Per-lot Rs. threshold (effective = per_lot × number_of_lots)
 max_reentries_per_day = 1       # Maximum 1 re-entry per day
 ```
 
@@ -1439,7 +1439,7 @@ schedule = [
 |-----|---------|-------------|
 | `enabled` | `true` | Enable re-entry after early close |
 | `cooldown_min` | `30` | Minutes to wait after close |
-| `max_loss_for_reentry` | `2000` | Max loss (Rs.) to allow re-entry |
+| `max_loss_per_lot` | `2000` | Per-lot Rs. threshold (effective = per_lot × number_of_lots) |
 | `max_reentries_per_day` | `1` | Max re-entries per day |
 
 ---
