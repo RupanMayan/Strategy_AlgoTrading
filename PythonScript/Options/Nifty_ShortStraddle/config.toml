@@ -1,0 +1,720 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  NIFTY SHORT STRADDLE — PARTIAL SQUARE OFF  |  Configuration File
+#  Strategy : Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS
+#  Version  : 5.9.0
+#
+#  Sections:
+#    1.  OpenAlgo Connection
+#    2.  Instrument
+#    3.  Timing
+#    4.  DTE Filter
+#    5.  Month Filter
+#    6.  VIX Filter
+#    6A. IVR / IVP Filter
+#    6B. Opening Range Filter
+#    7.  Risk Management
+#    7A. Pre-Trade Margin Guard
+#    7B. Intraday VIX Spike Monitor
+#    7C. Trailing Stop-Loss
+#    7D. Dynamic SL Tightening
+#    7E. Combined Premium Decay Exit
+#    7F. Winner-Leg Early Booking
+#    7G. Breakeven SL + Spot-Move Exit
+#    8.  Expiry
+#    9.  Strategy Name
+#    10. Telegram Alerts
+#    11. State & Log Files
+#    12. Logger
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 0 — DIRECTORY LAYOUT
+#
+#  All output files are organised into subdirectories to keep the project root
+#  clean.  Paths are relative to the strategy directory (where main.py lives).
+#  Use absolute paths for systemd/crontab deployments.
+#
+#  logs_dir : strategy.log + rotated log files
+#  data_dir : strategy_state.json, trades.jsonl, vix_history.csv
+#
+#  Directories are auto-created at startup if they don't exist.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[directories]
+logs_dir = "logs"    # Log files — strategy.log, rotated archives
+data_dir = "data"    # Data files — state, trade log, VIX history
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 1 — OPENALGO CONNECTION
+# ──────────────────────────────────────────────────────────────────────────────
+
+[connection]
+host    = "http://127.0.0.1:5000"   # OpenAlgo server URL
+api_key = "4b0043f2ff0eb98694d1b9925b43bcc4254d1655f038a4f2b3d735c062d17fc5"    # Leave blank → loaded from env OPENALGO_APIKEY
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 2 — INSTRUMENT
+# ──────────────────────────────────────────────────────────────────────────────
+
+[instrument]
+underlying     = "NIFTY"       # NIFTY | BANKNIFTY | FINNIFTY
+exchange       = "NSE_INDEX"   # Always NSE_INDEX for index-based option orders
+lot_size       = 65            # NIFTY=65  BANKNIFTY=35  FINNIFTY=40
+number_of_lots = 1             # Lots per leg — start with 1 for paper trading
+product        = "MIS"         # MIS = intraday auto sq-off  |  NRML = carry forward
+strike_offset  = "ATM"         # ATM | OTM1..OTM5 | ITM1..ITM5
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 3 — TIMING  (IST 24-hour HH:MM)
+#
+#  use_dte_entry_map:
+#    true  → entry time is taken from dte_entry_time_map below (per DTE)
+#    false → fixed entry_time is used for all days
+#
+#  WHY DTE-AWARE ENTRY TIMES:
+#    Opening IV is 15–25% inflated vs fair value for the first 10–15 min.
+#    Entering at 09:17 captures max premium but also captures max opening
+#    volatility — 40% of all SL hits occur within 15 min of entry.
+#    Waiting for IV normalisation improves fill quality and reduces false SLs.
+#
+#    DTE0/DTE1 (Tue/Mon): enter at 09:30 — gap settled, still captures most
+#      of the day's theta on the highest-premium days.
+#    DTE2 (Fri): 09:35 — moderate theta, extra 5 min improves fill price.
+#    DTE3 (Thu): 09:40 — lower premium, margin-spike risk on open; cleaner
+#      entry outweighs the marginal extra premium from entering earlier.
+#    DTE4 (Wed): 09:45 — thin premium anyway; entering early adds risk with
+#      minimal reward.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[timing]
+entry_time         = "09:30"   # Fallback entry time when use_dte_entry_map = false
+exit_time          = "15:15"   # Hard square-off — closes ALL remaining open legs
+monitor_interval_s = 15        # Seconds between P&L / SL checks
+use_dte_entry_map  = true      # true = use map below | false = use entry_time for all
+
+[timing.dte_entry_time_map]  # DTE → entry time (used when use_dte_entry_map = true)
+"0" = "09:30"   # DTE0 = Tuesday   (expiry day)    — gap settled, max theta day
+"1" = "09:30"   # DTE1 = Monday    (1 day out)     — strong theta, same rationale
+"2" = "09:35"   # DTE2 = Friday    (2 days out)    — moderate theta, cleaner fill
+"3" = "09:40"   # DTE3 = Thursday  (3 days out)    — lower premium, avoid open spike
+"4" = "09:45"   # DTE4 = Wednesday (4 days out)    — thin premium, no rush
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 4 — DTE FILTER  (Days To Expiry)
+#
+#  DTE = TRADING days from today to nearest weekly expiry.
+#  Matches AlgoTest exactly — weekends are excluded.
+#  NSE market holidays are handled by the OpenAlgo Python Strategy scheduler;
+#  the script will not be started on a holiday, so no internal holiday check needed.
+#  Source: AlgoTest DTE filter documentation.
+#
+#  DTE mapping for NIFTY (Tuesday expiry):
+#    DTE0 = Tuesday   (expiry day)             — peak theta, max premium collapse
+#    DTE1 = Monday    (1 trading day before)   — strong theta
+#    DTE2 = Friday    (2 trading days before)  — moderate theta
+#    DTE3 = Thursday  (3 trading days before)  — lower premium
+#    DTE4 = Wednesday (4 trading days before)  — thin premium
+#    DTE5 = Tuesday   (5 trading days before)  — prev week expiry day
+#    DTE6 = Monday    (6 trading days before)  — prev week Monday
+#
+#  NOTE: DTE uses TRADING days only (Mon–Fri, excluding weekends).
+#        Calendar days give WRONG numbers — Fri would be DTE4 in calendar mode
+#        but is correctly DTE2 in trading-day mode (matching AlgoTest).
+#
+#  Common presets:
+#    [0, 1]             → peak theta days only (Tue + Mon)
+#    [0]                → expiry day only — most aggressive theta capture
+#    [0, 1, 2]          → Tue + Mon + Fri
+#    [0, 1, 2, 3, 4]    → full expiry week — all 5 trading days
+#    [0, 1, 2, 3, 4, 5, 6] → all days — previous + current expiry week
+# ──────────────────────────────────────────────────────────────────────────────
+
+[dte_filter]
+trade_dte = [0, 1, 2, 3, 4]   # Full expiry week (all 5 trading days)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 5 — MONTH FILTER
+#  1=Jan … 11=Nov … 12=Dec
+#  November is a consistent loss month across all backtest years.
+#  Common options:
+#    [11]    → skip November only
+#    [4, 11] → also skip April (weaker month)
+#    []      → trade all months
+# ──────────────────────────────────────────────────────────────────────────────
+
+[month_filter]
+skip_months = [11]   # Skip November
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 6 — VIX FILTER
+#  VIX < 14 : premiums too thin  |  VIX > 28 : danger zone
+#  Verified against AlgoTest backtest configuration.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[vix_filter]
+enabled = true
+vix_min = 14.0   # Skip if VIX below this — premiums too thin
+vix_max = 28.0   # Skip if VIX above this — danger zone
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 6A — IV RANK (IVR) / IV PERCENTILE (IVP) FILTER
+#
+#  WHY THIS FILTER EXISTS:
+#    A short straddle only has genuine statistical edge when IMPLIED VOLATILITY
+#    is historically expensive — because expensive IV mean-reverts downward,
+#    adding an IV-crush profit component on top of theta decay.
+#    Without this filter, entries on low-IVR days face an IV headwind: even
+#    if NIFTY stays flat, rising IV makes your short positions more expensive.
+#
+#  IV RANK (IVR):
+#    IVR = (Today_VIX − 52wk_Low_VIX) / (52wk_High_VIX − 52wk_Low_VIX) × 100
+#    Answers: "Where is today's IV within the past 52-week HIGH/LOW range?"
+#    IVR = 0  → VIX at 52-week low   |   IVR = 100 → VIX at 52-week high
+#
+#  IV PERCENTILE (IVP):
+#    IVP = (Days in past 252 where VIX < Today_VIX) / 252 × 100
+#    Answers: "What % of past 252 days had LOWER IV than today?"
+#    IVP = 75 → IV is higher than it was on 75% of trading days this year
+#
+#  BALANCED THRESHOLDS (recommended for NIFTY weekly straddle):
+#    ivr_min = 30 → skip if IV is in the bottom 30% of its 52-week range
+#    ivp_min = 40 → skip if IV is below 40th percentile of daily occurrences
+#    Expected: ~20–25% fewer trades, +5–8% win-rate improvement, −30% max-DD
+#
+#  DATA REQUIREMENT:
+#    Requires vix_history.csv — a CSV of daily VIX closing values.
+#    Format (with header):
+#        date,vix_close
+#        2024-04-01,14.82
+#        2024-04-02,15.10
+#        ...
+#    BOOTSTRAP: Download NIFTY VIX historical data from nseindia.com
+#      → Market Data → Volatility → Historical VIX → download CSV.
+#      Rename to vix_history.csv, keep only "Date" and "Close" columns,
+#      rename headers to "date,vix_close", save in the same directory as script.
+#    AUTO-UPDATE: job_update_vix_history() appends today's VIX every day at
+#      vix_update_time automatically — file is self-maintaining after bootstrap.
+#
+#  ivr_fail_open:
+#    false (recommended) → if history file is missing/short, SKIP trade.
+#      Rationale: unknown IV regime = unknown edge. Better to miss a trade than
+#      enter blindly. This is conservative and production-safe.
+#    true  → allow trade if data is unavailable (matches margin guard behaviour).
+#      Use only in paper-trade / testing mode.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[ivr_ivp_filter]
+ivr_filter_enabled   = true
+ivr_min              = 30.0    # Skip if IVR < 30  (IV in bottom 30% of 52wk range)
+ivp_filter_enabled   = true
+ivp_min              = 40.0    # Skip if IVP < 40% (IV below 40th percentile)
+ivr_fail_open        = false   # false = skip trade if history unavailable (production-safe fail-closed)
+vix_history_file     = "vix_history.csv"   # Path to daily VIX closing data file
+vix_history_min_rows = 100     # Minimum rows needed for a meaningful IVR/IVP calculation
+vix_update_time      = "15:30" # IST time to auto-append today's VIX to history file
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 6B — OPENING RANGE FILTER  (directional gap guard)
+#
+#  WHY THIS EXISTS:
+#    A short straddle profits from IV crush and theta decay, not from direction.
+#    On days where NIFTY gaps sharply at open (budget, RBI policy, global cues),
+#    one leg is immediately deep ITM and the position starts underwater.
+#    The IVR/VIX filters screen historical regime; this filter screens the
+#    INTRADAY opening impulse — complementary, not redundant.
+#
+#    Data: ~35–40% of straddle losses on DTE0/DTE1 follow mornings where NIFTY
+#    moved > 0.5% in the first 15 minutes. Skipping those days eliminates a
+#    disproportionate share of drawdown with minimal win-rate sacrifice.
+#
+#  HOW IT WORKS:
+#    1. job_orb_capture() fires at capture_time (default 09:17 IST).
+#       It fetches the live NIFTY spot and stores it as state["orb_price"].
+#       09:17 is 2 minutes after open — enough for the first quote stabilisation.
+#    2. orb_filter_ok() is called inside job_entry() just before the trade.
+#       It fetches NIFTY spot again and computes:
+#         move_pct = |entry_spot − orb_price| / orb_price × 100
+#       If move_pct > max_move_pct → trade is skipped for the day.
+#
+#  FAIL-OPEN BEHAVIOUR:
+#    If ORB capture or the entry-time spot fetch fails, the filter is bypassed
+#    (fail-open). Safe for production — a missing ORB check is advisory, unlike
+#    a missing margin check which could blow the account.
+#
+#  max_move_pct guidance (NIFTY weekly straddle):
+#    0.30% → aggressive — catches even moderate gaps (more skips, +win-rate)
+#    0.50% → balanced   — catches meaningful directional opens (recommended)
+#    0.75% → relaxed    — only catches large gaps; few skips
+# ──────────────────────────────────────────────────────────────────────────────
+
+[orb_filter]
+enabled       = true
+capture_time  = "09:17"   # Capture NIFTY reference price 2 min after open
+max_move_pct  = 0.5       # Skip trade if NIFTY moved > 0.5% from ORB price
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7 — RISK MANAGEMENT
+#
+#  leg_sl_percent — applied to EACH LEG INDEPENDENTLY:
+#    CE SL = CE_entry_price × (1 + leg_sl_percent/100)  → close CE only
+#    PE SL = PE_entry_price × (1 + leg_sl_percent/100)  → close PE only
+#    99.6% accuracy verified from AlgoTest CSV (2311 SL hits, median = 20.00%)
+#
+#  daily_profit_target_per_lot / daily_loss_limit_per_lot — per lot values:
+#    Effective Rs. threshold = per_lot value × number_of_lots (auto-scaled in code)
+#    combined = closed_leg_pnl + open_leg(s)_mtm
+#    Trips → close ALL remaining open legs immediately
+#    Example: per_lot target=5000, lots=2 → effective target = Rs.10,000
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk]
+leg_sl_percent              = 20.0   # % of entry premium per leg  (0 = disabled)
+daily_profit_target_per_lot =  5000  # Rs. profit target PER LOT   (0 = disabled)
+daily_loss_limit_per_lot    = -4000  # Rs. loss limit PER LOT — NEGATIVE  (0 = disabled)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7A — PRE-TRADE MARGIN GUARD
+#
+#  Before placing the straddle, the script:
+#    1. Calls client.funds()  → fetches availablecash + collateral
+#    2. Calls client.margin() → fetches basket margin for CE+PE SELL MIS
+#       (includes SPAN straddle portfolio offset — cheaper than two naked shorts)
+#    3. Checks: (availablecash + collateral) >= required_margin × margin_buffer
+#
+#  margin_buffer = 1.20 → requires 20% headroom above margin
+#    Rationale: SPAN margins can spike intraday on VIX moves.
+#    Also compensates for Dhan's sequential (not basket) margin calculation.
+#
+#  fail_open = true  → if margin API fails, allow trade (don't block)
+#    Set to false to be conservative: skip trade if margin API is unreachable.
+#
+#  strike_rounding: NIFTY=50, BANKNIFTY=100, FINNIFTY=50
+#    Used to build the symbol string for the margin pre-check call.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.margin_guard]
+enabled         = true
+margin_buffer   = 1.20   # 20% safety headroom over required margin
+fail_open       = true   # true = allow trade if margin API fails
+strike_rounding = 50     # NIFTY=50, BANKNIFTY=100, FINNIFTY=50
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7B — INTRADAY VIX SPIKE MONITOR
+#
+#  WHY THIS EXISTS:
+#    The short straddle is short vega — a rising VIX directly increases the
+#    value of both legs even if NIFTY price stays flat. When VIX spikes
+#    mid-session (surprise macro event, global sell-off, circuit trigger),
+#    being short vega is the most dangerous place to be.
+#    This monitor catches mid-session IV expansion and exits BEFORE the
+#    combined loss exceeds what the VIX filter would have blocked at entry.
+#
+#  HOW IT WORKS:
+#    vix_at_entry is captured during the entry filter (stored in state).
+#    Every check_interval_s seconds the monitor fetches live VIX.
+#    If current_VIX > vix_at_entry × (1 + threshold_pct / 100):
+#      → close_all() fires immediately with reason "VIX Spike Exit"
+#      → Telegram alert sent
+#
+#  threshold_pct guidance (NIFTY-specific):
+#    10% → very sensitive — catches even moderate IV expansion (more exits)
+#    15% → balanced       — catches significant intraday spikes (recommended)
+#    20% → relaxed        — only exits on severe events (fewer exits, more risk)
+#
+#  abs_floor: prevents false exits at low absolute VIX levels.
+#    FIX-V (v5.5.0): relative-only threshold is misleading at low VIX —
+#    e.g. 14→16.1 = 15% spike but VIX 16 is normal and NOT dangerous.
+#    Exit fires only when BOTH conditions are true:
+#      spike_pct  >= threshold_pct  (15% relative rise)
+#      current_vix >= abs_floor     (18 absolute floor)
+#    At VIX_MIN=14: spike fires at 16.1 → blocked by floor ✓
+#    At VIX=20:     spike fires at 23.0 → allowed (genuinely dangerous) ✓
+#
+#  check_interval_s: throttle — runs at most once per interval regardless of
+#    how often the monitor tick fires. 300s (5 min) avoids API overload.
+#    Reduce to 180s (3 min) on high-volatility days if desired.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.vix_spike_monitor]
+enabled          = true
+threshold_pct    = 15.0   # % rise from entry VIX triggers exit
+check_interval_s = 300    # Seconds between VIX spike checks (5 min)
+abs_floor        = 18.0   # Minimum absolute VIX required to confirm a spike exit
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7C — TRAILING STOP-LOSS / PROFIT LOCK-IN
+#
+#  WHY THIS EXISTS:
+#    The fixed leg_sl_percent creates a permanent ceiling on losses but the
+#    floor on profits NEVER lifts. If a leg is sold at Rs.100 and decays to
+#    Rs.30 (Rs.70/unit profit), the SL is still Rs.120. A sudden reversal from
+#    Rs.30 to Rs.120 would erase the Rs.70 profit AND add a Rs.20 loss — a
+#    Rs.90/unit swing. Trailing SL prevents this by locking in increasing
+#    minimum profit as the option price decays.
+#
+#  HOW IT WORKS (per leg — independently):
+#
+#    Phase 1 — TRIGGER (one-time per leg per trade):
+#      When LTP falls to trigger_pct% of entry price, trailing activates.
+#      Example: entry Rs.100, trigger_pct=50 → triggers when LTP = Rs.50.
+#      At activation: initial trailing SL = LTP × (1 + lock_pct/100).
+#      Safety cap: initial trailing SL is capped at the fixed SL level to
+#        prevent misconfigured lock_pct from setting a worse SL than fixed.
+#
+#    Phase 2 — TRAIL (every monitor tick once active):
+#      new_trail_sl = LTP × (1 + lock_pct/100)
+#      SL only MOVES DOWN — updates only when new value < current trailing SL.
+#      This locks in more profit as LTP continues to fall.
+#
+#    Example walk-through (entry Rs.100, trigger=50%, lock=30%):
+#      LTP Rs.50 → trail activates. SL = Rs.50 × 1.30 = Rs.65   (locks Rs.35/unit)
+#      LTP Rs.35 → SL updated.      SL = Rs.35 × 1.30 = Rs.45.50 (locks Rs.54.50/unit)
+#      LTP Rs.20 → SL updated.      SL = Rs.20 × 1.30 = Rs.26    (locks Rs.74/unit)
+#      LTP Rs.10 → SL updated.      SL = Rs.10 × 1.30 = Rs.13    (locks Rs.87/unit)
+#      LTP bounces from Rs.10 → Rs.13 → SL HIT → exit at Rs.13, profit = Rs.87/unit ✓
+#
+#  STATE PERSISTENCE:
+#    trailing_active_ce/pe and trailing_sl_ce/pe are part of the JSON state.
+#    On script restart mid-trade (crash/restart): the exact trailing state is
+#    fully restored from disk — trailing resumes exactly where it left off.
+#    No reset to the fixed SL on restart — this is the correct behaviour.
+#
+#  trigger_pct guidance (NIFTY weekly straddle):
+#    40 → early trail  — activates when 60% profit captured (aggressive)
+#    50 → balanced     — activates when 50% profit captured (recommended)
+#    60 → conservative — activates when 40% profit captured (fewer activations)
+#
+#  lock_pct guidance:
+#    20 → tight  — more exits on small bounces, locks more profit
+#    30 → balanced — good buffer for normal intraday bounces (recommended)
+#    40 → loose  — fewer exits, wider room, less profit locked per step
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.trailing_sl]
+enabled     = true
+trigger_pct = 50.0   # Activate when LTP falls to this % of entry price
+lock_pct    = 30.0   # Trailing SL = current_LTP × (1 + lock_pct/100)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7D — DYNAMIC SL TIGHTENING  (time-of-day graduated SL)
+#
+#  WHY THIS EXISTS:
+#    The fixed 20% SL is calibrated for the morning session when full-day risk
+#    justifies a wide stop. By afternoon, theta has already captured most of the
+#    premium and holding a 20% SL exposes hard-earned profits to a late gamma
+#    surprise. Tightening the SL progressively through the day locks in more
+#    profit as the position matures.
+#
+#    Most effective on DTE0/DTE1 (expiry day and Monday) where intraday theta
+#    acceleration is steepest and late-session reversals are most damaging.
+#
+#  HOW IT WORKS:
+#    When enabled, _dynamic_sl_percent() replaces the flat leg_sl_percent in
+#    the FIXED-SL calculation path of sl_level().
+#    The trailing SL (when active) always takes precedence — this setting only
+#    affects legs that have NOT yet triggered trailing.
+#
+#    schedule is a list of (time, sl_pct) entries evaluated in descending time
+#    order. The FIRST entry whose time <= now() wins.
+#    Before the earliest threshold, leg_sl_percent (default 20%) is used.
+#
+#  Schedule guidance (NIFTY intraday):
+#    After 14:30 → 7%  : Last 45 min; premium largely decayed, protect gains
+#    After 13:30 → 10% : Afternoon session; reduce exposure
+#    After 12:00 → 15% : Mid-session; moderate tightening
+#    Before 12:00 → leg_sl_percent (20%) : Morning; full width needed
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.dynamic_sl]
+enabled = true
+
+# Must be in DESCENDING time order (latest time first). First match wins.
+schedule = [
+    { time = "14:30", sl_pct = 7.0  },   # After 2:30 PM → very tight (last 45 min, max theta harvested)
+    { time = "13:30", sl_pct = 10.0 },   # After 1:30 PM → medium-tight
+    { time = "12:00", sl_pct = 15.0 },   # After 12:00 PM → slightly tighter than morning
+]
+# Before 12:00 → falls back to risk.leg_sl_percent (20%)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7E — COMBINED PREMIUM DECAY EXIT
+#
+#  WHY THIS EXISTS:
+#    When BOTH legs are still active and have collectively decayed by a large
+#    percentage, continuing to hold exposes the position to afternoon gamma risk
+#    for diminishing remaining theta. Locking in profits at a combined decay
+#    target removes event risk in the final session hours.
+#
+#    Most useful on DTE2/DTE3 (Thu/Fri) where 60% combined decay often occurs
+#    by 11:30–12:00 AM — well before the 15:15 hard exit. On DTE0/DTE1 (peak
+#    theta days) the remaining premium is valuable enough to hold longer.
+#
+#  HOW IT WORKS:
+#    combined_entry = CE_entry_price + PE_entry_price
+#    combined_ltp   = CE_ltp + PE_ltp  (fetched fresh each monitor tick)
+#    decay_pct      = (1 − combined_ltp / combined_entry) × 100
+#    If decay_pct >= decay_target_pct → close_all() fires.
+#
+#  NOTE: Fires only when BOTH CE and PE legs are still active.
+#        Single-leg survivors are managed by trailing SL or winner booking.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.combined_decay_exit]
+enabled          = true
+decay_target_pct = 60.0   # Exit when combined premium has decayed by 60%
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7F — WINNER-LEG EARLY BOOKING
+#
+#  WHY THIS EXISTS:
+#    After one leg hits SL (e.g. CE closes on upside move), the surviving PE is
+#    often deeply profitable — having decayed to 20–30% of its entry price.
+#    Holding this leg to 15:15 exposes a large unrealised gain to gamma risk:
+#    a market reversal can push PE from Rs.15 back to Rs.60+ rapidly.
+#    Booking early at high decay locks the profit and removes residual exposure.
+#
+#  HOW IT WORKS:
+#    Every monitor tick, when exactly ONE leg is active, a fresh LTP is fetched
+#    for the surviving leg. If its LTP is <= decay_threshold_pct% of its entry
+#    price, close_one_leg() fires immediately.
+#    Example: PE entry Rs.100, threshold 30% → book when LTP <= Rs.30 (70%+ decay)
+#
+#  decay_threshold_pct guidance:
+#    20% → aggressive   — books when 80%+ of premium captured (higher profit lock,
+#           misses final 20% decay if market stays quiet)
+#    30% → balanced     — books at 70%+ decay; protects against common reversals
+#           (recommended)
+#    40% → conservative — books at 60%+ decay; allows more premium capture but
+#           exposes larger unrealised gain to reversal risk
+#
+#  SAFETY: Winner booking uses a FRESH LTP fetch — never acts on stale LTP from
+#    the per-leg SL check. If the LTP fetch fails, booking is skipped and
+#    normal monitoring continues safely.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.winner_leg_booking]
+enabled             = true
+decay_threshold_pct = 30.0   # Book surviving leg when LTP <= 30% of entry price
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7G — BREAKEVEN SL AFTER PARTIAL EXIT
+#
+#  WHY THIS EXISTS:
+#    When one leg hits its SL (e.g. CE closes at Rs.120 vs entry Rs.100, a
+#    Rs.20/unit loss), the surviving PE is still open at, say, Rs.50. The
+#    default fixed PE SL of Rs.120 (20% above PE entry Rs.100) remains — so
+#    the position could still lose Rs.20/unit on PE as well, creating a
+#    combined loss of Rs.40/unit × qty.
+#    Breakeven SL protection prevents this: the surviving leg's SL is tightened
+#    to the exact price where the total position (both legs combined) breaks even.
+#
+#  HOW IT WORKS:
+#    Immediately after a partial exit (close_one_leg()):
+#      closed_pnl = realised P&L from the closed leg (negative if SL hit)
+#      be_sl = other_entry_px + closed_pnl / qty()
+#
+#    Example: CE entry Rs.100, CE closed at Rs.120 → closed_pnl = -Rs.1300 (65 qty)
+#      PE entry Rs.100 → be_sl = 100 + (-1300/65) = 100 - 20 = Rs.80
+#      PE SL now Rs.80 instead of Rs.120 — max additional loss = Rs.0 net.
+#
+#    Only activates when closed_pnl < 0 (net loss so far):
+#      If the first leg closed profitably (winner booking → closed_pnl > 0),
+#      breakeven is irrelevant — the position is already net positive.
+#
+#  Priority in sl_level():
+#    1. Trailing SL (if active)              — always highest priority
+#    2. Breakeven SL (if active AND tighter) — protects combined position
+#    3. Fixed/dynamic SL                     — default
+#
+#  STATE PERSISTENCE:
+#    breakeven_active_ce/pe and breakeven_sl_ce/pe are part of the JSON state.
+#    On restart mid-trade: breakeven resumes exactly where it left off.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.breakeven_sl]
+enabled = true   # Tighten surviving leg SL to combined breakeven after partial exit
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SPOT-MOVE EXIT  (part of Section 7G)
+#
+#  WHY THIS EXISTS:
+#    Tracks NIFTY spot at entry time (state["underlying_ltp"]). Each monitor
+#    tick (throttled), if NIFTY has moved beyond the straddle's theoretical
+#    breakeven from entry spot, close_all() fires — the position has directional
+#    risk beyond what the SL design accounts for.
+#
+#  HOW IT WORKS:
+#    combined_premium = CE_entry_price + PE_entry_price  (per unit)
+#    move_threshold   = combined_premium × spot_multiplier
+#    if |current_NIFTY − spot_at_entry| >= move_threshold → close_all()
+#
+#  spot_multiplier guidance:
+#    0.8 → exit slightly BEFORE theoretical breakeven (conservative — fewer
+#           losses but may exit some recoverable situations)
+#    1.0 → exit exactly AT theoretical breakeven (balanced, recommended)
+#    1.2 → exit slightly AFTER — allows some breathing room past breakeven
+#           (if individual SLs not yet hit; closer to daily loss limit role)
+#
+#  check_interval_s: throttle frequency. 60s means one NIFTY LTP fetch per
+#    minute — negligible API load while catching intraday trends.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.spot_move_exit]
+enabled          = true
+spot_multiplier  = 1.0   # Exit when NIFTY moves >= 1.0× combined premium from entry spot
+check_interval_s = 60    # Throttle: fetch NIFTY spot at most once per 60s
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 8 — EXPIRY
+#  Format : DDMMMYY uppercase  e.g. "25MAR26"
+#  auto_expiry = true → resolves the nearest Tuesday automatically every day.
+#  manual_expiry is used only when auto_expiry = false (must be a Tuesday).
+# ──────────────────────────────────────────────────────────────────────────────
+
+[expiry]
+auto_expiry   = true          # true = auto nearest Tuesday (NIFTY weekly expiry day)
+manual_expiry = "25MAR26"     # Used only when auto_expiry = false  (must be a Tuesday)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 9 — STRATEGY NAME
+#  Must match exactly what is registered in the OpenAlgo dashboard.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[strategy]
+name = "Short Straddle"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 10 — TELEGRAM ALERTS
+#  bot_token from @BotFather  |  chat_id from @userinfobot
+#  Leave blank → loaded from env vars TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+# ──────────────────────────────────────────────────────────────────────────────
+
+[telegram]
+enabled   = true
+bot_token = "8744018927:AAF3-Mx6DRvINDYRlLawQ94H8vhhC9MqxJc"   # Leave blank → loaded from env TELEGRAM_BOT_TOKEN
+chat_id   = "724474340"   # Leave blank → loaded from env TELEGRAM_CHAT_ID
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 11 — STATE & LOG FILES
+#
+#  state_file: JSON persisted atomically after every state mutation.
+#    Use absolute path when running as a systemd service or crontab.
+#    e.g. "/home/ubuntu/strategy/strategy_state.json"
+#
+#  trade_log_file: One JSON object per line — appended on every position close.
+#    Enables post-session analysis without digging through logs.
+#    Set to "" to disable trade logging.
+#
+#  quote_fail_alert_threshold: consecutive monitor ticks where ALL active legs
+#    fail LTP fetch before a Telegram alert is sent (broker quotes unreachable).
+#    At monitor_interval_s=15s, threshold=3 means alert fires after ~45s of blackout.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[files]
+state_file                 = "strategy_state.json"
+trade_log_file             = "trades.jsonl"
+quote_fail_alert_threshold = 3   # Ticks before quote-fail Telegram alert fires
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 12 — LOGGER
+#
+#  WHY THIS EXISTS:
+#    The current script uses plog() which prints directly to stdout with no
+#    level filtering, no file output, and no rotation. In production (systemd
+#    service, crontab, VPS), stdout is either lost or fills disk unbounded.
+#    A proper logger adds:
+#      • Level filtering  — suppress DEBUG noise in production
+#      • File output      — persist logs across terminal sessions
+#      • Daily rotation   — one log file per trading day, auto-cleanup
+#      • Size guard       — prevents runaway log files from filling disk
+#
+#  log_level:
+#    Controls the minimum severity that is printed/written.
+#    Levels in order of severity (lowest → highest):
+#      DEBUG    → every monitor tick detail, SL calculations, LTP fetches
+#                 Use only for troubleshooting — very verbose (thousands of lines/day)
+#      INFO     → normal operation: entry, exit, filter decisions, reconcile
+#                 Recommended for production — captures all meaningful events
+#      WARNING  → non-fatal issues: state save failed, API retried, fallback used
+#      ERROR    → failures that affect trade execution: order rejected, LTP missing
+#      CRITICAL → system-level failures: scheduler crash, unrecoverable error
+#
+#  log_to_console:
+#    true  → logger also prints to stdout (matches current plog() behaviour)
+#             Useful during development or when running interactively
+#    false → silent console; only writes to file (recommended for systemd/crontab)
+#
+#  log_to_file:
+#    true  → logger writes to log_file in addition to (or instead of) console
+#    false → console only (current behaviour — no change needed for dev/testing)
+#
+#  log_file:
+#    Path to the log file. Can be relative (same dir as script) or absolute.
+#    Use absolute path for systemd service or crontab.
+#    e.g. "/home/ubuntu/strategy/strategy.log"
+#    When log_rotation = "daily", the logger auto-appends YYYY-MM-DD suffix
+#    to rolled-over files: strategy.log.2026-03-20
+#
+#  log_rotation:
+#    "daily"  → rotate at midnight; one file per trading day (recommended)
+#               Rolled files: strategy.log.2026-03-19, strategy.log.2026-03-18, …
+#               Pairs well with backup_count = 30 to keep 1 month of history.
+#    "size"   → rotate when file exceeds log_max_bytes
+#               Rolled files: strategy.log.1, strategy.log.2, …
+#               Useful when the script runs continuously without daily restart.
+#    "none"   → no rotation; single file grows indefinitely (not recommended
+#               for production — only for short paper-trade sessions)
+#
+#  log_max_mb:
+#    Maximum file size in MB before rotation when log_rotation = "size".
+#    Ignored when log_rotation = "daily" or "none".
+#    10 MB — a full trading day at INFO level is ~1–2 MB.
+#    At DEBUG level, allow 50–100 MB.
+#
+#  log_backup_count:
+#    Number of rotated log files to keep before the oldest is deleted.
+#    log_rotation = "daily" : backup_count = 30 keeps 30 days of history
+#    log_rotation = "size"  : backup_count = 5  keeps 5 rolled size-files
+#    Older files are deleted automatically by the rotating handler.
+#
+#  log_format:
+#    Python logging format string. Tokens:
+#      %(asctime)s   → timestamp (configured to IST via logging.Formatter)
+#      %(levelname)s → DEBUG / INFO / WARNING / ERROR / CRITICAL
+#      %(message)s   → the log message
+#    Default mirrors the existing plog() output style exactly so existing
+#    log parsers / grep patterns continue to work without changes.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[logging]
+log_level       = "INFO"          # DEBUG | INFO | WARNING | ERROR | CRITICAL
+log_to_console  = true            # true = also print to stdout (current plog behaviour)
+log_to_file     = true            # true = write logs to log_file
+log_file        = "strategy.log"  # Log file path — use absolute path for systemd/crontab
+log_rotation    = "daily"         # "daily" | "size" | "none"
+log_max_mb      = 10              # Max file size in MB — used only when log_rotation = "size"
+log_backup_count = 30             # Files to keep: 30 days (daily) or 5 rolled files (size)
+log_format      = "%(asctime)s [%(levelname)-8s] %(message)s"  # Mirrors existing plog() style
