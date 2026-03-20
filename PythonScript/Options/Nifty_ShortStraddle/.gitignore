@@ -1,0 +1,6 @@
+# Python cache
+__pycache__/
+
+# Strategy runtime data
+data/
+logs/

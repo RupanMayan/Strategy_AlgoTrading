@@ -121,12 +121,12 @@ class Monitor:
         # ── Throttle ──────────────────────────────────────────────────────────
         now = now_ist()
         if (
-            _shared._last_vix_spike_check_time is not None
-            and (now - _shared._last_vix_spike_check_time).total_seconds()
+            _shared._monitor_state.last_vix_spike_check_time is not None
+            and (now - _shared._monitor_state.last_vix_spike_check_time).total_seconds()
                 < cfg.VIX_SPIKE_CHECK_INTERVAL_S
         ):
             return
-        _shared._last_vix_spike_check_time = now
+        _shared._monitor_state.last_vix_spike_check_time = now
 
         # ── Fetch live VIX ────────────────────────────────────────────────────
         current_vix = self._vm.fetch_vix()
@@ -231,11 +231,11 @@ class Monitor:
         # ── Throttle ──────────────────────────────────────────────────────────
         now = now_ist()
         if (
-            _shared._last_spot_check_time is not None
-            and (now - _shared._last_spot_check_time).total_seconds() < cfg.SPOT_CHECK_INTERVAL_S
+            _shared._monitor_state.last_spot_check_time is not None
+            and (now - _shared._monitor_state.last_spot_check_time).total_seconds() < cfg.SPOT_CHECK_INTERVAL_S
         ):
             return
-        _shared._last_spot_check_time = now
+        _shared._monitor_state.last_spot_check_time = now
 
         current_spot = self._fetch_spot_ltp()
         if current_spot <= 0:
@@ -300,7 +300,7 @@ class Monitor:
           close_one_leg() — the other leg keeps running.
           combined_pnl = closed_pnl (realised) + open_mtm (unrealised).
         """
-        _shared._first_tick_fired = True  # Used by _close_all_locked() no-tick heuristic
+        _shared._monitor_state.first_tick_fired = True  # Used by _close_all_locked() no-tick heuristic
 
         open_mtm     = 0.0
         legs_checked = 0   # Active legs we attempted to fetch LTP for
@@ -387,33 +387,33 @@ class Monitor:
 
         # ── Broker connectivity escalation ────────────────────────────────────
         if legs_checked > 0 and legs_ltp_ok == 0:
-            _shared._consecutive_quote_fail_ticks += 1
-            if _shared._consecutive_quote_fail_ticks == cfg.QUOTE_FAIL_ALERT_THRESHOLD:
-                _shared._quote_fail_alerted = True
-                elapsed_s = _shared._consecutive_quote_fail_ticks * cfg.MONITOR_INTERVAL_S
+            _shared._monitor_state.consecutive_quote_fail_ticks += 1
+            if _shared._monitor_state.consecutive_quote_fail_ticks == cfg.QUOTE_FAIL_ALERT_THRESHOLD:
+                _shared._monitor_state.quote_fail_alerted = True
+                elapsed_s = _shared._monitor_state.consecutive_quote_fail_ticks * cfg.MONITOR_INTERVAL_S
                 warn(
-                    f"Broker quotes UNREACHABLE for {_shared._consecutive_quote_fail_ticks} consecutive ticks "
+                    f"Broker quotes UNREACHABLE for {_shared._monitor_state.consecutive_quote_fail_ticks} consecutive ticks "
                     f"(~{elapsed_s}s) — SL monitoring paused. Sending alert."
                 )
                 telegram(
                     f"⚠️ BROKER QUOTES UNREACHABLE\n"
-                    f"LTP fetch has failed for {_shared._consecutive_quote_fail_ticks} consecutive monitor ticks "
+                    f"LTP fetch has failed for {_shared._monitor_state.consecutive_quote_fail_ticks} consecutive monitor ticks "
                     f"(~{elapsed_s}s).\n"
                     f"Active legs : {active_legs()}\n"
                     f"SL monitoring is PAUSED until quotes recover.\n"
                     f"Check OpenAlgo / broker connection. Consider manual intervention."
                 )
-        elif legs_ltp_ok > 0 and _shared._quote_fail_alerted:
-            warn(f"Broker quotes RESTORED after {_shared._consecutive_quote_fail_ticks} failed ticks")
+        elif legs_ltp_ok > 0 and _shared._monitor_state.quote_fail_alerted:
+            warn(f"Broker quotes RESTORED after {_shared._monitor_state.consecutive_quote_fail_ticks} failed ticks")
             telegram(
                 f"✅ BROKER QUOTES RESTORED\n"
-                f"LTP fetch is working again after {_shared._consecutive_quote_fail_ticks} failed ticks.\n"
+                f"LTP fetch is working again after {_shared._monitor_state.consecutive_quote_fail_ticks} failed ticks.\n"
                 f"SL monitoring resuming normally."
             )
-            _shared._consecutive_quote_fail_ticks = 0
-            _shared._quote_fail_alerted           = False
+            _shared._monitor_state.consecutive_quote_fail_ticks = 0
+            _shared._monitor_state.quote_fail_alerted           = False
         elif legs_ltp_ok > 0:
-            _shared._consecutive_quote_fail_ticks = 0
+            _shared._monitor_state.consecutive_quote_fail_ticks = 0
 
         # ── If both legs closed by SL(s) this tick → already flat ────────────
         if not state["in_position"]:
@@ -540,32 +540,32 @@ class Monitor:
         been paused.  Resets the counter on the first tick that runs normally.
         """
         if not state["in_position"]:
-            _shared._consecutive_monitor_skips = 0
+            _shared._monitor_state.consecutive_monitor_skips = 0
             return
 
         acquired = _monitor_lock.acquire(blocking=False)
         if not acquired:
-            _shared._consecutive_monitor_skips += 1
+            _shared._monitor_state.consecutive_monitor_skips += 1
             warn(
                 f"Monitor tick skipped — previous tick still running "
-                f"(lock contention, skip #{_shared._consecutive_monitor_skips})"
+                f"(lock contention, skip #{_shared._monitor_state.consecutive_monitor_skips})"
             )
-            if _shared._consecutive_monitor_skips == 3:
-                elapsed_s = _shared._consecutive_monitor_skips * cfg.MONITOR_INTERVAL_S
+            if _shared._monitor_state.consecutive_monitor_skips == 3:
+                elapsed_s = _shared._monitor_state.consecutive_monitor_skips * cfg.MONITOR_INTERVAL_S
                 error(
-                    f"Monitor BLOCKED for {_shared._consecutive_monitor_skips} consecutive ticks "
+                    f"Monitor BLOCKED for {_shared._monitor_state.consecutive_monitor_skips} consecutive ticks "
                     f"(~{elapsed_s}s) — SL protection is paused!"
                 )
                 telegram(
                     f"🚨 MONITOR BLOCKED\n"
                     f"Previous monitor tick has been running for ~{elapsed_s}s.\n"
-                    f"SL checks are PAUSED — {_shared._consecutive_monitor_skips} ticks skipped.\n"
+                    f"SL checks are PAUSED — {_shared._monitor_state.consecutive_monitor_skips} ticks skipped.\n"
                     f"Active legs: {active_legs()}\n"
                     f"Check logs immediately. Consider manual monitoring."
                 )
             return
 
-        _shared._consecutive_monitor_skips = 0  # Successful lock — reset skip counter
+        _shared._monitor_state.consecutive_monitor_skips = 0  # Successful lock — reset skip counter
         try:
             self.run_tick()
         finally:

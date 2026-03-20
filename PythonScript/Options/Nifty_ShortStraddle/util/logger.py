@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from util.config_util import Config
 
 __all__ = [
+    "StrategyLogger",
     "setup_logging",
     "get_logger",
     "info",
@@ -88,16 +89,12 @@ _IST = pytz.timezone("Asia/Kolkata")
 # third-party libraries (openalgo, apscheduler, requests) that also log.
 _ROOT_LOGGER_NAME = "nss"
 
-# ── Module state ──────────────────────────────────────────────────────────────
-_is_configured: bool = False
-_root_log: logging.Logger = logging.getLogger(_ROOT_LOGGER_NAME)
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  IST-aware log formatter
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class _ISTFormatter(logging.Formatter):
+class ISTFormatter(logging.Formatter):
     """
     Custom formatter that renders %(asctime)s in IST (Asia/Kolkata, UTC+05:30)
     regardless of the server's system timezone.
@@ -123,213 +120,211 @@ class _ISTFormatter(logging.Formatter):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  setup_logging() — one-time configuration from a Config object
+#  StrategyLogger — encapsulates all logging configuration and convenience API
 # ═══════════════════════════════════════════════════════════════════════════════
+
+class StrategyLogger:
+    """
+    Manages the strategy logging pipeline: configuration, handlers, and
+    convenience methods for the "nss" logger hierarchy.
+
+    Typical usage is through the module-level singleton (_logger_instance) which
+    auto-configures on import. The module-level functions (info, warn, error,
+    debug, sep, get_logger, setup_logging) delegate to this singleton.
+    """
+
+    def __init__(self) -> None:
+        self._is_configured: bool = False
+        self._root_log: logging.Logger = logging.getLogger(_ROOT_LOGGER_NAME)
+
+    @property
+    def is_configured(self) -> bool:
+        return self._is_configured
+
+    def setup(self, cfg: "Config") -> None:
+        """
+        Configure the strategy logger from a validated Config object.
+
+        Reads the following fields from cfg (Section 12 of config.toml):
+            LOG_LEVEL        — "DEBUG" | "INFO" | "WARNING" | "ERROR" | "CRITICAL"
+            LOG_TO_CONSOLE   — True/False — emit to stdout
+            LOG_TO_FILE      — True/False — write to file
+            LOG_FILE         — path to the log file (relative paths resolve from CWD)
+            LOG_ROTATION     — "daily" | "size" | "none"
+            LOG_MAX_BYTES    — max file size in bytes before rotation (size mode only)
+            LOG_BACKUP_COUNT — number of old log files to keep
+            LOG_FORMAT       — Python logging format string
+
+        This method is idempotent — calling it again clears all existing handlers
+        and reconfigures from scratch. This prevents duplicate handler accumulation
+        when called multiple times (e.g., in unit tests or when reloading config).
+
+        Parameters
+        ----------
+        cfg : Config
+            Validated Config object from util.config_util.load_config().
+
+        Raises
+        ------
+        OSError
+            If the log file parent directory cannot be created or the file cannot
+            be opened for writing.
+        """
+        logger = logging.getLogger(_ROOT_LOGGER_NAME)
+
+        # Clear existing handlers — required for idempotent re-configuration.
+        # Close each handler first to flush buffers and release file descriptors.
+        for _handler in logger.handlers[:]:
+            _handler.close()
+        logger.handlers.clear()
+
+        # Do not propagate to the Python root logger ("") to avoid duplicate output
+        # from any basicConfig() calls made by third-party libraries.
+        logger.propagate = False
+
+        level = getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO)
+        logger.setLevel(level)
+
+        formatter = ISTFormatter(fmt=cfg.LOG_FORMAT)
+
+        # ── Console handler ───────────────────────────────────────────────────
+        if cfg.LOG_TO_CONSOLE:
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(level)
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
+
+        # ── File handler ──────────────────────────────────────────────────────
+        if cfg.LOG_TO_FILE:
+            log_path = Path(cfg.LOG_FILE)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+            rotation = cfg.LOG_ROTATION.lower()
+
+            if rotation == "daily":
+                file_handler: logging.Handler = TimedRotatingFileHandler(
+                    filename    = log_path,
+                    when        = "midnight",
+                    interval    = 1,
+                    backupCount = cfg.LOG_BACKUP_COUNT,
+                    encoding    = "utf-8",
+                    utc         = False,
+                )
+            elif rotation == "size":
+                file_handler = RotatingFileHandler(
+                    filename    = log_path,
+                    maxBytes    = cfg.LOG_MAX_BYTES,
+                    backupCount = cfg.LOG_BACKUP_COUNT,
+                    encoding    = "utf-8",
+                )
+            else:
+                # rotation == "none" — append forever, no rotation.
+                file_handler = logging.FileHandler(
+                    filename = log_path,
+                    mode     = "a",
+                    encoding = "utf-8",
+                )
+
+            file_handler.setLevel(level)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+
+        self._root_log = logger
+        self._is_configured = True
+
+    def get_logger(self, name: str) -> logging.Logger:
+        """
+        Return a named child logger under the strategy root ("nss").
+
+        All child loggers inherit handlers and level from the root logger configured
+        by setup(). There is no need to add handlers to child loggers.
+
+        Parameters
+        ----------
+        name : str
+            Typically __name__ from the calling module.
+            Automatically prefixed with "nss." if not already.
+
+        Returns
+        -------
+        logging.Logger
+        """
+        if not name.startswith(_ROOT_LOGGER_NAME):
+            name = f"{_ROOT_LOGGER_NAME}.{name}"
+        return logging.getLogger(name)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  Convenience methods — drop-in replacements for plog() family
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def info(self, msg: str) -> None:
+        """Log at INFO level — drop-in replacement for pinfo()."""
+        self._root_log.info(msg)
+
+    def warn(self, msg: str) -> None:
+        """Log at WARNING level — drop-in replacement for pwarn()."""
+        self._root_log.warning(msg)
+
+    def error(self, msg: str) -> None:
+        """Log at ERROR level — drop-in replacement for perr()."""
+        self._root_log.error(msg)
+
+    def debug(self, msg: str) -> None:
+        """Log at DEBUG level — drop-in replacement for pdebug()."""
+        self._root_log.debug(msg)
+
+    def sep(self) -> None:
+        """
+        Log a visual separator line at INFO level — drop-in replacement for psep().
+        WHY 68 dashes: matches the original psep() which used '─' * 68.
+        """
+        self._root_log.info("─" * 68)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Module-level singleton + backward-compatible function API
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_logger_instance = StrategyLogger()
+
 
 def setup_logging(cfg: "Config") -> None:
-    """
-    Configure the strategy logger from a validated Config object.
+    """Backward-compatible wrapper — delegates to the singleton."""
+    _logger_instance.setup(cfg)
 
-    Reads the following fields from cfg (Section 12 of config.toml):
-        LOG_LEVEL        — "DEBUG" | "INFO" | "WARNING" | "ERROR" | "CRITICAL"
-        LOG_TO_CONSOLE   — True/False — emit to stdout
-        LOG_TO_FILE      — True/False — write to file
-        LOG_FILE         — path to the log file (relative paths resolve from CWD)
-        LOG_ROTATION     — "daily" | "size" | "none"
-        LOG_MAX_BYTES    — max file size in bytes before rotation (size mode only)
-        LOG_BACKUP_COUNT — number of old log files to keep
-        LOG_FORMAT       — Python logging format string
-
-    This function is idempotent — calling it again clears all existing handlers
-    and reconfigures from scratch. This prevents duplicate handler accumulation
-    when setup_logging() is called multiple times (e.g., in unit tests or when
-    reloading config at runtime).
-
-    Parameters
-    ----------
-    cfg : Config
-        Validated Config object from util.config_util.load_config().
-
-    Raises
-    ------
-    OSError
-        If the log file parent directory cannot be created or the file cannot
-        be opened for writing.
-    """
-    global _is_configured, _root_log
-
-    logger = logging.getLogger(_ROOT_LOGGER_NAME)
-
-    # Clear existing handlers — required for idempotent re-configuration.
-    # Without this, each call to setup_logging() would add duplicate handlers.
-    # Close each handler first to flush buffers and release file descriptors
-    # before clearing; skipping close() can leave OS file handles open and
-    # lose buffered log lines that haven't been flushed yet.
-    for _handler in logger.handlers[:]:
-        _handler.close()
-    logger.handlers.clear()
-
-    # Do not propagate to the Python root logger ("") to avoid duplicate output
-    # from any basicConfig() calls made by third-party libraries.
-    logger.propagate = False
-
-    level = getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO)
-    logger.setLevel(level)
-
-    formatter = _ISTFormatter(fmt=cfg.LOG_FORMAT)
-
-    # ── Console handler ───────────────────────────────────────────────────────
-    # Writes to stdout (not stderr) so shell redirection works cleanly:
-    #   python main.py 2>&1 | tee output.log
-    if cfg.LOG_TO_CONSOLE:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(level)
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-
-    # ── File handler ──────────────────────────────────────────────────────────
-    if cfg.LOG_TO_FILE:
-        log_path = Path(cfg.LOG_FILE)
-        # Ensure parent directory exists; config_util validates it, but the
-        # directory may have been created after validation (e.g., by the user
-        # running mkdir just before launch), so we use exist_ok=True.
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        rotation = cfg.LOG_ROTATION.lower()
-
-        if rotation == "daily":
-            # Rotate at midnight local system time; LOG_BACKUP_COUNT old files kept.
-            # WHY when="midnight" and not when="D":
-            #   "midnight" rolls over at 00:00 local time (closest to IST midnight
-            #   on local machines; on UTC servers it fires at 00:00 UTC = 05:30 IST).
-            #   For exact IST midnight rotation on a UTC server, set TZ=Asia/Kolkata.
-            file_handler: logging.Handler = TimedRotatingFileHandler(
-                filename    = log_path,
-                when        = "midnight",
-                interval    = 1,
-                backupCount = cfg.LOG_BACKUP_COUNT,
-                encoding    = "utf-8",
-                utc         = False,    # use local system clock for rollover trigger
-            )
-        elif rotation == "size":
-            # Rotate when file reaches LOG_MAX_BYTES (converted from log_max_mb).
-            # LOG_BACKUP_COUNT old files kept alongside the current file.
-            file_handler = RotatingFileHandler(
-                filename    = log_path,
-                maxBytes    = cfg.LOG_MAX_BYTES,
-                backupCount = cfg.LOG_BACKUP_COUNT,
-                encoding    = "utf-8",
-            )
-        else:
-            # rotation == "none" — append forever, no rotation.
-            # Suitable for short-lived runs or when an external log manager
-            # (e.g., logrotate, systemd-journald) handles rotation.
-            file_handler = logging.FileHandler(
-                filename = log_path,
-                mode     = "a",
-                encoding = "utf-8",
-            )
-
-        file_handler.setLevel(level)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
-    _root_log = logger
-    _is_configured = True
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  get_logger() — named child loggers for per-module context
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def get_logger(name: str) -> logging.Logger:
-    """
-    Return a named child logger under the strategy root ("nss").
+    """Backward-compatible wrapper — delegates to the singleton."""
+    return _logger_instance.get_logger(name)
 
-    All child loggers inherit handlers and level from the root logger configured
-    by setup_logging(). There is no need to add handlers to child loggers — just
-    call get_logger() and use the returned logger directly.
-
-    Parameters
-    ----------
-    name : str
-        Typically __name__ from the calling module.
-        The name is automatically prefixed with "nss." if it does not already
-        start with it, so the full logger name is always "nss.<name>".
-
-    Returns
-    -------
-    logging.Logger
-
-    Example
-    -------
-        # In strategy_core.py:
-        from util.logger import get_logger
-        log = get_logger(__name__)     # → "nss.strategy_core"
-        log.info("Entry placed: CE %s PE %s", ce_sym, pe_sym)
-        log.warning("VIX %.1f above threshold %.1f", vix, cfg.VIX_MAX)
-    """
-    if not name.startswith(_ROOT_LOGGER_NAME):
-        name = f"{_ROOT_LOGGER_NAME}.{name}"
-    return logging.getLogger(name)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Module-level convenience functions
-#
-#  These are direct drop-in replacements for the original plog() family:
-#    pinfo(msg)  → info(msg)
-#    pwarn(msg)  → warn(msg)
-#    perr(msg)   → error(msg)
-#    pdebug(msg) → debug(msg)
-#    psep()      → sep()
-#
-#  They all write to the root "nss" logger so that output appears on both
-#  console and file handlers configured by setup_logging().
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def info(msg: str) -> None:
     """Log at INFO level — drop-in replacement for pinfo()."""
-    _root_log.info(msg)
+    _logger_instance.info(msg)
 
 
 def warn(msg: str) -> None:
     """Log at WARNING level — drop-in replacement for pwarn()."""
-    _root_log.warning(msg)
+    _logger_instance.warn(msg)
 
 
 def error(msg: str) -> None:
     """Log at ERROR level — drop-in replacement for perr()."""
-    _root_log.error(msg)
+    _logger_instance.error(msg)
 
 
 def debug(msg: str) -> None:
     """Log at DEBUG level — drop-in replacement for pdebug()."""
-    _root_log.debug(msg)
+    _logger_instance.debug(msg)
 
 
 def sep() -> None:
-    """
-    Log a visual separator line at INFO level — drop-in replacement for psep().
-
-    Output example:
-        2026-03-20 09:30:00 IST [INFO    ] ────────────────────────────────────────────────────────────────────
-
-    WHY 68 dashes: matches the original psep() which used '─' * 68 to fill a
-    typical 80-column terminal width after the log prefix.
-    """
-    _root_log.info("─" * 68)
+    """Log a visual separator line at INFO level — drop-in replacement for psep()."""
+    _logger_instance.sep()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Auto-configure from the module-level config singleton on import
-#
-#  This runs once when the module is first imported. If config.toml exists and
-#  is valid, logging is immediately ready — no explicit setup_logging() call
-#  needed in main.py or strategy_core.py.
-#
-#  If config.toml is not found: a warning is printed to stderr and logging is
-#  deferred. Call setup_logging(cfg) explicitly after load_config().
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _auto_setup() -> None:
@@ -338,12 +333,9 @@ def _auto_setup() -> None:
     Called automatically at module import time.
     """
     try:
-        # Import inside the function to avoid a circular import at module level.
-        # util.config_util also imports nothing from util.logger, so there is
-        # no actual circular dependency — just a load-order sensitivity.
         from util.config_util import cfg  # noqa: PLC0415
         if cfg is not None:
-            setup_logging(cfg)
+            _logger_instance.setup(cfg)
     except Exception as exc:
         print(
             f"[logger] WARNING: auto-setup failed — {exc}\n"

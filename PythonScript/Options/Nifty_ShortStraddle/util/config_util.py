@@ -21,6 +21,10 @@ Usage:
     from util.config_util import load_config
     cfg = load_config("/path/to/config.toml")
 
+    # Option C — use the classmethod factory directly:
+    from util.config_util import Config
+    cfg = Config.from_toml("/path/to/config.toml")
+
 Environment variable overrides (take precedence over config.toml values):
     OPENALGO_APIKEY      → connection.api_key
     TELEGRAM_BOT_TOKEN   → telegram.bot_token
@@ -203,554 +207,554 @@ class Config:
     LOG_BACKUP_COUNT: int
     LOG_FORMAT:       str
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  Static helpers (used by validation)
+    # ═══════════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Internal helpers
-# ═══════════════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def _to_minutes(hhmm: str) -> int:
+        """Convert HH:MM string to total minutes since midnight. No validation."""
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
 
-def _to_minutes(hhmm: str) -> int:
-    """Convert HH:MM string to total minutes since midnight. No validation."""
-    h, m = hhmm.split(":")
-    return int(h) * 60 + int(m)
+    @staticmethod
+    def _validate_hhmm(field_name: str, value: str, errors: list[str]) -> bool:
+        """
+        Validate a HH:MM time string. Appends an error if invalid.
+        Returns True if valid so callers can safely call _to_minutes() after.
+        """
+        try:
+            h, m = value.split(":")
+            assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+            return True
+        except Exception:
+            errors.append(f"{field_name} must be HH:MM (24-hour), got '{value}'")
+            return False
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  _validate() — instance method (called after construction)
+    # ═══════════════════════════════════════════════════════════════════════════
 
-def _validate_hhmm(field_name: str, value: str, errors: list[str]) -> bool:
-    """
-    Validate a HH:MM time string. Appends an error if invalid.
-    Returns True if valid so callers can safely call _to_minutes() after.
-    """
-    try:
-        h, m = value.split(":")
-        assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
-        return True
-    except Exception:
-        errors.append(f"{field_name} must be HH:MM (24-hour), got '{value}'")
-        return False
+    def _validate(self) -> None:
+        """
+        Validate all Config fields.
+        Collects ALL errors and raises a single ValueError so the operator sees
+        every problem at once rather than fixing one error at a time.
+        """
+        errors: list[str] = []
 
-
-def _validate(cfg: Config) -> None:
-    """
-    Validate all Config fields.
-    Collects ALL errors and raises a single ValueError so the operator sees
-    every problem at once rather than fixing one error at a time.
-    """
-    errors: list[str] = []
-
-    # ── Section 1 — Connection ────────────────────────────────────────────────
-    if not cfg.OPENALGO_HOST:
-        errors.append("[connection] host is required")
-    if not cfg.OPENALGO_API_KEY:
-        errors.append(
-            "[connection] api_key is required — set it in config.toml "
-            "or export OPENALGO_APIKEY in the environment"
-        )
-
-    # ── Section 2 — Instrument ────────────────────────────────────────────────
-    if cfg.LOT_SIZE <= 0:
-        errors.append("[instrument] lot_size must be > 0")
-    if cfg.NUMBER_OF_LOTS <= 0:
-        errors.append("[instrument] number_of_lots must be > 0")
-    if cfg.PRODUCT not in _VALID_PRODUCTS:
-        errors.append(f"[instrument] product must be 'MIS' or 'NRML', got '{cfg.PRODUCT}'")
-    if not cfg.UNDERLYING:
-        errors.append("[instrument] underlying cannot be empty")
-
-    # ── Section 3 — Timing ───────────────────────────────────────────────────
-    entry_ok = _validate_hhmm("[timing] entry_time", cfg.ENTRY_TIME, errors)
-    exit_ok  = _validate_hhmm("[timing] exit_time",  cfg.EXIT_TIME,  errors)
-    # Cross-check: entry must be before exit
-    if entry_ok and exit_ok:
-        if _to_minutes(cfg.ENTRY_TIME) >= _to_minutes(cfg.EXIT_TIME):
+        # ── Section 1 — Connection ────────────────────────────────────────────
+        if not self.OPENALGO_HOST:
+            errors.append("[connection] host is required")
+        if not self.OPENALGO_API_KEY:
             errors.append(
-                f"[timing] entry_time ({cfg.ENTRY_TIME}) must be "
-                f"before exit_time ({cfg.EXIT_TIME})"
+                "[connection] api_key is required — set it in config.toml "
+                "or export OPENALGO_APIKEY in the environment"
             )
-    if cfg.MONITOR_INTERVAL_S <= 0:
-        errors.append("[timing] monitor_interval_s must be > 0")
-    if cfg.MONITOR_INTERVAL_S > 60:
-        errors.append(
-            f"[timing] monitor_interval_s = {cfg.MONITOR_INTERVAL_S}s is dangerously high "
-            "— SL checks fire at most once per interval; recommended max is 60s"
-        )
-    for dte_key, dte_time in cfg.DTE_ENTRY_TIME_MAP.items():
-        t_ok = _validate_hhmm(f"[timing.dte_entry_time_map] key {dte_key}", dte_time, errors)
-        # Each DTE entry time must also be before exit_time
-        if t_ok and exit_ok:
-            if _to_minutes(dte_time) >= _to_minutes(cfg.EXIT_TIME):
+
+        # ── Section 2 — Instrument ────────────────────────────────────────────
+        if self.LOT_SIZE <= 0:
+            errors.append("[instrument] lot_size must be > 0")
+        if self.NUMBER_OF_LOTS <= 0:
+            errors.append("[instrument] number_of_lots must be > 0")
+        if self.PRODUCT not in _VALID_PRODUCTS:
+            errors.append(f"[instrument] product must be 'MIS' or 'NRML', got '{self.PRODUCT}'")
+        if not self.UNDERLYING:
+            errors.append("[instrument] underlying cannot be empty")
+
+        # ── Section 3 — Timing ───────────────────────────────────────────────
+        entry_ok = self._validate_hhmm("[timing] entry_time", self.ENTRY_TIME, errors)
+        exit_ok  = self._validate_hhmm("[timing] exit_time",  self.EXIT_TIME,  errors)
+        # Cross-check: entry must be before exit
+        if entry_ok and exit_ok:
+            if self._to_minutes(self.ENTRY_TIME) >= self._to_minutes(self.EXIT_TIME):
                 errors.append(
-                    f"[timing.dte_entry_time_map] key {dte_key}: "
-                    f"entry time {dte_time} must be before exit_time {cfg.EXIT_TIME}"
+                    f"[timing] entry_time ({self.ENTRY_TIME}) must be "
+                    f"before exit_time ({self.EXIT_TIME})"
+                )
+        if self.MONITOR_INTERVAL_S <= 0:
+            errors.append("[timing] monitor_interval_s must be > 0")
+        if self.MONITOR_INTERVAL_S > 60:
+            errors.append(
+                f"[timing] monitor_interval_s = {self.MONITOR_INTERVAL_S}s is dangerously high "
+                "— SL checks fire at most once per interval; recommended max is 60s"
+            )
+        for dte_key, dte_time in self.DTE_ENTRY_TIME_MAP.items():
+            t_ok = self._validate_hhmm(f"[timing.dte_entry_time_map] key {dte_key}", dte_time, errors)
+            # Each DTE entry time must also be before exit_time
+            if t_ok and exit_ok:
+                if self._to_minutes(dte_time) >= self._to_minutes(self.EXIT_TIME):
+                    errors.append(
+                        f"[timing.dte_entry_time_map] key {dte_key}: "
+                        f"entry time {dte_time} must be before exit_time {self.EXIT_TIME}"
+                    )
+
+        # ── Section 4 — DTE Filter ────────────────────────────────────────────
+        if not self.TRADE_DTE:
+            errors.append("[dte_filter] trade_dte cannot be empty — at least one DTE required")
+        if any(d < 0 for d in self.TRADE_DTE):
+            errors.append("[dte_filter] trade_dte values must be >= 0")
+
+        # ── Section 5 — Month Filter ──────────────────────────────────────────
+        if any(m < 1 or m > 12 for m in self.SKIP_MONTHS):
+            errors.append("[month_filter] skip_months values must be 1–12")
+
+        # ── Section 6 — VIX Filter ───────────────────────────────────────────
+        if self.VIX_MIN < 0:
+            errors.append("[vix_filter] vix_min must be >= 0")
+        if self.VIX_MIN >= self.VIX_MAX:
+            errors.append("[vix_filter] vix_min must be strictly less than vix_max")
+
+        # ── Section 6A — IVR / IVP ───────────────────────────────────────────
+        if not (0 <= self.IVR_MIN <= 100):
+            errors.append("[ivr_ivp_filter] ivr_min must be 0–100")
+        if not (0 <= self.IVP_MIN <= 100):
+            errors.append("[ivr_ivp_filter] ivp_min must be 0–100")
+        if self.VIX_HISTORY_MIN_ROWS <= 0:
+            errors.append("[ivr_ivp_filter] vix_history_min_rows must be > 0")
+        self._validate_hhmm("[ivr_ivp_filter] vix_update_time", self.VIX_UPDATE_TIME, errors)
+
+        # ── Section 6B — ORB ─────────────────────────────────────────────────
+        self._validate_hhmm("[orb_filter] capture_time", self.ORB_CAPTURE_TIME, errors)
+        if self.ORB_MAX_MOVE_PCT <= 0:
+            errors.append("[orb_filter] max_move_pct must be > 0")
+
+        # ── Section 7 — Risk ─────────────────────────────────────────────────
+        if self.LEG_SL_PERCENT < 0:
+            errors.append("[risk] leg_sl_percent must be >= 0  (0 = disabled)")
+        if self.DAILY_PROFIT_TARGET_PER_LOT < 0:
+            errors.append("[risk] daily_profit_target_per_lot must be >= 0  (0 = disabled)")
+        if self.DAILY_LOSS_LIMIT_PER_LOT > 0:
+            errors.append(
+                "[risk] daily_loss_limit_per_lot must be <= 0 — "
+                "use a negative value e.g. -4000  (0 = disabled)"
+            )
+
+        # ── Section 7A — Margin Guard ─────────────────────────────────────────
+        if self.MARGIN_BUFFER < 1.0:
+            errors.append("[risk.margin_guard] margin_buffer must be >= 1.0  (1.20 = 20% headroom)")
+        if self.ATM_STRIKE_ROUNDING <= 0:
+            errors.append("[risk.margin_guard] strike_rounding must be > 0")
+
+        # ── Section 7B — VIX Spike Monitor ───────────────────────────────────
+        if self.VIX_SPIKE_THRESHOLD_PCT <= 0:
+            errors.append("[risk.vix_spike_monitor] threshold_pct must be > 0")
+        if self.VIX_SPIKE_CHECK_INTERVAL_S <= 0:
+            errors.append("[risk.vix_spike_monitor] check_interval_s must be > 0")
+        if self.VIX_SPIKE_ABS_FLOOR < 0:
+            errors.append("[risk.vix_spike_monitor] abs_floor must be >= 0")
+        if self.VIX_SPIKE_ABS_FLOOR < self.VIX_MIN:
+            errors.append(
+                f"[risk.vix_spike_monitor] abs_floor ({self.VIX_SPIKE_ABS_FLOOR}) is below "
+                f"vix_filter.vix_min ({self.VIX_MIN}) — the floor will never activate because "
+                "VIX below vix_min would have blocked entry; raise abs_floor to >= vix_min"
+            )
+        if self.VIX_SPIKE_MONITOR_ENABLED and not self.VIX_FILTER_ENABLED:
+            errors.append(
+                "[risk.vix_spike_monitor] enabled but [vix_filter] enabled = false — "
+                "the spike monitor relies on the VIX filter to establish a safe entry VIX "
+                "baseline; without it, entries at very low VIX make abs_floor and threshold "
+                "unreliable; either enable vix_filter or disable vix_spike_monitor"
+            )
+
+        # ── Section 7C — Trailing SL ──────────────────────────────────────────
+        if not (0 < self.TRAIL_TRIGGER_PCT < 100):
+            errors.append("[risk.trailing_sl] trigger_pct must be between 0 and 100 (exclusive)")
+        if self.TRAIL_LOCK_PCT <= 0:
+            errors.append("[risk.trailing_sl] lock_pct must be > 0")
+
+        # ── Section 7D — Dynamic SL ───────────────────────────────────────────
+        for i, (t, pct) in enumerate(self.DYNAMIC_SL_SCHEDULE):
+            self._validate_hhmm(f"[risk.dynamic_sl] schedule[{i}].time", t, errors)
+            if pct <= 0:
+                errors.append(f"[risk.dynamic_sl] schedule[{i}].sl_pct must be > 0")
+            if pct > self.LEG_SL_PERCENT and self.LEG_SL_PERCENT > 0:
+                errors.append(
+                    f"[risk.dynamic_sl] schedule[{i}].sl_pct ({pct}%) is larger than "
+                    f"risk.leg_sl_percent ({self.LEG_SL_PERCENT}%) — dynamic schedule "
+                    "entries must be tighter (smaller) than the base SL"
+                )
+        # Verify entries are in descending time order (required for first-match logic)
+        times = [entry[0] for entry in self.DYNAMIC_SL_SCHEDULE]
+        if times != sorted(times, reverse=True):
+            errors.append(
+                "[risk.dynamic_sl] schedule must be in DESCENDING time order "
+                "(latest time first) — e.g. 14:30, 13:30, 12:00"
+            )
+
+        # ── Section 7E — Combined Decay Exit ─────────────────────────────────
+        if not (0 < self.COMBINED_DECAY_TARGET_PCT < 100):
+            errors.append("[risk.combined_decay_exit] decay_target_pct must be 0–100 (exclusive)")
+
+        # ── Section 7F — Winner Leg Booking ──────────────────────────────────
+        if not (0 < self.WINNER_LEG_DECAY_THRESHOLD_PCT < 100):
+            errors.append("[risk.winner_leg_booking] decay_threshold_pct must be 0–100 (exclusive)")
+
+        # ── Section 7G — Spot-Move Exit ───────────────────────────────────────
+        if self.BREAKEVEN_SPOT_MULTIPLIER <= 0:
+            errors.append("[risk.spot_move_exit] spot_multiplier must be > 0")
+        if self.SPOT_CHECK_INTERVAL_S <= 0:
+            errors.append("[risk.spot_move_exit] check_interval_s must be > 0")
+
+        # ── Section 8 — Expiry ───────────────────────────────────────────────
+        if not self.AUTO_EXPIRY:
+            if not self.MANUAL_EXPIRY:
+                errors.append(
+                    "[expiry] manual_expiry is required when auto_expiry = false "
+                    "(format: DDMMMYY uppercase e.g. '25MAR26')"
+                )
+            elif not _EXPIRY_RE.match(self.MANUAL_EXPIRY):
+                errors.append(
+                    f"[expiry] manual_expiry '{self.MANUAL_EXPIRY}' has wrong format — "
+                    "must be DDMMMYY uppercase e.g. '25MAR26', '01JAN27'"
                 )
 
-    # ── Section 4 — DTE Filter ────────────────────────────────────────────────
-    if not cfg.TRADE_DTE:
-        errors.append("[dte_filter] trade_dte cannot be empty — at least one DTE required")
-    if any(d < 0 for d in cfg.TRADE_DTE):
-        errors.append("[dte_filter] trade_dte values must be >= 0")
-
-    # ── Section 5 — Month Filter ──────────────────────────────────────────────
-    if any(m < 1 or m > 12 for m in cfg.SKIP_MONTHS):
-        errors.append("[month_filter] skip_months values must be 1–12")
-
-    # ── Section 6 — VIX Filter ───────────────────────────────────────────────
-    if cfg.VIX_MIN < 0:
-        errors.append("[vix_filter] vix_min must be >= 0")
-    if cfg.VIX_MIN >= cfg.VIX_MAX:
-        errors.append("[vix_filter] vix_min must be strictly less than vix_max")
-
-    # ── Section 6A — IVR / IVP ───────────────────────────────────────────────
-    if not (0 <= cfg.IVR_MIN <= 100):
-        errors.append("[ivr_ivp_filter] ivr_min must be 0–100")
-    if not (0 <= cfg.IVP_MIN <= 100):
-        errors.append("[ivr_ivp_filter] ivp_min must be 0–100")
-    if cfg.VIX_HISTORY_MIN_ROWS <= 0:
-        errors.append("[ivr_ivp_filter] vix_history_min_rows must be > 0")
-    _validate_hhmm("[ivr_ivp_filter] vix_update_time", cfg.VIX_UPDATE_TIME, errors)
-
-    # ── Section 6B — ORB ─────────────────────────────────────────────────────
-    _validate_hhmm("[orb_filter] capture_time", cfg.ORB_CAPTURE_TIME, errors)
-    if cfg.ORB_MAX_MOVE_PCT <= 0:
-        errors.append("[orb_filter] max_move_pct must be > 0")
-
-    # ── Section 7 — Risk ─────────────────────────────────────────────────────
-    if cfg.LEG_SL_PERCENT < 0:
-        errors.append("[risk] leg_sl_percent must be >= 0  (0 = disabled)")
-    if cfg.DAILY_PROFIT_TARGET_PER_LOT < 0:
-        errors.append("[risk] daily_profit_target_per_lot must be >= 0  (0 = disabled)")
-    if cfg.DAILY_LOSS_LIMIT_PER_LOT > 0:
-        errors.append(
-            "[risk] daily_loss_limit_per_lot must be <= 0 — "
-            "use a negative value e.g. -4000  (0 = disabled)"
-        )
-
-    # ── Section 7A — Margin Guard ─────────────────────────────────────────────
-    if cfg.MARGIN_BUFFER < 1.0:
-        errors.append("[risk.margin_guard] margin_buffer must be >= 1.0  (1.20 = 20% headroom)")
-    if cfg.ATM_STRIKE_ROUNDING <= 0:
-        errors.append("[risk.margin_guard] strike_rounding must be > 0")
-
-    # ── Section 7B — VIX Spike Monitor ───────────────────────────────────────
-    if cfg.VIX_SPIKE_THRESHOLD_PCT <= 0:
-        errors.append("[risk.vix_spike_monitor] threshold_pct must be > 0")
-    if cfg.VIX_SPIKE_CHECK_INTERVAL_S <= 0:
-        errors.append("[risk.vix_spike_monitor] check_interval_s must be > 0")
-    if cfg.VIX_SPIKE_ABS_FLOOR < 0:
-        errors.append("[risk.vix_spike_monitor] abs_floor must be >= 0")
-    # Cross-check: abs_floor should be >= vix_min; if lower, the floor is below
-    # the entry threshold and will never meaningfully block a spike exit.
-    if cfg.VIX_SPIKE_ABS_FLOOR < cfg.VIX_MIN:
-        errors.append(
-            f"[risk.vix_spike_monitor] abs_floor ({cfg.VIX_SPIKE_ABS_FLOOR}) is below "
-            f"vix_filter.vix_min ({cfg.VIX_MIN}) — the floor will never activate because "
-            "VIX below vix_min would have blocked entry; raise abs_floor to >= vix_min"
-        )
-    # Cross-check: VIX spike monitor requires VIX filter enabled.
-    # The spike monitor compares current VIX against vix_at_entry captured during
-    # the entry filter. If the VIX filter is disabled, entries can occur at any VIX
-    # (including VIX=10), making both the threshold_pct and abs_floor unreliable.
-    if cfg.VIX_SPIKE_MONITOR_ENABLED and not cfg.VIX_FILTER_ENABLED:
-        errors.append(
-            "[risk.vix_spike_monitor] enabled but [vix_filter] enabled = false — "
-            "the spike monitor relies on the VIX filter to establish a safe entry VIX "
-            "baseline; without it, entries at very low VIX make abs_floor and threshold "
-            "unreliable; either enable vix_filter or disable vix_spike_monitor"
-        )
-
-    # ── Section 7C — Trailing SL ──────────────────────────────────────────────
-    if not (0 < cfg.TRAIL_TRIGGER_PCT < 100):
-        errors.append("[risk.trailing_sl] trigger_pct must be between 0 and 100 (exclusive)")
-    if cfg.TRAIL_LOCK_PCT <= 0:
-        errors.append("[risk.trailing_sl] lock_pct must be > 0")
-
-    # ── Section 7D — Dynamic SL ───────────────────────────────────────────────
-    for i, (t, pct) in enumerate(cfg.DYNAMIC_SL_SCHEDULE):
-        _validate_hhmm(f"[risk.dynamic_sl] schedule[{i}].time", t, errors)
-        if pct <= 0:
-            errors.append(f"[risk.dynamic_sl] schedule[{i}].sl_pct must be > 0")
-        if pct > cfg.LEG_SL_PERCENT and cfg.LEG_SL_PERCENT > 0:
+        # ── Section 9 — Strategy Name ─────────────────────────────────────────
+        if not self.STRATEGY_NAME.strip():
             errors.append(
-                f"[risk.dynamic_sl] schedule[{i}].sl_pct ({pct}%) is larger than "
-                f"risk.leg_sl_percent ({cfg.LEG_SL_PERCENT}%) — dynamic schedule "
-                "entries must be tighter (smaller) than the base SL"
-            )
-    # Verify entries are in descending time order (required for first-match logic)
-    times = [entry[0] for entry in cfg.DYNAMIC_SL_SCHEDULE]
-    if times != sorted(times, reverse=True):
-        errors.append(
-            "[risk.dynamic_sl] schedule must be in DESCENDING time order "
-            "(latest time first) — e.g. 14:30, 13:30, 12:00"
-        )
-
-    # ── Section 7E — Combined Decay Exit ─────────────────────────────────────
-    if not (0 < cfg.COMBINED_DECAY_TARGET_PCT < 100):
-        errors.append("[risk.combined_decay_exit] decay_target_pct must be 0–100 (exclusive)")
-
-    # ── Section 7F — Winner Leg Booking ──────────────────────────────────────
-    if not (0 < cfg.WINNER_LEG_DECAY_THRESHOLD_PCT < 100):
-        errors.append("[risk.winner_leg_booking] decay_threshold_pct must be 0–100 (exclusive)")
-
-    # ── Section 7G — Spot-Move Exit ───────────────────────────────────────────
-    if cfg.BREAKEVEN_SPOT_MULTIPLIER <= 0:
-        errors.append("[risk.spot_move_exit] spot_multiplier must be > 0")
-    if cfg.SPOT_CHECK_INTERVAL_S <= 0:
-        errors.append("[risk.spot_move_exit] check_interval_s must be > 0")
-
-    # ── Section 8 — Expiry ───────────────────────────────────────────────────
-    if not cfg.AUTO_EXPIRY:
-        if not cfg.MANUAL_EXPIRY:
-            errors.append(
-                "[expiry] manual_expiry is required when auto_expiry = false "
-                "(format: DDMMMYY uppercase e.g. '25MAR26')"
-            )
-        elif not _EXPIRY_RE.match(cfg.MANUAL_EXPIRY):
-            errors.append(
-                f"[expiry] manual_expiry '{cfg.MANUAL_EXPIRY}' has wrong format — "
-                "must be DDMMMYY uppercase e.g. '25MAR26', '01JAN27'"
+                "[strategy] name cannot be empty — must match the strategy name "
+                "registered in the OpenAlgo dashboard"
             )
 
-    # ── Section 9 — Strategy Name ─────────────────────────────────────────────
-    if not cfg.STRATEGY_NAME.strip():
-        errors.append(
-            "[strategy] name cannot be empty — must match the strategy name "
-            "registered in the OpenAlgo dashboard"
-        )
-
-    # ── Section 10 — Telegram ────────────────────────────────────────────────
-    if cfg.TELEGRAM_ENABLED:
-        if not cfg.TELEGRAM_BOT_TOKEN:
-            errors.append(
-                "[telegram] bot_token is required when enabled = true — "
-                "set in config.toml or export TELEGRAM_BOT_TOKEN"
-            )
-        if not cfg.TELEGRAM_CHAT_ID:
-            errors.append(
-                "[telegram] chat_id is required when enabled = true — "
-                "set in config.toml or export TELEGRAM_CHAT_ID"
-            )
-
-    # ── Section 11 — Files ───────────────────────────────────────────────────
-    if not cfg.STATE_FILE:
-        errors.append("[files] state_file path cannot be empty")
-    if cfg.TRADE_LOG_FILE:
-        trade_log_dir = Path(cfg.TRADE_LOG_FILE).parent
-        if not trade_log_dir.exists():
-            # Attempt auto-create (directories section may have been skipped)
-            try:
-                trade_log_dir.mkdir(parents=True, exist_ok=True)
-            except OSError:
+        # ── Section 10 — Telegram ────────────────────────────────────────────
+        if self.TELEGRAM_ENABLED:
+            if not self.TELEGRAM_BOT_TOKEN:
                 errors.append(
-                    f"[files] trade_log_file parent directory does not exist and cannot be created: "
-                    f"'{trade_log_dir}' — create the directory or set trade_log_file = '' to disable"
+                    "[telegram] bot_token is required when enabled = true — "
+                    "set in config.toml or export TELEGRAM_BOT_TOKEN"
                 )
-    if cfg.QUOTE_FAIL_ALERT_THRESHOLD <= 0:
-        errors.append("[files] quote_fail_alert_threshold must be > 0")
+            if not self.TELEGRAM_CHAT_ID:
+                errors.append(
+                    "[telegram] chat_id is required when enabled = true — "
+                    "set in config.toml or export TELEGRAM_CHAT_ID"
+                )
 
-    # ── Section 12 — Logger ──────────────────────────────────────────────────
-    if cfg.LOG_LEVEL.upper() not in _VALID_LOG_LEVELS:
-        errors.append(
-            f"[logging] log_level must be one of "
-            f"{sorted(_VALID_LOG_LEVELS)}, got '{cfg.LOG_LEVEL}'"
-        )
-    if cfg.LOG_ROTATION.lower() not in _VALID_LOG_ROTATIONS:
-        errors.append(
-            f"[logging] log_rotation must be 'daily', 'size', or 'none', "
-            f"got '{cfg.LOG_ROTATION}'"
-        )
-    if cfg.LOG_TO_FILE:
-        if not cfg.LOG_FILE:
-            errors.append("[logging] log_file path is required when log_to_file = true")
-        else:
-            log_dir = Path(cfg.LOG_FILE).parent
-            if not log_dir.exists():
+        # ── Section 11 — Files ───────────────────────────────────────────────
+        if not self.STATE_FILE:
+            errors.append("[files] state_file path cannot be empty")
+        if self.TRADE_LOG_FILE:
+            trade_log_dir = Path(self.TRADE_LOG_FILE).parent
+            if not trade_log_dir.exists():
+                # Attempt auto-create (directories section may have been skipped)
                 try:
-                    log_dir.mkdir(parents=True, exist_ok=True)
+                    trade_log_dir.mkdir(parents=True, exist_ok=True)
                 except OSError:
                     errors.append(
-                        f"[logging] log_file parent directory does not exist and cannot be created: "
-                        f"'{log_dir}' — create the directory or use a relative path"
+                        f"[files] trade_log_file parent directory does not exist and cannot be created: "
+                        f"'{trade_log_dir}' — create the directory or set trade_log_file = '' to disable"
                     )
-    if cfg.LOG_MAX_BYTES <= 0:
-        errors.append("[logging] log_max_mb must be > 0")
-    if cfg.LOG_BACKUP_COUNT <= 0:
-        errors.append("[logging] log_backup_count must be > 0")
-    if not cfg.LOG_TO_CONSOLE and not cfg.LOG_TO_FILE:
-        errors.append(
-            "[logging] both log_to_console and log_to_file are false — "
-            "all log output will be silently discarded; "
-            "enable at least one to preserve strategy logs"
+        if self.QUOTE_FAIL_ALERT_THRESHOLD <= 0:
+            errors.append("[files] quote_fail_alert_threshold must be > 0")
+
+        # ── Section 12 — Logger ──────────────────────────────────────────────
+        if self.LOG_LEVEL.upper() not in _VALID_LOG_LEVELS:
+            errors.append(
+                f"[logging] log_level must be one of "
+                f"{sorted(_VALID_LOG_LEVELS)}, got '{self.LOG_LEVEL}'"
+            )
+        if self.LOG_ROTATION.lower() not in _VALID_LOG_ROTATIONS:
+            errors.append(
+                f"[logging] log_rotation must be 'daily', 'size', or 'none', "
+                f"got '{self.LOG_ROTATION}'"
+            )
+        if self.LOG_TO_FILE:
+            if not self.LOG_FILE:
+                errors.append("[logging] log_file path is required when log_to_file = true")
+            else:
+                log_dir = Path(self.LOG_FILE).parent
+                if not log_dir.exists():
+                    try:
+                        log_dir.mkdir(parents=True, exist_ok=True)
+                    except OSError:
+                        errors.append(
+                            f"[logging] log_file parent directory does not exist and cannot be created: "
+                            f"'{log_dir}' — create the directory or use a relative path"
+                        )
+        if self.LOG_MAX_BYTES <= 0:
+            errors.append("[logging] log_max_mb must be > 0")
+        if self.LOG_BACKUP_COUNT <= 0:
+            errors.append("[logging] log_backup_count must be > 0")
+        if not self.LOG_TO_CONSOLE and not self.LOG_TO_FILE:
+            errors.append(
+                "[logging] both log_to_console and log_to_file are false — "
+                "all log output will be silently discarded; "
+                "enable at least one to preserve strategy logs"
+            )
+
+        # ── Raise all errors at once ──────────────────────────────────────────
+        if errors:
+            bullet_list = "\n".join(f"  • {e}" for e in errors)
+            raise ValueError(
+                f"\nconfig.toml has {len(errors)} validation error(s):\n{bullet_list}\n"
+            )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  from_toml() — classmethod factory (primary entry point)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @classmethod
+    def from_toml(cls, config_path: str | Path = _DEFAULT_CONFIG_PATH) -> Config:
+        """
+        Load, validate and return a Config object from a TOML file.
+
+        Parameters
+        ----------
+        config_path : str or Path, optional
+            Path to the TOML config file.
+            Defaults to config.toml in the strategy directory (parent of util/).
+
+        Returns
+        -------
+        Config
+            Frozen dataclass with all validated configuration values.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the config file does not exist at the given path.
+        ValueError
+            If the TOML has a syntax error, or one or more values fail validation.
+        """
+        config_path = Path(config_path)
+
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Config file not found: {config_path}\n"
+                f"Expected at: {config_path.resolve()}"
+            )
+
+        # ── Parse TOML ────────────────────────────────────────────────────────
+        try:
+            with open(config_path, "rb") as f:
+                raw = tomllib.load(f)
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(
+                f"config.toml has a TOML syntax error:\n  {exc}\n"
+                f"File: {config_path.resolve()}"
+            ) from exc
+
+        # ── Extract sections (short aliases for readability) ──────────────────
+        dirs   = raw.get("directories",         {})
+        conn   = raw.get("connection",          {})
+        inst   = raw.get("instrument",          {})
+        timing = raw.get("timing",              {})
+        dte    = raw.get("dte_filter",          {})
+        months = raw.get("month_filter",        {})
+        vix    = raw.get("vix_filter",          {})
+        ivr    = raw.get("ivr_ivp_filter",      {})
+        orb    = raw.get("orb_filter",          {})
+        risk   = raw.get("risk",                {})
+        mg     = risk.get("margin_guard",       {})
+        vsm    = risk.get("vix_spike_monitor",  {})
+        tsl    = risk.get("trailing_sl",        {})
+        dsl    = risk.get("dynamic_sl",         {})
+        cde    = risk.get("combined_decay_exit",{})
+        wlb    = risk.get("winner_leg_booking", {})
+        besl   = risk.get("breakeven_sl",       {})
+        sme    = risk.get("spot_move_exit",     {})
+        expiry = raw.get("expiry",              {})
+        strat  = raw.get("strategy",            {})
+        tg     = raw.get("telegram",            {})
+        files  = raw.get("files",               {})
+        logcfg = raw.get("logging",             {})
+
+        # ── Resolve directory paths relative to the strategy directory ────────
+        logs_dir_raw = dirs.get("logs_dir", "logs")
+        data_dir_raw = dirs.get("data_dir", "data")
+        logs_dir = str((_STRATEGY_DIR / logs_dir_raw).resolve()) if not os.path.isabs(logs_dir_raw) else logs_dir_raw
+        data_dir = str((_STRATEGY_DIR / data_dir_raw).resolve()) if not os.path.isabs(data_dir_raw) else data_dir_raw
+
+        # Auto-create directories at load time (before validation checks paths)
+        os.makedirs(logs_dir, exist_ok=True)
+        os.makedirs(data_dir, exist_ok=True)
+
+        # ── Environment variable overrides ────────────────────────────────────
+        api_key   = os.getenv("OPENALGO_APIKEY")    or conn.get("api_key",   "")
+        tg_token  = os.getenv("TELEGRAM_BOT_TOKEN") or tg.get("bot_token",   "")
+        tg_chatid = os.getenv("TELEGRAM_CHAT_ID")   or tg.get("chat_id",     "")
+
+        # ── Derived values ────────────────────────────────────────────────────
+        number_of_lots = int(inst.get("number_of_lots", 1))
+        profit_per_lot = float(risk.get("daily_profit_target_per_lot", 0))
+        loss_per_lot   = float(risk.get("daily_loss_limit_per_lot",    0))
+
+        # ── DTE entry time map: TOML string keys → int keys ──────────────────
+        try:
+            dte_map = {int(k): v for k, v in timing.get("dte_entry_time_map", {}).items()}
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"[timing.dte_entry_time_map] keys must be integers (0–6), got error: {exc}"
+            ) from exc
+
+        # ── Dynamic SL schedule: list[{time, sl_pct}] → list[(str, float)] ───
+        raw_schedule = dsl.get("schedule", [])
+        try:
+            dsl_schedule = [
+                (str(entry["time"]), float(entry["sl_pct"]))
+                for entry in raw_schedule
+            ]
+        except (KeyError, TypeError) as exc:
+            raise ValueError(
+                f"[risk.dynamic_sl] schedule entries must have 'time' and 'sl_pct' keys, "
+                f"got error: {exc}"
+            ) from exc
+
+        # ── log_max_mb → bytes ────────────────────────────────────────────────
+        log_max_bytes = int(logcfg.get("log_max_mb", 10)) * 1024 * 1024
+
+        # ── Resolve file paths into their respective directories ─────────────
+        def _resolve_in(directory: str, filename: str) -> str:
+            if not filename:
+                return ""
+            if os.path.isabs(filename):
+                return filename
+            return str(Path(directory) / filename)
+
+        resolved_log_file     = _resolve_in(logs_dir, logcfg.get("log_file",     "strategy.log"))
+        resolved_state_file   = _resolve_in(data_dir, files.get("state_file",    "strategy_state.json"))
+        resolved_trade_log    = _resolve_in(data_dir, files.get("trade_log_file","trades.jsonl"))
+        resolved_vix_history  = _resolve_in(data_dir, ivr.get("vix_history_file","vix_history.csv"))
+
+        # ── Build Config ──────────────────────────────────────────────────────
+        instance = cls(
+            # Section 0 — Directory Layout
+            LOGS_DIR = logs_dir,
+            DATA_DIR = data_dir,
+
+            # Section 1 — Connection
+            OPENALGO_HOST    = conn.get("host",    "http://127.0.0.1:5000"),
+            OPENALGO_API_KEY = api_key,
+
+            # Section 2 — Instrument
+            UNDERLYING     = inst.get("underlying",    "NIFTY"),
+            EXCHANGE       = inst.get("exchange",      "NSE_INDEX"),
+            LOT_SIZE       = int(inst.get("lot_size",       65)),
+            NUMBER_OF_LOTS = number_of_lots,
+            PRODUCT        = inst.get("product",       "MIS"),
+            STRIKE_OFFSET  = inst.get("strike_offset", "ATM"),
+
+            # Section 3 — Timing
+            ENTRY_TIME         = timing.get("entry_time",         "09:30"),
+            EXIT_TIME          = timing.get("exit_time",          "15:15"),
+            MONITOR_INTERVAL_S = int(timing.get("monitor_interval_s", 15)),
+            USE_DTE_ENTRY_MAP  = bool(timing.get("use_dte_entry_map",  True)),
+            DTE_ENTRY_TIME_MAP = dte_map,
+
+            # Section 4 — DTE Filter
+            TRADE_DTE = list(dte.get("trade_dte", [0, 1, 2, 3, 4])),
+
+            # Section 5 — Month Filter
+            SKIP_MONTHS = list(months.get("skip_months", [])),
+
+            # Section 6 — VIX Filter
+            VIX_FILTER_ENABLED = bool(vix.get("enabled", True)),
+            VIX_MIN            = float(vix.get("vix_min", 14.0)),
+            VIX_MAX            = float(vix.get("vix_max", 28.0)),
+
+            # Section 6A — IVR / IVP Filter
+            IVR_FILTER_ENABLED   = bool(ivr.get("ivr_filter_enabled",   True)),
+            IVR_MIN              = float(ivr.get("ivr_min",              30.0)),
+            IVP_FILTER_ENABLED   = bool(ivr.get("ivp_filter_enabled",   True)),
+            IVP_MIN              = float(ivr.get("ivp_min",              40.0)),
+            IVR_FAIL_OPEN        = bool(ivr.get("ivr_fail_open",        False)),
+            VIX_HISTORY_FILE     = resolved_vix_history,
+            VIX_HISTORY_MIN_ROWS = int(ivr.get("vix_history_min_rows", 100)),
+            VIX_UPDATE_TIME      = ivr.get("vix_update_time",      "15:30"),
+
+            # Section 6B — ORB Filter
+            ORB_FILTER_ENABLED = bool(orb.get("enabled",      True)),
+            ORB_CAPTURE_TIME   = orb.get("capture_time",  "09:17"),
+            ORB_MAX_MOVE_PCT   = float(orb.get("max_move_pct", 0.5)),
+
+            # Section 7 — Risk Management
+            LEG_SL_PERCENT              = float(risk.get("leg_sl_percent",              20.0)),
+            DAILY_PROFIT_TARGET_PER_LOT = profit_per_lot,
+            DAILY_LOSS_LIMIT_PER_LOT    = loss_per_lot,
+            DAILY_PROFIT_TARGET         = profit_per_lot * number_of_lots,  # derived
+            DAILY_LOSS_LIMIT            = loss_per_lot   * number_of_lots,  # derived
+
+            # Section 7A — Margin Guard
+            MARGIN_GUARD_ENABLED   = bool(mg.get("enabled",         True)),
+            MARGIN_BUFFER          = float(mg.get("margin_buffer",   1.20)),
+            MARGIN_GUARD_FAIL_OPEN = bool(mg.get("fail_open",        True)),
+            ATM_STRIKE_ROUNDING    = int(mg.get("strike_rounding",   50)),
+
+            # Section 7B — VIX Spike Monitor
+            VIX_SPIKE_MONITOR_ENABLED  = bool(vsm.get("enabled",          True)),
+            VIX_SPIKE_THRESHOLD_PCT    = float(vsm.get("threshold_pct",   15.0)),
+            VIX_SPIKE_CHECK_INTERVAL_S = int(vsm.get("check_interval_s",  300)),
+            VIX_SPIKE_ABS_FLOOR        = float(vsm.get("abs_floor",        18.0)),
+
+            # Section 7C — Trailing SL
+            TRAILING_SL_ENABLED = bool(tsl.get("enabled",     True)),
+            TRAIL_TRIGGER_PCT   = float(tsl.get("trigger_pct", 50.0)),
+            TRAIL_LOCK_PCT      = float(tsl.get("lock_pct",    30.0)),
+
+            # Section 7D — Dynamic SL Tightening
+            DYNAMIC_SL_ENABLED  = bool(dsl.get("enabled", True)),
+            DYNAMIC_SL_SCHEDULE = dsl_schedule,
+
+            # Section 7E — Combined Premium Decay Exit
+            COMBINED_DECAY_EXIT_ENABLED = bool(cde.get("enabled",          True)),
+            COMBINED_DECAY_TARGET_PCT   = float(cde.get("decay_target_pct", 60.0)),
+
+            # Section 7F — Winner-Leg Early Booking
+            WINNER_LEG_EARLY_EXIT_ENABLED  = bool(wlb.get("enabled",             True)),
+            WINNER_LEG_DECAY_THRESHOLD_PCT = float(wlb.get("decay_threshold_pct", 30.0)),
+
+            # Section 7G — Breakeven SL
+            BREAKEVEN_AFTER_PARTIAL_ENABLED = bool(besl.get("enabled", True)),
+
+            # Section 7G — Spot-Move Exit
+            BREAKEVEN_SPOT_EXIT_ENABLED = bool(sme.get("enabled",         True)),
+            BREAKEVEN_SPOT_MULTIPLIER   = float(sme.get("spot_multiplier", 1.0)),
+            SPOT_CHECK_INTERVAL_S       = int(sme.get("check_interval_s",  60)),
+
+            # Section 8 — Expiry
+            AUTO_EXPIRY   = bool(expiry.get("auto_expiry",   True)),
+            MANUAL_EXPIRY = expiry.get("manual_expiry", ""),
+
+            # Section 9 — Strategy Name
+            STRATEGY_NAME = strat.get("name", "Short Straddle"),
+
+            # Section 10 — Telegram
+            TELEGRAM_ENABLED   = bool(tg.get("enabled", True)),
+            TELEGRAM_BOT_TOKEN = tg_token,
+            TELEGRAM_CHAT_ID   = tg_chatid,
+
+            # Section 11 — State & Log Files
+            STATE_FILE                 = resolved_state_file,
+            TRADE_LOG_FILE             = resolved_trade_log,
+            QUOTE_FAIL_ALERT_THRESHOLD = int(files.get("quote_fail_alert_threshold", 3)),
+
+            # Section 12 — Logger
+            LOG_LEVEL        = logcfg.get("log_level",    "INFO").upper(),
+            LOG_TO_CONSOLE   = bool(logcfg.get("log_to_console", True)),
+            LOG_TO_FILE      = bool(logcfg.get("log_to_file",    True)),
+            LOG_FILE         = resolved_log_file,
+            LOG_ROTATION     = logcfg.get("log_rotation", "daily").lower(),
+            LOG_MAX_BYTES    = log_max_bytes,
+            LOG_BACKUP_COUNT = int(logcfg.get("log_backup_count", 30)),
+            LOG_FORMAT       = logcfg.get(
+                "log_format",
+                "%(asctime)s [%(levelname)-8s] %(message)s"
+            ),
         )
 
-    # ── Raise all errors at once ──────────────────────────────────────────────
-    if errors:
-        bullet_list = "\n".join(f"  • {e}" for e in errors)
-        raise ValueError(
-            f"\nconfig.toml has {len(errors)} validation error(s):\n{bullet_list}\n"
-        )
+        # ── Validate all fields ───────────────────────────────────────────────
+        instance._validate()
+
+        return instance
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  load_config() — public entry point
+#  Backward-compatible module-level function
+#  Usage: from util.config_util import load_config
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_config(config_path: str | Path = _DEFAULT_CONFIG_PATH) -> Config:
-    """
-    Load, validate and return a Config object from a TOML file.
-
-    Parameters
-    ----------
-    config_path : str or Path, optional
-        Path to the TOML config file.
-        Defaults to config.toml in the strategy directory (parent of util/).
-
-    Returns
-    -------
-    Config
-        Frozen dataclass with all validated configuration values.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the config file does not exist at the given path.
-    ValueError
-        If the TOML has a syntax error, or one or more values fail validation.
-    """
-    config_path = Path(config_path)
-
-    if not config_path.exists():
-        raise FileNotFoundError(
-            f"Config file not found: {config_path}\n"
-            f"Expected at: {config_path.resolve()}"
-        )
-
-    # ── Parse TOML ────────────────────────────────────────────────────────────
-    # Catch TOMLDecodeError and re-raise as ValueError with a clear message.
-    try:
-        with open(config_path, "rb") as f:
-            raw = tomllib.load(f)
-    except tomllib.TOMLDecodeError as exc:
-        raise ValueError(
-            f"config.toml has a TOML syntax error:\n  {exc}\n"
-            f"File: {config_path.resolve()}"
-        ) from exc
-
-    # ── Extract sections (short aliases for readability) ──────────────────────
-    dirs   = raw.get("directories",         {})
-    conn   = raw.get("connection",          {})
-    inst   = raw.get("instrument",          {})
-    timing = raw.get("timing",              {})
-    dte    = raw.get("dte_filter",          {})
-    months = raw.get("month_filter",        {})
-    vix    = raw.get("vix_filter",          {})
-    ivr    = raw.get("ivr_ivp_filter",      {})
-    orb    = raw.get("orb_filter",          {})
-    risk   = raw.get("risk",                {})
-    mg     = risk.get("margin_guard",       {})
-    vsm    = risk.get("vix_spike_monitor",  {})
-    tsl    = risk.get("trailing_sl",        {})
-    dsl    = risk.get("dynamic_sl",         {})
-    cde    = risk.get("combined_decay_exit",{})
-    wlb    = risk.get("winner_leg_booking", {})
-    besl   = risk.get("breakeven_sl",       {})
-    sme    = risk.get("spot_move_exit",     {})
-    expiry = raw.get("expiry",              {})
-    strat  = raw.get("strategy",            {})
-    tg     = raw.get("telegram",            {})
-    files  = raw.get("files",               {})
-    logcfg = raw.get("logging",             {})
-
-    # ── Resolve directory paths relative to the strategy directory ───────────
-    # Relative paths are resolved from the strategy dir (where main.py lives).
-    # Absolute paths are used as-is.
-    logs_dir_raw = dirs.get("logs_dir", "logs")
-    data_dir_raw = dirs.get("data_dir", "data")
-    logs_dir = str((_STRATEGY_DIR / logs_dir_raw).resolve()) if not os.path.isabs(logs_dir_raw) else logs_dir_raw
-    data_dir = str((_STRATEGY_DIR / data_dir_raw).resolve()) if not os.path.isabs(data_dir_raw) else data_dir_raw
-
-    # Auto-create directories at load time (before validation checks paths)
-    os.makedirs(logs_dir, exist_ok=True)
-    os.makedirs(data_dir, exist_ok=True)
-
-    # ── Environment variable overrides ────────────────────────────────────────
-    # Sensitive credentials: env var takes precedence over config.toml value.
-    api_key   = os.getenv("OPENALGO_APIKEY")    or conn.get("api_key",   "")
-    tg_token  = os.getenv("TELEGRAM_BOT_TOKEN") or tg.get("bot_token",   "")
-    tg_chatid = os.getenv("TELEGRAM_CHAT_ID")   or tg.get("chat_id",     "")
-
-    # ── Derived values ────────────────────────────────────────────────────────
-    number_of_lots = int(inst.get("number_of_lots", 1))
-    profit_per_lot = float(risk.get("daily_profit_target_per_lot", 0))
-    loss_per_lot   = float(risk.get("daily_loss_limit_per_lot",    0))
-
-    # ── DTE entry time map: TOML string keys → int keys ───────────────────────
-    try:
-        dte_map = {int(k): v for k, v in timing.get("dte_entry_time_map", {}).items()}
-    except (ValueError, TypeError) as exc:
-        raise ValueError(
-            f"[timing.dte_entry_time_map] keys must be integers (0–6), got error: {exc}"
-        ) from exc
-
-    # ── Dynamic SL schedule: list[{time, sl_pct}] → list[(str, float)] ───────
-    # Guard against missing keys in each schedule entry before validation runs.
-    raw_schedule = dsl.get("schedule", [])
-    try:
-        dsl_schedule = [
-            (str(entry["time"]), float(entry["sl_pct"]))
-            for entry in raw_schedule
-        ]
-    except (KeyError, TypeError) as exc:
-        raise ValueError(
-            f"[risk.dynamic_sl] schedule entries must have 'time' and 'sl_pct' keys, "
-            f"got error: {exc}"
-        ) from exc
-
-    # ── log_max_mb → bytes ────────────────────────────────────────────────────
-    log_max_bytes = int(logcfg.get("log_max_mb", 10)) * 1024 * 1024
-
-    # ── Resolve file paths into their respective directories ────────────────
-    # File names from config are joined with the appropriate directory.
-    # If the user specifies an absolute path, it is used as-is.
-    def _resolve_in(directory: str, filename: str) -> str:
-        if not filename:
-            return ""
-        if os.path.isabs(filename):
-            return filename
-        return str(Path(directory) / filename)
-
-    resolved_log_file     = _resolve_in(logs_dir, logcfg.get("log_file",     "strategy.log"))
-    resolved_state_file   = _resolve_in(data_dir, files.get("state_file",    "strategy_state.json"))
-    resolved_trade_log    = _resolve_in(data_dir, files.get("trade_log_file","trades.jsonl"))
-    resolved_vix_history  = _resolve_in(data_dir, ivr.get("vix_history_file","vix_history.csv"))
-
-    # ── Build Config ──────────────────────────────────────────────────────────
-    cfg = Config(
-        # Section 0 — Directory Layout
-        LOGS_DIR = logs_dir,
-        DATA_DIR = data_dir,
-
-        # Section 1 — Connection
-        OPENALGO_HOST    = conn.get("host",    "http://127.0.0.1:5000"),
-        OPENALGO_API_KEY = api_key,
-
-        # Section 2 — Instrument
-        UNDERLYING     = inst.get("underlying",    "NIFTY"),
-        EXCHANGE       = inst.get("exchange",      "NSE_INDEX"),
-        LOT_SIZE       = int(inst.get("lot_size",       65)),
-        NUMBER_OF_LOTS = number_of_lots,
-        PRODUCT        = inst.get("product",       "MIS"),
-        STRIKE_OFFSET  = inst.get("strike_offset", "ATM"),
-
-        # Section 3 — Timing
-        ENTRY_TIME         = timing.get("entry_time",         "09:30"),
-        EXIT_TIME          = timing.get("exit_time",          "15:15"),
-        MONITOR_INTERVAL_S = int(timing.get("monitor_interval_s", 15)),
-        USE_DTE_ENTRY_MAP  = bool(timing.get("use_dte_entry_map",  True)),
-        DTE_ENTRY_TIME_MAP = dte_map,
-
-        # Section 4 — DTE Filter
-        TRADE_DTE = list(dte.get("trade_dte", [0, 1, 2, 3, 4])),
-
-        # Section 5 — Month Filter
-        SKIP_MONTHS = list(months.get("skip_months", [])),
-
-        # Section 6 — VIX Filter
-        VIX_FILTER_ENABLED = bool(vix.get("enabled", True)),
-        VIX_MIN            = float(vix.get("vix_min", 14.0)),
-        VIX_MAX            = float(vix.get("vix_max", 28.0)),
-
-        # Section 6A — IVR / IVP Filter
-        IVR_FILTER_ENABLED   = bool(ivr.get("ivr_filter_enabled",   True)),
-        IVR_MIN              = float(ivr.get("ivr_min",              30.0)),
-        IVP_FILTER_ENABLED   = bool(ivr.get("ivp_filter_enabled",   True)),
-        IVP_MIN              = float(ivr.get("ivp_min",              40.0)),
-        IVR_FAIL_OPEN        = bool(ivr.get("ivr_fail_open",        False)),
-        VIX_HISTORY_FILE     = resolved_vix_history,
-        VIX_HISTORY_MIN_ROWS = int(ivr.get("vix_history_min_rows", 100)),
-        VIX_UPDATE_TIME      = ivr.get("vix_update_time",      "15:30"),
-
-        # Section 6B — ORB Filter
-        ORB_FILTER_ENABLED = bool(orb.get("enabled",      True)),
-        ORB_CAPTURE_TIME   = orb.get("capture_time",  "09:17"),
-        ORB_MAX_MOVE_PCT   = float(orb.get("max_move_pct", 0.5)),
-
-        # Section 7 — Risk Management
-        LEG_SL_PERCENT              = float(risk.get("leg_sl_percent",              20.0)),
-        DAILY_PROFIT_TARGET_PER_LOT = profit_per_lot,
-        DAILY_LOSS_LIMIT_PER_LOT    = loss_per_lot,
-        DAILY_PROFIT_TARGET         = profit_per_lot * number_of_lots,  # derived
-        DAILY_LOSS_LIMIT            = loss_per_lot   * number_of_lots,  # derived
-
-        # Section 7A — Margin Guard
-        MARGIN_GUARD_ENABLED   = bool(mg.get("enabled",         True)),
-        MARGIN_BUFFER          = float(mg.get("margin_buffer",   1.20)),
-        MARGIN_GUARD_FAIL_OPEN = bool(mg.get("fail_open",        True)),
-        ATM_STRIKE_ROUNDING    = int(mg.get("strike_rounding",   50)),
-
-        # Section 7B — VIX Spike Monitor
-        VIX_SPIKE_MONITOR_ENABLED  = bool(vsm.get("enabled",          True)),
-        VIX_SPIKE_THRESHOLD_PCT    = float(vsm.get("threshold_pct",   15.0)),
-        VIX_SPIKE_CHECK_INTERVAL_S = int(vsm.get("check_interval_s",  300)),
-        VIX_SPIKE_ABS_FLOOR        = float(vsm.get("abs_floor",        18.0)),
-
-        # Section 7C — Trailing SL
-        TRAILING_SL_ENABLED = bool(tsl.get("enabled",     True)),
-        TRAIL_TRIGGER_PCT   = float(tsl.get("trigger_pct", 50.0)),
-        TRAIL_LOCK_PCT      = float(tsl.get("lock_pct",    30.0)),
-
-        # Section 7D — Dynamic SL Tightening
-        DYNAMIC_SL_ENABLED  = bool(dsl.get("enabled", True)),
-        DYNAMIC_SL_SCHEDULE = dsl_schedule,
-
-        # Section 7E — Combined Premium Decay Exit
-        COMBINED_DECAY_EXIT_ENABLED = bool(cde.get("enabled",          True)),
-        COMBINED_DECAY_TARGET_PCT   = float(cde.get("decay_target_pct", 60.0)),
-
-        # Section 7F — Winner-Leg Early Booking
-        WINNER_LEG_EARLY_EXIT_ENABLED  = bool(wlb.get("enabled",             True)),
-        WINNER_LEG_DECAY_THRESHOLD_PCT = float(wlb.get("decay_threshold_pct", 30.0)),
-
-        # Section 7G — Breakeven SL
-        BREAKEVEN_AFTER_PARTIAL_ENABLED = bool(besl.get("enabled", True)),
-
-        # Section 7G — Spot-Move Exit
-        BREAKEVEN_SPOT_EXIT_ENABLED = bool(sme.get("enabled",         True)),
-        BREAKEVEN_SPOT_MULTIPLIER   = float(sme.get("spot_multiplier", 1.0)),
-        SPOT_CHECK_INTERVAL_S       = int(sme.get("check_interval_s",  60)),
-
-        # Section 8 — Expiry
-        AUTO_EXPIRY   = bool(expiry.get("auto_expiry",   True)),
-        MANUAL_EXPIRY = expiry.get("manual_expiry", ""),
-
-        # Section 9 — Strategy Name
-        STRATEGY_NAME = strat.get("name", "Short Straddle"),
-
-        # Section 10 — Telegram
-        TELEGRAM_ENABLED   = bool(tg.get("enabled", True)),
-        TELEGRAM_BOT_TOKEN = tg_token,
-        TELEGRAM_CHAT_ID   = tg_chatid,
-
-        # Section 11 — State & Log Files
-        STATE_FILE                 = resolved_state_file,
-        TRADE_LOG_FILE             = resolved_trade_log,
-        QUOTE_FAIL_ALERT_THRESHOLD = int(files.get("quote_fail_alert_threshold", 3)),
-
-        # Section 12 — Logger
-        LOG_LEVEL        = logcfg.get("log_level",    "INFO").upper(),
-        LOG_TO_CONSOLE   = bool(logcfg.get("log_to_console", True)),
-        LOG_TO_FILE      = bool(logcfg.get("log_to_file",    True)),
-        LOG_FILE         = resolved_log_file,
-        LOG_ROTATION     = logcfg.get("log_rotation", "daily").lower(),
-        LOG_MAX_BYTES    = log_max_bytes,
-        LOG_BACKUP_COUNT = int(logcfg.get("log_backup_count", 30)),
-        LOG_FORMAT       = logcfg.get(
-            "log_format",
-            "%(asctime)s [%(levelname)-8s] %(message)s"
-        ),
-    )
-
-    # ── Validate all fields ───────────────────────────────────────────────────
-    _validate(cfg)
-
-    return cfg
+    """Backward-compatible wrapper around Config.from_toml()."""
+    return Config.from_toml(config_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -766,7 +770,7 @@ def _load_default() -> Config | None:
     Validation and syntax errors are always fatal — the script exits immediately.
     """
     try:
-        return load_config(_DEFAULT_CONFIG_PATH)
+        return Config.from_toml(_DEFAULT_CONFIG_PATH)
     except FileNotFoundError:
         print(
             f"[config_util] WARNING: {_DEFAULT_CONFIG_PATH} not found. "
@@ -796,7 +800,7 @@ if __name__ == "__main__":
     print(f"Loading: {path.resolve()}\n")
 
     try:
-        loaded = load_config(path)
+        loaded = Config.from_toml(path)
     except (FileNotFoundError, ValueError) as exc:
         print(f"FAILED:\n{exc}")
         sys.exit(1)

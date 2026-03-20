@@ -7,8 +7,9 @@ Import this instead of duplicating constants or helpers.
 Exports:
   VERSION, IST, OPTION_EXCH, INDEX_EXCH, VIX_SYMBOL   — strategy constants
   DAY_NAMES, MONTH_NAMES                               — display helpers
-  _monitor_lock, _last_vix_spike_check_time, ...       — monitor thread vars
-  _get_client()                                        — lazy OpenAlgo client
+  BrokerClient, _broker_client, _get_client()          — lazy OpenAlgo client
+  MonitorState, _monitor_state                         — monitor thread vars
+  _monitor_lock                                        — monitor RLock (alias)
   now_ist(), qty(), parse_hhmm(), active_legs()        — stateless helpers
   sl_level(), _dynamic_sl_percent()                    — SL helpers
   telegram                                             — notify alias
@@ -60,36 +61,7 @@ MONTH_NAMES = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  MODULE-LEVEL THREAD STATE
-#
-#  Intentionally module-level (not instance attributes) so that each
-#  APScheduler job closure and background thread shares the SAME counters
-#  across calls — even when accessed through different StrategyCore method
-#  calls.  Using instance attributes would require passing `self` into every
-#  daemon thread and scheduler job, adding unnecessary coupling.
-#
-#  _monitor_lock        : RLock — serialises monitor ticks with close ops.
-#                         Reentrant so close_all() → close_one_leg() is safe.
-#  _last_vix_spike_*    : throttle — VIX spike check runs at most once per
-#                         VIX_SPIKE_CHECK_INTERVAL_S seconds.
-#  _last_spot_check_*   : throttle — spot-move check runs at most once per
-#                         SPOT_CHECK_INTERVAL_S seconds.
-#  _first_tick_fired    : True once the first monitor tick fires after entry.
-#                         Guards the 0–15s window where today_pnl == 0 is real.
-#  _consecutive_*       : escalation counters — alert after N consecutive fails.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_monitor_lock:                 threading.RLock = threading.RLock()
-_last_vix_spike_check_time:    Optional[datetime] = None
-_last_spot_check_time:         Optional[datetime] = None
-_first_tick_fired:             bool = False
-_consecutive_quote_fail_ticks: int  = 0
-_quote_fail_alerted:           bool = False
-_consecutive_monitor_skips:    int  = 0
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LAZY OPENALGO CLIENT
+#  BrokerClient — thread-safe lazy OpenAlgo client singleton
 #
 #  Initialised on first use (not at import time) so that:
 #    • Unit tests can import without a live broker connection.
@@ -97,21 +69,96 @@ _consecutive_monitor_skips:    int  = 0
 #    • A config reload automatically picks up the new API key.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_client_instance: Optional[OpenAlgoClient] = None
-_client_lock = threading.Lock()
+class BrokerClient:
+    """
+    Thread-safe lazy singleton for the OpenAlgo API client.
+
+    The client is constructed on the first call to get_client(), not at import
+    time. Double-checked locking ensures exactly one instance across threads.
+    """
+
+    def __init__(self) -> None:
+        self._instance: Optional[OpenAlgoClient] = None
+        self._lock = threading.Lock()
+
+    def get_client(self) -> OpenAlgoClient:
+        """Return the singleton OpenAlgoClient, constructing it on first call."""
+        if self._instance is None:
+            with self._lock:
+                if self._instance is None:   # double-checked locking
+                    self._instance = OpenAlgoClient(
+                        api_key = cfg.OPENALGO_API_KEY,
+                        host    = cfg.OPENALGO_HOST,
+                    )
+        return self._instance
+
+
+# Module-level singleton
+_broker_client = BrokerClient()
 
 
 def _get_client() -> OpenAlgoClient:
-    """Return the singleton OpenAlgoClient, constructing it on first call."""
-    global _client_instance
-    if _client_instance is None:
-        with _client_lock:
-            if _client_instance is None:   # double-checked locking
-                _client_instance = OpenAlgoClient(
-                    api_key = cfg.OPENALGO_API_KEY,
-                    host    = cfg.OPENALGO_HOST,
-                )
-    return _client_instance
+    """Backward-compatible wrapper — delegates to the BrokerClient singleton."""
+    return _broker_client.get_client()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MonitorState — mutable thread state shared across monitor/order modules
+#
+#  Encapsulates all the counters and timestamps that coordinate the monitor
+#  loop, VIX spike check throttle, spot-move check throttle, and broker
+#  connectivity escalation.
+#
+#  A single module-level instance (_monitor_state) is used by all modules
+#  via `import src._shared as _shared; _shared._monitor_state.xxx`.
+#
+#  _monitor_lock (RLock) is intentionally kept as a separate module-level
+#  variable since it is imported directly by name in monitor.py and
+#  order_engine.py: `from src._shared import _monitor_lock`.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MonitorState:
+    """
+    Mutable state shared between monitor ticks, close operations, and
+    background threads.
+
+    Attributes
+    ----------
+    last_vix_spike_check_time : throttle for VIX spike check
+    last_spot_check_time      : throttle for spot-move check
+    first_tick_fired          : True once the first monitor tick fires after entry
+    consecutive_quote_fail_ticks : escalation counter for LTP failures
+    quote_fail_alerted        : True once the failure alert has been sent
+    consecutive_monitor_skips : lock-contention skip counter
+    """
+
+    def __init__(self) -> None:
+        self.last_vix_spike_check_time: Optional[datetime] = None
+        self.last_spot_check_time:      Optional[datetime] = None
+        self.first_tick_fired:          bool = False
+        self.consecutive_quote_fail_ticks: int  = 0
+        self.quote_fail_alerted:        bool = False
+        self.consecutive_monitor_skips: int  = 0
+
+    def reset_entry(self) -> None:
+        """Reset counters at new position entry."""
+        self.first_tick_fired          = False
+        self.consecutive_quote_fail_ticks = 0
+        self.quote_fail_alerted        = False
+
+
+# Module-level singleton
+_monitor_state = MonitorState()
+
+# RLock exposed as a module-level variable for backward-compatible direct import.
+# Reentrant so close_all() → close_one_leg() is safe.
+_monitor_lock: threading.RLock = threading.RLock()
+
+# ── Backward-compatible aliases for code that accesses _shared.xxx directly ──
+# These are properties bridged to the MonitorState singleton so that existing
+# code like `_shared._last_vix_spike_check_time = now` continues to work.
+# We use module-level attribute access via __getattr__/__setattr__ overrides
+# defined at the bottom of this file.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -204,3 +251,33 @@ def sl_level(leg: str) -> float:
 
     # 3. Fixed SL (time-graduated when DYNAMIC_SL_ENABLED)
     return round(entry * (1.0 + _dynamic_sl_percent() / 100.0), 2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Module __getattr__ / __setattr__ — backward-compatible attribute bridging
+#
+#  Other modules access monitor state via:
+#    _shared._last_vix_spike_check_time = now
+#    _shared._first_tick_fired = True
+#    _shared._consecutive_quote_fail_ticks += 1
+#    etc.
+#
+#  These are bridged to _monitor_state attributes so the MonitorState class
+#  owns the data while existing code works without modification.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_MONITOR_STATE_ALIASES = {
+    "_last_vix_spike_check_time":    "last_vix_spike_check_time",
+    "_last_spot_check_time":         "last_spot_check_time",
+    "_first_tick_fired":             "first_tick_fired",
+    "_consecutive_quote_fail_ticks": "consecutive_quote_fail_ticks",
+    "_quote_fail_alerted":           "quote_fail_alerted",
+    "_consecutive_monitor_skips":    "consecutive_monitor_skips",
+}
+
+
+def __getattr__(name: str):
+    """Module-level __getattr__ for backward-compatible monitor state access."""
+    if name in _MONITOR_STATE_ALIASES:
+        return getattr(_monitor_state, _MONITOR_STATE_ALIASES[name])
+    raise AttributeError(f"module 'src._shared' has no attribute {name!r}")

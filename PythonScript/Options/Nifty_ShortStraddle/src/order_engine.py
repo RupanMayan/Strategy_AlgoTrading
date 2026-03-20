@@ -174,9 +174,9 @@ class OrderEngine:
             return False
 
         # ── Populate state — BOTH legs now active ─────────────────────────────
-        _shared._first_tick_fired             = False
-        _shared._consecutive_quote_fail_ticks = 0
-        _shared._quote_fail_alerted           = False
+        _shared._monitor_state.first_tick_fired             = False
+        _shared._monitor_state.consecutive_quote_fail_ticks = 0
+        _shared._monitor_state.quote_fail_alerted           = False
 
         now_dt = now_ist()
         state["in_position"]        = True
@@ -593,7 +593,7 @@ class OrderEngine:
                 ce_px      = state["entry_price_ce"]
                 pe_px      = state["entry_price_pe"]
                 no_tick_yet = (
-                    not _shared._first_tick_fired
+                    not _shared._monitor_state.first_tick_fired
                     and ce_px > 0
                     and pe_px > 0
                 )

@@ -79,6 +79,7 @@ import pytz
 from util.logger import debug, error, info, warn
 
 __all__ = [
+    "StateManager",
     "INITIAL_STATE",
     "state",
     "save_state",
@@ -106,76 +107,45 @@ _IST = pytz.timezone("Asia/Kolkata")
 
 INITIAL_STATE: dict[str, Any] = {
     # ── Position flags ────────────────────────────────────────────────────────
-    # in_position: True if ANY leg is still open (CE or PE or both)
-    # ce_active / pe_active: True = leg is currently open at the broker
     "in_position"         : False,
-
-    "ce_active"           : False,   # True = CE sell position exists at broker
-    "pe_active"           : False,   # True = PE sell position exists at broker
+    "ce_active"           : False,
+    "pe_active"           : False,
 
     # ── Leg symbols ───────────────────────────────────────────────────────────
-    # Resolved by OpenAlgo from ATM strike + expiry at entry time.
-    # Format: "NIFTY25MAR2623000CE", "NIFTY25MAR2623000PE"
     "symbol_ce"           : "",
     "symbol_pe"           : "",
 
     # ── Order IDs ─────────────────────────────────────────────────────────────
-    # Returned by place_order() — used by orderstatus() to fetch fill prices.
     "orderid_ce"          : "",
     "orderid_pe"          : "",
 
     # ── Entry fill prices — basis of ALL SL calculations ─────────────────────
-    # Fetched via orderstatus() after entry (not the requested price).
-    # Fixed permanently at entry — SL level = entry_price × (1 + SL%/100).
-    # 0.0 = fill not yet captured (crash guard: SL skipped when entry=0).
     "entry_price_ce"      : 0.0,
     "entry_price_pe"      : 0.0,
 
     # ── Exit fill prices — recorded by close_one_leg() for trade log ──────────
-    # Actual broker average fill if orderstatus() available; else trigger LTP.
     "exit_price_ce"       : 0.0,
     "exit_price_pe"       : 0.0,
 
     # ── Realised P&L from legs already closed this session ───────────────────
-    # closed_pnl += (entry_price - exit_price) × qty  when a leg closes.
-    # combined_pnl = closed_pnl + open_leg(s)_mtm  — used for target/limit.
     "closed_pnl"          : 0.0,
 
     # ── Trailing SL state (per leg — independent) ─────────────────────────────
-    # trailing_active_*: True once LTP has fallen through the trigger threshold.
-    # trailing_sl_*:     The current trailing SL price; only moves down.
-    # Persisted so a crash/restart resumes trailing exactly where it stopped.
     "trailing_active_ce"  : False,
     "trailing_active_pe"  : False,
     "trailing_sl_ce"      : 0.0,
     "trailing_sl_pe"      : 0.0,
 
     # ── Breakeven SL state (per leg — set after partial exit at a loss) ───────
-    # breakeven_active_*: True once the surviving leg's SL has been tightened
-    #   to the breakeven price (i.e. the price where total combined P&L = 0).
-    # breakeven_sl_*:     The computed breakeven buyback price for the leg.
-    # Only activated when closed_pnl < 0 (first leg closed at a loss).
     "breakeven_active_ce" : False,
     "breakeven_active_pe" : False,
     "breakeven_sl_ce"     : 0.0,
     "breakeven_sl_pe"     : 0.0,
 
     # ── Opening range reference price ─────────────────────────────────────────
-    # NIFTY spot captured by job_orb_capture() at ORB_CAPTURE_TIME (09:17 IST).
-    # Used by orb_filter_ok() to measure how much NIFTY has moved at entry time.
-    # Reset between trades; rewritten fresh each trading day by the ORB job.
     "orb_price"           : 0.0,
 
     # ── Market context captured at entry ─────────────────────────────────────
-    # underlying_ltp: NIFTY spot at the moment of straddle entry.
-    #   Also serves as the spot_at_entry reference for spot_move_exit guard.
-    # vix_at_entry:   India VIX at entry — baseline for VIX spike monitor.
-    # ivr_at_entry:   IV Rank at entry (0–100); logged and Telegram'd.
-    # ivp_at_entry:   IV Percentile at entry (0–100); logged and Telegram'd.
-    # entry_time:     tz-aware datetime (IST) set at entry; serialised to ISO
-    #                 string in JSON, restored to datetime on load.
-    # entry_date:     YYYY-MM-DD string; used for stale-state detection on restart
-    #                 (if saved_date != today_ist → MIS auto sq-off assumed).
     "underlying_ltp"      : 0.0,
     "vix_at_entry"        : 0.0,
     "ivr_at_entry"        : 0.0,
@@ -184,285 +154,242 @@ INITIAL_STATE: dict[str, Any] = {
     "entry_date"          : None,   # "YYYY-MM-DD"   | None
 
     # ── Margin info captured at entry ─────────────────────────────────────────
-    # Stored for logging and Telegram only — not used in trade logic.
-    "margin_required"     : 0.0,   # SPAN + Exposure margin from margin guard
-    "margin_available"    : 0.0,   # cash + collateral from funds() call
+    "margin_required"     : 0.0,
+    "margin_available"    : 0.0,
 
     # ── Running P&L (updated every monitor cycle) ─────────────────────────────
-    # today_pnl = closed_pnl + current open leg(s) MTM.
-    # Checked against DAILY_PROFIT_TARGET and DAILY_LOSS_LIMIT each monitor tick.
     "today_pnl"           : 0.0,
 
     # ── Session statistics ─────────────────────────────────────────────────────
-    # trade_count: incremented at each entry (0 → 1 on first entry, etc.).
-    # exit_reason: human-readable description of HOW the position was closed;
-    #   e.g. "CE SL Hit", "Daily Target", "Hard Exit 15:15", "VIX Spike Exit".
     "trade_count"         : 0,
     "exit_reason"         : "",
 }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Module-level state singleton
-#
-#  This is the SINGLE live copy of the state dict shared across all modules.
-#  All modules must import it by reference, not by value:
-#
-#    from util.state import state          # ← import the reference (correct)
-#    state["ce_active"] = True             # ← mutates the shared object
-#
-#  NEVER do: local_state = dict(state)    # this creates a disconnected copy
-#            local_state["ce_active"] = True   # not visible to other modules
+#  StateManager — encapsulates live state dict and persistence operations
 # ═══════════════════════════════════════════════════════════════════════════════
 
-state: dict[str, Any] = dict(INITIAL_STATE)
+class StateManager:
+    """
+    Manages the in-memory strategy state dict and its crash-safe JSON persistence.
+
+    The live state dict is a plain dict accessible via the `data` property (and
+    also exposed as the module-level `state` variable for backward compatibility).
+    All modules share the same dict object — mutations are visible immediately.
+    """
+
+    def __init__(self, initial: dict[str, Any] | None = None) -> None:
+        self._state: dict[str, Any] = dict(initial or INITIAL_STATE)
+
+    @property
+    def data(self) -> dict[str, Any]:
+        """The live state dict. Mutate in place; all references stay in sync."""
+        return self._state
+
+    def reset(self) -> None:
+        """
+        Reset all state fields to their initial (blank) values.
+
+        Uses dict.clear() + dict.update() to mutate the existing object IN PLACE
+        so all modules that imported `state` by reference continue to see the
+        reset values.
+        """
+        self._state.clear()
+        self._state.update(INITIAL_STATE)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  Path resolution
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _resolve_path(state_path: Optional[str | Path]) -> Path:
+        """
+        Resolve the state file path.
+        - If state_path is given, use it (useful for tests with a custom tmp path).
+        - If None, fall back to cfg.STATE_FILE from the config singleton.
+        - If cfg is also None (config.toml not found), fall back to a local default.
+        """
+        if state_path is not None:
+            return Path(state_path)
+
+        try:
+            from util.config_util import cfg  # noqa: PLC0415
+            if cfg is not None:
+                return Path(cfg.STATE_FILE)
+        except ImportError:
+            pass
+
+        # Last-resort fallback — should never reach here in production
+        return Path("strategy_state.json")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  save() — atomic crash-safe write
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def save(self, state_path: Optional[str | Path] = None) -> None:
+        """
+        Atomically write the current in-memory state dict to a JSON file.
+
+        Write strategy:
+            1. Shallow-copy the live state dict.
+            2. Serialize `entry_time` (datetime → ISO string) so json.dump() succeeds.
+            3. Write to a temp file in the SAME directory as the state file.
+            4. os.replace(temp → state_file) — atomic on both POSIX and Windows NTFS.
+            5. On any error: clean up the temp file and log a WARNING (never raises).
+
+        Parameters
+        ----------
+        state_path : str or Path, optional
+            Path to write to. Defaults to cfg.STATE_FILE.
+        """
+        path = self._resolve_path(state_path)
+
+        try:
+            payload: dict[str, Any] = dict(self._state)
+
+            # ── Serialize datetime objects to ISO strings for JSON ─────────────
+            if isinstance(payload.get("entry_time"), datetime):
+                payload["entry_time"] = payload["entry_time"].isoformat()
+
+            # ── Ensure parent directory exists ────────────────────────────────
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            # ── Atomic write: temp → rename ───────────────────────────────────
+            fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".state.tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                os.replace(tmp_path, path)
+
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+
+            debug(f"State saved → {path}")
+
+        except Exception as exc:
+            warn(f"State save failed: {exc}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  load() — read + type restoration
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def load(self, state_path: Optional[str | Path] = None) -> dict[str, Any]:
+        """
+        Load the persisted state dict from a JSON file.
+
+        Returns:
+            - The loaded dict with entry_time restored to a tz-aware IST datetime,
+              if the file exists and is valid JSON.
+            - An empty dict {} if the file is missing (fresh start).
+            - An empty dict {} if the file is corrupt (logs a warning).
+
+        Parameters
+        ----------
+        state_path : str or Path, optional
+            Path to read from. Defaults to cfg.STATE_FILE.
+        """
+        path = self._resolve_path(state_path)
+
+        if not path.exists():
+            info(f"No state file at {path} — fresh start")
+            return {}
+
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded: dict[str, Any] = json.load(f)
+
+        except json.JSONDecodeError as exc:
+            warn(f"State file is corrupt (JSON error: {exc}) — starting fresh")
+            return {}
+        except OSError as exc:
+            warn(f"State file read error: {exc} — starting fresh")
+            return {}
+
+        # ── Restore entry_time: ISO string → tz-aware IST datetime ───────────
+        raw_entry_time = loaded.get("entry_time")
+        if isinstance(raw_entry_time, str):
+            try:
+                parsed = datetime.fromisoformat(raw_entry_time)
+                if parsed.tzinfo is None:
+                    loaded["entry_time"] = _IST.localize(parsed)
+                else:
+                    loaded["entry_time"] = parsed.astimezone(_IST)
+            except (ValueError, OverflowError) as exc:
+                warn(
+                    f"entry_time in state file could not be parsed ('{raw_entry_time}'): {exc} "
+                    "— defaulting to current IST time"
+                )
+                loaded["entry_time"] = datetime.now(_IST)
+
+        info(f"State file loaded: {path}")
+        return loaded
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  clear_file() — remove the persisted state file
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def clear_file(self, state_path: Optional[str | Path] = None) -> None:
+        """
+        Delete the state file from disk.
+
+        Called ONLY after the position is confirmed FULLY FLAT (both legs closed).
+
+        Parameters
+        ----------
+        state_path : str or Path, optional
+            Path to delete. Defaults to cfg.STATE_FILE.
+        """
+        path = self._resolve_path(state_path)
+
+        try:
+            if path.exists():
+                path.unlink()
+                info(f"State file cleared: {path}")
+            else:
+                debug(f"State file already absent: {path}")
+        except OSError as exc:
+            warn(f"State file remove failed: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  reset_state() — wipe live state back to blank without replacing the object
+#  Module-level singleton + backward-compatible API
 # ═══════════════════════════════════════════════════════════════════════════════
+
+_state_manager = StateManager()
+
+# The SINGLE live copy of the state dict shared across all modules.
+# All modules must import it by reference, not by value:
+#   from util.state import state          # ← import the reference (correct)
+#   state["ce_active"] = True             # ← mutates the shared object
+state: dict[str, Any] = _state_manager.data
+
 
 def reset_state() -> None:
-    """
-    Reset all state fields to their initial (blank) values.
+    """Backward-compatible wrapper — delegates to the singleton."""
+    _state_manager.reset()
 
-    Uses dict.update() to mutate the existing object IN PLACE so all modules
-    that imported `state` by reference continue to see the reset values.
-    Called after a position is fully closed (both legs flat) to prepare for the
-    next potential entry.
-
-    WHY NOT `state = dict(INITIAL_STATE)`:
-      Rebinding the module-level name creates a NEW dict object. Any other module
-      that already did `from util.state import state` would still hold a reference
-      to the OLD dict — the reset would be invisible to them.
-      Using `state.clear(); state.update(INITIAL_STATE)` guarantees all references
-      remain valid.
-    """
-    state.clear()
-    state.update(INITIAL_STATE)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  _resolve_state_path() — internal helper
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _resolve_state_path(state_path: Optional[str | Path]) -> Path:
-    """
-    Resolve the state file path.
-    - If state_path is given, use it (useful for tests with a custom tmp path).
-    - If None, fall back to cfg.STATE_FILE from the config singleton.
-    - If cfg is also None (config.toml not found), fall back to a local default.
-    """
-    if state_path is not None:
-        return Path(state_path)
-
-    try:
-        from util.config_util import cfg  # noqa: PLC0415
-        if cfg is not None:
-            return Path(cfg.STATE_FILE)
-    except ImportError:
-        pass
-
-    # Last-resort fallback — should never reach here in production
-    return Path("strategy_state.json")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  save_state() — atomic crash-safe write
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def save_state(state_path: Optional[str | Path] = None) -> None:
-    """
-    Atomically write the current in-memory state dict to a JSON file.
+    """Backward-compatible wrapper — delegates to the singleton."""
+    _state_manager.save(state_path)
 
-    Write strategy:
-        1. Shallow-copy the live state dict.
-        2. Serialize `entry_time` (datetime → ISO string) so json.dump() succeeds.
-        3. Write to a temp file in the SAME directory as the state file
-           (same filesystem → rename is atomic even on network mounts).
-        4. os.replace(temp → state_file) — atomic on both POSIX and Windows NTFS.
-        5. On any error: clean up the temp file and log a WARNING (never raises).
-
-    WHY atomic write:
-        A direct json.dump(path) would leave a partially-written file on crash or
-        SIGKILL. The next restart would read a corrupt state, unable to tell whether
-        a live position exists — potentially leading to a naked position with no SL.
-        The temp-rename pattern guarantees the state file is ALWAYS either the
-        previous complete version or the new complete version, never in-between.
-
-    Parameters
-    ----------
-    state_path : str or Path, optional
-        Path to write to. Defaults to cfg.STATE_FILE.
-
-    Notes
-    -----
-    This function is intentionally non-raising: a state save failure is a WARNING,
-    not a CRITICAL. The in-memory state is still authoritative for the current
-    session. However, persistent failures should be investigated — on the next
-    restart the state cannot be recovered.
-    """
-    path = _resolve_state_path(state_path)
-
-    try:
-        # Shallow copy — we mutate `payload` (entry_time key) without touching
-        # the live state dict.
-        payload: dict[str, Any] = dict(state)
-
-        # ── Serialize datetime objects to ISO strings for JSON ─────────────────
-        # `entry_time` is a tz-aware datetime at runtime but JSON has no datetime
-        # type. We serialise to ISO 8601 and restore in load_state().
-        if isinstance(payload.get("entry_time"), datetime):
-            payload["entry_time"] = payload["entry_time"].isoformat()
-
-        # ── Ensure parent directory exists ────────────────────────────────────
-        # Parent is validated at startup by config_util, but the user may have
-        # deleted the directory mid-session. mkdir(exist_ok=True) is safe.
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        # ── Atomic write: temp → rename ───────────────────────────────────────
-        # mkstemp() creates the temp file in the SAME directory so that the
-        # os.replace() rename stays on the same filesystem (required for atomicity).
-        fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".state.tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())   # Flush OS buffers → guarantee data on disk
-
-            # os.replace() is atomic on POSIX (rename syscall) and on Windows NTFS.
-            os.replace(tmp_path, path)
-
-        except Exception:
-            # Clean up the temp file — leave the existing state file intact.
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-
-        debug(f"State saved → {path}")
-
-    except Exception as exc:
-        warn(f"State save failed: {exc}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  load_state() — read + type restoration
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def load_state(state_path: Optional[str | Path] = None) -> dict[str, Any]:
-    """
-    Load the persisted state dict from a JSON file.
+    """Backward-compatible wrapper — delegates to the singleton."""
+    return _state_manager.load(state_path)
 
-    Returns:
-        - The loaded dict with entry_time restored to a tz-aware IST datetime,
-          if the file exists and is valid JSON.
-        - An empty dict {} if the file is missing (fresh start).
-        - An empty dict {} if the file is corrupt (logs a warning).
-
-    Callers must merge the loaded dict into the live state themselves:
-        saved = load_state()
-        if saved:
-            state.update(saved)
-
-    WHY return {} instead of INITIAL_STATE on missing/corrupt:
-        An empty return lets the caller distinguish "file not found" from
-        "file loaded successfully" without checking a boolean flag.
-        strategy_core reconcile_on_startup() specifically checks `if saved`
-        to decide whether a prior session needs to be restored.
-
-    Parameters
-    ----------
-    state_path : str or Path, optional
-        Path to read from. Defaults to cfg.STATE_FILE.
-
-    Notes
-    -----
-    entry_time deserialization:
-        JSON stores entry_time as an ISO 8601 string. This function parses it
-        back to a tz-aware datetime in IST. The reconcile logic in strategy_core
-        can then directly compare entry_time against datetime.now(IST).
-
-        If the ISO string has timezone info → converted to IST via astimezone().
-        If the ISO string is naive (old format) → localized to IST via IST.localize().
-        If parsing fails (malformed) → entry_time is set to now_ist() as a safe
-        fallback and a warning is logged.
-    """
-    path = _resolve_state_path(state_path)
-
-    if not path.exists():
-        info(f"No state file at {path} — fresh start")
-        return {}
-
-    try:
-        with open(path, encoding="utf-8") as f:
-            loaded: dict[str, Any] = json.load(f)
-
-    except json.JSONDecodeError as exc:
-        warn(f"State file is corrupt (JSON error: {exc}) — starting fresh")
-        return {}
-    except OSError as exc:
-        warn(f"State file read error: {exc} — starting fresh")
-        return {}
-
-    # ── Restore entry_time: ISO string → tz-aware IST datetime ───────────────
-    raw_entry_time = loaded.get("entry_time")
-    if isinstance(raw_entry_time, str):
-        try:
-            parsed = datetime.fromisoformat(raw_entry_time)
-            if parsed.tzinfo is None:
-                # Naive datetime (saved before IST-awareness fix) → localize to IST
-                loaded["entry_time"] = _IST.localize(parsed)
-            else:
-                # Tz-aware → convert to IST (handles UTC-stored datetimes from VPS)
-                loaded["entry_time"] = parsed.astimezone(_IST)
-        except (ValueError, OverflowError) as exc:
-            warn(
-                f"entry_time in state file could not be parsed ('{raw_entry_time}'): {exc} "
-                "— defaulting to current IST time"
-            )
-            loaded["entry_time"] = datetime.now(_IST)
-
-    info(f"State file loaded: {path}")
-    return loaded
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  clear_state_file() — remove the persisted state file
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def clear_state_file(state_path: Optional[str | Path] = None) -> None:
-    """
-    Delete the state file from disk.
-
-    Called ONLY after the position is confirmed FULLY FLAT (both legs closed).
-    Never called while a position is open — that would prevent recovery on restart.
-
-    On restart with no state file, reconcile_on_startup() starts fresh (Case A).
-    On restart WITH a state file, it attempts to restore the position (Case B/C/D).
-
-    Parameters
-    ----------
-    state_path : str or Path, optional
-        Path to delete. Defaults to cfg.STATE_FILE.
-
-    Notes
-    -----
-    Non-raising: if the file was already deleted (e.g., by a concurrent process
-    or manual operator intervention), the function logs a debug message and
-    returns without error.
-    """
-    path = _resolve_state_path(state_path)
-
-    try:
-        if path.exists():
-            path.unlink()
-            info(f"State file cleared: {path}")
-        else:
-            debug(f"State file already absent: {path}")
-    except OSError as exc:
-        warn(f"State file remove failed: {exc}")
+    """Backward-compatible wrapper — delegates to the singleton."""
+    _state_manager.clear_file(state_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -482,7 +409,7 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     do_roundtrip = "--roundtrip" in args
     path_args    = [a for a in args if not a.startswith("--")]
-    _state_path  = Path(path_args[0]) if path_args else _resolve_state_path(None)
+    _state_path  = Path(path_args[0]) if path_args else StateManager._resolve_path(None)
 
     print("─" * 72)
     print("  STATE MODULE SELF-TEST")
