@@ -492,17 +492,33 @@ class OrderEngine:
                 and other_entry_px > 0
                 and state["closed_pnl"] < 0
             ):
-                be_price = round(other_entry_px + state["closed_pnl"] / qty(), 2)
+                # Mathematical breakeven price (net P&L = 0 when surviving leg exits here)
+                raw_be_price = round(other_entry_px + state["closed_pnl"] / qty(), 2)
+                # Apply buffer: raise the breakeven SL so it doesn't fire at the exact
+                # breakeven — give the surviving leg breathing room to profit.
+                be_price = round(raw_be_price * (1.0 + cfg.BREAKEVEN_BUFFER_PCT / 100.0), 2)
                 if 0 < be_price < other_entry_px:
                     other_lower = other_leg.lower()
-                    state[f"breakeven_active_{other_lower}"] = True
-                    state[f"breakeven_sl_{other_lower}"]     = be_price
+                    state[f"breakeven_active_{other_lower}"]       = True
+                    state[f"breakeven_sl_{other_lower}"]           = be_price
+                    state[f"breakeven_activated_at_{other_lower}"] = now_ist().isoformat()
                     be_activated = True
+                    if cfg.BREAKEVEN_GRACE_PERIOD_MIN > 0:
+                        from datetime import timedelta
+                        arm_time = now_ist() + timedelta(minutes=cfg.BREAKEVEN_GRACE_PERIOD_MIN)
+                        grace_str = (
+                            f"  Grace period : {cfg.BREAKEVEN_GRACE_PERIOD_MIN} min "
+                            f"(SL arms at ~{arm_time.strftime('%H:%M:%S')} IST)"
+                        )
+                    else:
+                        grace_str = "  Grace period : NONE (armed immediately)"
                     info(
                         f"  BREAKEVEN SL activated for {other_leg}: "
                         f"Rs.{be_price:.2f}  "
-                        f"(position breaks even when {other_leg} exits at ≤ Rs.{be_price:.2f})"
+                        f"(raw breakeven Rs.{raw_be_price:.2f} + "
+                        f"{cfg.BREAKEVEN_BUFFER_PCT}% buffer)"
                     )
+                    info(grace_str)
 
             other_sl = sl_level(other_leg)
             state["in_position"] = True
@@ -796,39 +812,50 @@ class OrderEngine:
 
         self._append_trade_log(reason, final_pnl, exit_dt)
 
+        # ── Store last-trade info for re-entry logic BEFORE resetting ─────────
+        state["last_close_time"]     = exit_dt.isoformat()
+        state["last_trade_pnl"]      = final_pnl
+        # Increment reentry counter only if this is a re-entry (trade_count > 0 for current day)
+        today_str = exit_dt.strftime("%Y-%m-%d")
+        if state.get("entry_date") == today_str:
+            state["reentry_count_today"] = state.get("reentry_count_today", 0)
+        # (reentry_count_today is incremented by strategy_core on re-entry, not here)
+
         # Reset ALL position-related state
-        state["in_position"]         = False
-        state["ce_active"]           = False
-        state["pe_active"]           = False
-        state["symbol_ce"]           = ""
-        state["symbol_pe"]           = ""
-        state["orderid_ce"]          = ""
-        state["orderid_pe"]          = ""
-        state["entry_price_ce"]      = 0.0
-        state["entry_price_pe"]      = 0.0
-        state["exit_price_ce"]       = 0.0
-        state["exit_price_pe"]       = 0.0
-        state["closed_pnl"]          = 0.0
-        state["today_pnl"]           = 0.0   # FIX-10
-        state["underlying_ltp"]      = 0.0
-        state["vix_at_entry"]        = 0.0
-        state["ivr_at_entry"]        = 0.0
-        state["ivp_at_entry"]        = 0.0
-        state["trailing_active_ce"]  = False
-        state["trailing_active_pe"]  = False
-        state["trailing_sl_ce"]      = 0.0
-        state["trailing_sl_pe"]      = 0.0
-        state["breakeven_active_ce"] = False
-        state["breakeven_active_pe"] = False
-        state["breakeven_sl_ce"]     = 0.0
-        state["breakeven_sl_pe"]     = 0.0
-        state["orb_price"]           = 0.0
-        state["entry_time"]          = None
-        state["entry_date"]          = None
-        state["margin_required"]     = 0.0
-        state["margin_available"]    = 0.0
-        state["exit_reason"]         = reason
-        state["trade_count"]        += 1
+        state["in_position"]              = False
+        state["ce_active"]                = False
+        state["pe_active"]                = False
+        state["symbol_ce"]                = ""
+        state["symbol_pe"]                = ""
+        state["orderid_ce"]               = ""
+        state["orderid_pe"]               = ""
+        state["entry_price_ce"]           = 0.0
+        state["entry_price_pe"]           = 0.0
+        state["exit_price_ce"]            = 0.0
+        state["exit_price_pe"]            = 0.0
+        state["closed_pnl"]               = 0.0
+        state["today_pnl"]                = 0.0   # FIX-10
+        state["underlying_ltp"]           = 0.0
+        state["vix_at_entry"]             = 0.0
+        state["ivr_at_entry"]             = 0.0
+        state["ivp_at_entry"]             = 0.0
+        state["trailing_active_ce"]       = False
+        state["trailing_active_pe"]       = False
+        state["trailing_sl_ce"]           = 0.0
+        state["trailing_sl_pe"]           = 0.0
+        state["breakeven_active_ce"]      = False
+        state["breakeven_active_pe"]      = False
+        state["breakeven_sl_ce"]          = 0.0
+        state["breakeven_sl_pe"]          = 0.0
+        state["breakeven_activated_at_ce"] = None
+        state["breakeven_activated_at_pe"] = None
+        state["orb_price"]                = 0.0
+        state["entry_time"]               = None
+        state["entry_date"]               = None
+        state["margin_required"]          = 0.0
+        state["margin_available"]         = 0.0
+        state["exit_reason"]              = reason
+        state["trade_count"]             += 1
 
         clear_state_file()
 

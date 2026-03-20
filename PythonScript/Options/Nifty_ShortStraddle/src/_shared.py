@@ -43,7 +43,7 @@ telegram = notify
 #  Change user-facing settings in config.toml only.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VERSION     = "5.9.0"
+VERSION     = "6.0.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -200,23 +200,44 @@ def active_legs() -> list[str]:
     return result
 
 
+def _base_sl_percent() -> float:
+    """
+    Return the base per-leg SL % — DTE-aware if configured.
+
+    Priority:
+      1. DTE_SL_OVERRIDE[current_dte] — if an override exists for today's DTE
+      2. LEG_SL_PERCENT              — default base SL
+
+    This is the "morning" SL that dynamic time-of-day tightening acts on.
+    """
+    if cfg.DTE_SL_OVERRIDE:
+        dte = state.get("current_dte")
+        if dte is not None and dte in cfg.DTE_SL_OVERRIDE:
+            return cfg.DTE_SL_OVERRIDE[dte]
+    return cfg.LEG_SL_PERCENT
+
+
 def _dynamic_sl_percent() -> float:
     """
-    Return the effective per-leg SL % based on current time.
+    Return the effective per-leg SL % based on DTE + current time.
 
-    When DYNAMIC_SL_ENABLED = True, DYNAMIC_SL_SCHEDULE is evaluated in
-    descending time order — the first entry whose threshold <= current HH:MM
-    wins.  Falls back to LEG_SL_PERCENT if no entry matches.
+    Evaluation order:
+      1. Base SL = _base_sl_percent() (DTE-override or LEG_SL_PERCENT)
+      2. If DYNAMIC_SL_ENABLED, time-of-day schedule can TIGHTEN below base.
+         Each schedule entry's sl_pct is used as-is (not relative to base).
+         Only entries with sl_pct < base are effective tightenings.
 
-    When DYNAMIC_SL_ENABLED = False, LEG_SL_PERCENT is always returned.
+    When DYNAMIC_SL_ENABLED = False, _base_sl_percent() is returned.
     """
+    base = _base_sl_percent()
     if not cfg.DYNAMIC_SL_ENABLED:
-        return cfg.LEG_SL_PERCENT
+        return base
     now_hm = now_ist().strftime("%H:%M")
     for threshold, sl_pct in cfg.DYNAMIC_SL_SCHEDULE:
         if now_hm >= threshold:
-            return sl_pct
-    return cfg.LEG_SL_PERCENT
+            # Only tighten — never widen beyond the base
+            return min(sl_pct, base)
+    return base
 
 
 def sl_level(leg: str) -> float:
@@ -226,6 +247,7 @@ def sl_level(leg: str) -> float:
     Priority (highest → lowest):
       1. Trailing SL  — if TRAILING_SL_ENABLED and activated for this leg
       2. Breakeven SL — if BREAKEVEN_AFTER_PARTIAL_ENABLED and activated,
+                        AND grace period has elapsed,
                         and the breakeven price is TIGHTER than fixed SL
       3. Fixed SL     — entry_price × (1 + _dynamic_sl_percent() / 100)
 
@@ -242,14 +264,35 @@ def sl_level(leg: str) -> float:
         if trail_sl > 0:
             return trail_sl
 
-    # 2. Breakeven SL — only when it is tighter (lower) than fixed SL
+    # 2. Breakeven SL — only when tighter than fixed SL AND grace period has elapsed
     if cfg.BREAKEVEN_AFTER_PARTIAL_ENABLED and state.get(f"breakeven_active_{leg_lower}", False):
         be_sl    = state.get(f"breakeven_sl_{leg_lower}", 0.0)
         fixed_sl = round(entry * (1.0 + _dynamic_sl_percent() / 100.0), 2)
         if be_sl > 0 and be_sl < fixed_sl:
-            return be_sl
+            # ── Grace period gate ────────────────────────────────────
+            # Only apply the breakeven SL after BREAKEVEN_GRACE_PERIOD_MIN
+            # minutes have passed since it was activated. During the grace
+            # window, the normal fixed/dynamic SL protects the leg, giving
+            # it time to decay and reach the breakeven level organically.
+            be_activated_at = state.get(f"breakeven_activated_at_{leg_lower}")
+            if be_activated_at and cfg.BREAKEVEN_GRACE_PERIOD_MIN > 0:
+                try:
+                    if isinstance(be_activated_at, str):
+                        be_activated_at = datetime.fromisoformat(be_activated_at)
+                    if be_activated_at.tzinfo is None:
+                        be_activated_at = IST.localize(be_activated_at)
+                    elapsed_min = (now_ist() - be_activated_at).total_seconds() / 60.0
+                    if elapsed_min < cfg.BREAKEVEN_GRACE_PERIOD_MIN:
+                        # Grace period still active — fall through to fixed SL
+                        pass
+                    else:
+                        return be_sl  # Grace period elapsed — breakeven SL active
+                except Exception:
+                    return be_sl  # Parse error — fail-safe to breakeven
+            else:
+                return be_sl  # No grace period or no timestamp — apply immediately
 
-    # 3. Fixed SL (time-graduated when DYNAMIC_SL_ENABLED)
+    # 3. Fixed SL (time-graduated when DYNAMIC_SL_ENABLED, DTE-aware via _base_sl_percent)
     return round(entry * (1.0 + _dynamic_sl_percent() / 100.0), 2)
 
 

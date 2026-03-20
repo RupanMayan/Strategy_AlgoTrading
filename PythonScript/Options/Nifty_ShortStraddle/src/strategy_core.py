@@ -187,6 +187,56 @@ class StrategyCore:
                     f"(expected DDMMMYY e.g. 25MAR26)"
                 )
 
+        # ── DTE SL Override ───────────────────────────────────────────────────
+        if cfg.DTE_SL_OVERRIDE:
+            for dte_key, sl_pct in cfg.DTE_SL_OVERRIDE.items():
+                if sl_pct <= 0:
+                    errors.append(
+                        f"DTE_SL_OVERRIDE[DTE{dte_key}] sl_pct must be > 0, "
+                        f"got {sl_pct}"
+                    )
+                if dte_key not in cfg.TRADE_DTE:
+                    warn(
+                        f"CONFIG NOTE: DTE_SL_OVERRIDE has DTE{dte_key} but "
+                        f"TRADE_DTE does not include {dte_key} — override is harmless but unused"
+                    )
+
+        # ── Breakeven SL grace/buffer ────────────────────────────────────────
+        if cfg.BREAKEVEN_AFTER_PARTIAL_ENABLED:
+            if cfg.BREAKEVEN_GRACE_PERIOD_MIN < 0:
+                errors.append(
+                    f"BREAKEVEN_GRACE_PERIOD_MIN must be >= 0, "
+                    f"got {cfg.BREAKEVEN_GRACE_PERIOD_MIN}"
+                )
+            if cfg.BREAKEVEN_BUFFER_PCT < 0:
+                errors.append(
+                    f"BREAKEVEN_BUFFER_PCT must be >= 0, "
+                    f"got {cfg.BREAKEVEN_BUFFER_PCT}"
+                )
+            if cfg.BREAKEVEN_GRACE_PERIOD_MIN == 0 and cfg.BREAKEVEN_BUFFER_PCT == 0:
+                warn(
+                    "CONFIG WARNING: Both BREAKEVEN_GRACE_PERIOD_MIN=0 and "
+                    "BREAKEVEN_BUFFER_PCT=0. Breakeven SL may fire instantly "
+                    "after partial close — consider setting grace >= 3 min or "
+                    "buffer >= 5%."
+                )
+
+        # ── Re-entry ─────────────────────────────────────────────────────────
+        if cfg.REENTRY_ENABLED:
+            if cfg.REENTRY_COOLDOWN_MIN <= 0:
+                errors.append(
+                    f"REENTRY_COOLDOWN_MIN must be > 0, got {cfg.REENTRY_COOLDOWN_MIN}"
+                )
+            if cfg.REENTRY_MAX_LOSS_FOR_REENTRY <= 0:
+                errors.append(
+                    f"REENTRY_MAX_LOSS_FOR_REENTRY must be > 0, "
+                    f"got {cfg.REENTRY_MAX_LOSS_FOR_REENTRY}"
+                )
+            if cfg.REENTRY_MAX_PER_DAY <= 0:
+                errors.append(
+                    f"REENTRY_MAX_PER_DAY must be > 0, got {cfg.REENTRY_MAX_PER_DAY}"
+                )
+
         # ── Trailing SL ───────────────────────────────────────────────────────
         if cfg.TRAILING_SL_ENABLED:
             if not (0.0 < cfg.TRAIL_TRIGGER_PCT < 100.0):
@@ -604,6 +654,24 @@ class StrategyCore:
         print(f"  DTE method    : TRADING days (AlgoTest-compatible, weekends excluded).", flush=True)
         print(f"  DTE filter    : trades ONLY on {dte_str} of weekly expiry cycle.", flush=True)
         print(f"  Margin guard  : funds() + margin() checked before every entry.", flush=True)
+        if cfg.DTE_SL_OVERRIDE:
+            dte_sl_str = "  |  ".join(
+                f"DTE{d}={sl:.0f}%" for d, sl in sorted(cfg.DTE_SL_OVERRIDE.items())
+            )
+            print(f"  DTE SL override: {dte_sl_str}  (others use {cfg.LEG_SL_PERCENT}%)", flush=True)
+        if cfg.BREAKEVEN_AFTER_PARTIAL_ENABLED:
+            print(
+                f"  Breakeven SL   : grace={cfg.BREAKEVEN_GRACE_PERIOD_MIN}min  "
+                f"buffer={cfg.BREAKEVEN_BUFFER_PCT}%",
+                flush=True,
+            )
+        if cfg.REENTRY_ENABLED:
+            print(
+                f"  Re-entry       : ENABLED  cooldown={cfg.REENTRY_COOLDOWN_MIN}min  "
+                f"max_loss=Rs.{cfg.REENTRY_MAX_LOSS_FOR_REENTRY:.0f}  "
+                f"max/day={cfg.REENTRY_MAX_PER_DAY}",
+                flush=True,
+            )
         print(f"  Analyze Mode  : paper/live is set in the OpenAlgo dashboard.", flush=True)
         print("=" * 72, flush=True)
         print("", flush=True)
@@ -768,6 +836,67 @@ class StrategyCore:
             warn("Already in position — entry skipped (duplicate guard)")
             return
 
+        # ── 1a. Re-entry guard — check if this is a valid re-entry attempt ───
+        today_str = now_ist().strftime("%Y-%m-%d")
+        trade_count_today = state.get("trade_count", 0)
+        reentry_count     = state.get("reentry_count_today", 0)
+        last_close_time   = state.get("last_close_time")
+        last_trade_pnl    = state.get("last_trade_pnl", 0.0)
+        last_entry_date   = state.get("entry_date")
+
+        # Reset reentry counter on a new day
+        if last_entry_date and last_entry_date != today_str:
+            state["reentry_count_today"] = 0
+            reentry_count = 0
+
+        # Determine if this is the first trade or a re-entry
+        is_first_trade = (last_close_time is None) or (last_entry_date != today_str)
+
+        if not is_first_trade:
+            # This is a potential re-entry — check re-entry conditions
+            if not cfg.REENTRY_ENABLED:
+                info("Re-entry disabled — only one trade per day allowed")
+                return
+
+            if reentry_count >= cfg.REENTRY_MAX_PER_DAY:
+                info(
+                    f"Re-entry limit reached: {reentry_count}/{cfg.REENTRY_MAX_PER_DAY} "
+                    f"re-entries today — no more entries"
+                )
+                return
+
+            # Check cooldown
+            if last_close_time:
+                try:
+                    from datetime import datetime as _dt
+                    close_dt = _dt.fromisoformat(str(last_close_time))
+                    if close_dt.tzinfo is None:
+                        from src._shared import IST as _IST
+                        close_dt = _IST.localize(close_dt)
+                    elapsed_min = (now_ist() - close_dt).total_seconds() / 60.0
+                    if elapsed_min < cfg.REENTRY_COOLDOWN_MIN:
+                        info(
+                            f"Re-entry cooldown: {elapsed_min:.0f}m elapsed < "
+                            f"{cfg.REENTRY_COOLDOWN_MIN}m required — skipping"
+                        )
+                        return
+                except Exception as exc:
+                    debug(f"Re-entry cooldown check failed: {exc} — allowing entry")
+
+            # Check previous trade loss threshold
+            if last_trade_pnl < 0 and abs(last_trade_pnl) > cfg.REENTRY_MAX_LOSS_FOR_REENTRY:
+                info(
+                    f"Re-entry blocked: previous loss Rs.{last_trade_pnl:.0f} "
+                    f"exceeds max Rs.{cfg.REENTRY_MAX_LOSS_FOR_REENTRY:.0f}"
+                )
+                return
+
+            info(
+                f"RE-ENTRY ATTEMPT #{reentry_count + 1} "
+                f"(prev P&L Rs.{last_trade_pnl:.0f}, "
+                f"cooldown OK) — running full filter chain"
+            )
+
         # ── 2. DTE filter + month filter ───────────────────────────────────────
         if not self._filter.dte_filter_ok(dte_now):
             return
@@ -794,7 +923,16 @@ class StrategyCore:
         state["today_pnl"]  = 0.0
         state["closed_pnl"] = 0.0
 
+        # Store current DTE for DTE-aware SL override (used by _base_sl_percent())
+        if dte_now is None:
+            dte_now = self._filter.get_dte()
+        state["current_dte"] = dte_now
+
         success = self._order_engine.place_entry(expiry)
+        if success and not is_first_trade:
+            # Track re-entry count
+            state["reentry_count_today"] = reentry_count + 1
+            info(f"Re-entry #{state['reentry_count_today']} placed successfully")
         if not success:
             error("Entry FAILED — no position opened today")
             telegram("Entry FAILED — no position opened. Check logs.")

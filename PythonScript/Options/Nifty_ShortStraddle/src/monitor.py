@@ -332,17 +332,27 @@ class Monitor:
             if entry_px > 0:
                 self._tsl.update(leg, ltp, entry_px)
 
-            # ── Effective SL: trailing > breakeven > dynamic/fixed ────────────
+            # ── Effective SL: trailing > breakeven (after grace) > dynamic/fixed ──
             sl_lvl      = sl_level(leg)
             is_trailing = cfg.TRAILING_SL_ENABLED and state.get(f"trailing_active_{leg.lower()}", False)
 
             _be_sl_val    = state.get(f"breakeven_sl_{leg.lower()}", 0.0)
+            _be_active    = state.get(f"breakeven_active_{leg.lower()}", False)
             _is_breakeven = (
                 not is_trailing
                 and cfg.BREAKEVEN_AFTER_PARTIAL_ENABLED
-                and state.get(f"breakeven_active_{leg.lower()}", False)
+                and _be_active
                 and _be_sl_val > 0
                 and sl_lvl == _be_sl_val
+            )
+            # Detect if breakeven is configured but still in grace period
+            _be_in_grace = (
+                not is_trailing
+                and cfg.BREAKEVEN_AFTER_PARTIAL_ENABLED
+                and _be_active
+                and _be_sl_val > 0
+                and sl_lvl != _be_sl_val  # sl_level returned fixed SL, not BE
+                and cfg.BREAKEVEN_GRACE_PERIOD_MIN > 0
             )
             _is_dynamic = not is_trailing and not _is_breakeven and cfg.DYNAMIC_SL_ENABLED
 
@@ -350,6 +360,8 @@ class Monitor:
                 sl_mode_label = "[TRAIL]"
             elif _is_breakeven:
                 sl_mode_label = "[BREAKEVEN]"
+            elif _be_in_grace:
+                sl_mode_label = f"[DYNAMIC {_dynamic_sl_percent():.0f}% / BE-GRACE]"
             elif _is_dynamic:
                 sl_mode_label = f"[DYNAMIC {_dynamic_sl_percent():.0f}%]"
             else:
@@ -369,7 +381,29 @@ class Monitor:
                 elif _is_dynamic:
                     sl_type = f"Dynamic SL {_dynamic_sl_percent():.0f}%"
                 else:
-                    sl_type = f"Fixed SL {cfg.LEG_SL_PERCENT}%"
+                    sl_type = f"Fixed SL {_dynamic_sl_percent():.0f}%"
+
+                # ── NET P&L GUARD ────────────────────────────────────────────
+                # When only one leg remains (partial mode) and the combined
+                # net P&L (closed_pnl + this leg's MTM) is still POSITIVE,
+                # defer the SL exit — the overall position is profitable and
+                # the daily loss limit will catch genuine deterioration.
+                # Does NOT apply to trailing SL (already locking profits).
+                if (
+                    not is_trailing
+                    and not _is_breakeven
+                    and state["closed_pnl"] != 0  # partial mode — one leg already closed
+                ):
+                    net_pnl = state["closed_pnl"] + leg_mtm
+                    if net_pnl > 0:
+                        debug(
+                            f"  {leg} SL deferred: net P&L Rs.{net_pnl:.0f} > 0 "
+                            f"(closed Rs.{state['closed_pnl']:.0f} + open Rs.{leg_mtm:.0f}). "
+                            f"Deferring to daily loss limit."
+                        )
+                        open_mtm += leg_mtm
+                        continue
+
                 warn(
                     f"SL HIT [{sl_type}]: {leg}  |  "
                     f"LTP Rs.{ltp:.2f} >= SL Rs.{sl_lvl:.2f}  "

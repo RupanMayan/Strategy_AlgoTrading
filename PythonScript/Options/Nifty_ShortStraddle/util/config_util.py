@@ -172,13 +172,24 @@ class Config:
     WINNER_LEG_EARLY_EXIT_ENABLED:  bool
     WINNER_LEG_DECAY_THRESHOLD_PCT: float
 
+    # ── Section 7 — DTE-aware SL Override ──────────────────────────────────────
+    DTE_SL_OVERRIDE: dict              # {int → float}  DTE → SL% override
+
     # ── Section 7G — Breakeven SL ─────────────────────────────────────────────
     BREAKEVEN_AFTER_PARTIAL_ENABLED: bool
+    BREAKEVEN_GRACE_PERIOD_MIN:      int     # minutes before breakeven SL arms
+    BREAKEVEN_BUFFER_PCT:            float   # % buffer above breakeven price
 
     # ── Section 7G — Spot-Move Exit ───────────────────────────────────────────
     BREAKEVEN_SPOT_EXIT_ENABLED: bool
     BREAKEVEN_SPOT_MULTIPLIER:   float
     SPOT_CHECK_INTERVAL_S:       int
+
+    # ── Section 7H — Re-entry ────────────────────────────────────────────────
+    REENTRY_ENABLED:              bool
+    REENTRY_COOLDOWN_MIN:         int
+    REENTRY_MAX_LOSS_FOR_REENTRY: float    # absolute Rs. threshold
+    REENTRY_MAX_PER_DAY:          int
 
     # ── Section 8 — Expiry ───────────────────────────────────────────────────
     AUTO_EXPIRY:   bool
@@ -390,11 +401,33 @@ class Config:
         if not (0 < self.WINNER_LEG_DECAY_THRESHOLD_PCT < 100):
             errors.append("[risk.winner_leg_booking] decay_threshold_pct must be 0–100 (exclusive)")
 
+        # ── Section 7 — DTE SL Override ─────────────────────────────────────
+        for dte_key, sl_pct in self.DTE_SL_OVERRIDE.items():
+            if sl_pct <= 0:
+                errors.append(
+                    f"[risk.dte_sl_override] DTE{dte_key} sl_pct must be > 0, got {sl_pct}"
+                )
+
+        # ── Section 7G — Breakeven SL ───────────────────────────────────────
+        if self.BREAKEVEN_GRACE_PERIOD_MIN < 0:
+            errors.append("[risk.breakeven_sl] grace_period_min must be >= 0")
+        if self.BREAKEVEN_BUFFER_PCT < 0:
+            errors.append("[risk.breakeven_sl] buffer_pct must be >= 0")
+
         # ── Section 7G — Spot-Move Exit ───────────────────────────────────────
         if self.BREAKEVEN_SPOT_MULTIPLIER <= 0:
             errors.append("[risk.spot_move_exit] spot_multiplier must be > 0")
         if self.SPOT_CHECK_INTERVAL_S <= 0:
             errors.append("[risk.spot_move_exit] check_interval_s must be > 0")
+
+        # ── Section 7H — Re-entry ──────────────────────────────────────────
+        if self.REENTRY_ENABLED:
+            if self.REENTRY_COOLDOWN_MIN <= 0:
+                errors.append("[risk.reentry] cooldown_min must be > 0")
+            if self.REENTRY_MAX_LOSS_FOR_REENTRY <= 0:
+                errors.append("[risk.reentry] max_loss_for_reentry must be > 0")
+            if self.REENTRY_MAX_PER_DAY <= 0:
+                errors.append("[risk.reentry] max_reentries_per_day must be > 0")
 
         # ── Section 8 — Expiry ───────────────────────────────────────────────
         if not self.AUTO_EXPIRY:
@@ -552,6 +585,8 @@ class Config:
         wlb    = risk.get("winner_leg_booking", {})
         besl   = risk.get("breakeven_sl",       {})
         sme    = risk.get("spot_move_exit",     {})
+        reen   = risk.get("reentry",            {})
+        dte_sl = risk.get("dte_sl_override",    {})
         expiry = raw.get("expiry",              {})
         strat  = raw.get("strategy",            {})
         tg     = raw.get("telegram",            {})
@@ -597,6 +632,15 @@ class Config:
             raise ValueError(
                 f"[risk.dynamic_sl] schedule entries must have 'time' and 'sl_pct' keys, "
                 f"got error: {exc}"
+            ) from exc
+
+        # ── DTE SL override map: TOML string keys → int keys ─────────────────
+        try:
+            dte_sl_map = {int(k): float(v) for k, v in dte_sl.items()}
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"[risk.dte_sl_override] keys must be integers (DTE), "
+                f"values must be floats (SL %), got error: {exc}"
             ) from exc
 
         # ── log_max_mb → bytes ────────────────────────────────────────────────
@@ -702,13 +746,24 @@ class Config:
             WINNER_LEG_EARLY_EXIT_ENABLED  = bool(wlb.get("enabled",             True)),
             WINNER_LEG_DECAY_THRESHOLD_PCT = float(wlb.get("decay_threshold_pct", 30.0)),
 
+            # Section 7 — DTE-aware SL Override
+            DTE_SL_OVERRIDE = dte_sl_map,
+
             # Section 7G — Breakeven SL
             BREAKEVEN_AFTER_PARTIAL_ENABLED = bool(besl.get("enabled", True)),
+            BREAKEVEN_GRACE_PERIOD_MIN      = int(besl.get("grace_period_min", 5)),
+            BREAKEVEN_BUFFER_PCT            = float(besl.get("buffer_pct", 10.0)),
 
             # Section 7G — Spot-Move Exit
             BREAKEVEN_SPOT_EXIT_ENABLED = bool(sme.get("enabled",         True)),
             BREAKEVEN_SPOT_MULTIPLIER   = float(sme.get("spot_multiplier", 1.0)),
             SPOT_CHECK_INTERVAL_S       = int(sme.get("check_interval_s",  60)),
+
+            # Section 7H — Re-entry
+            REENTRY_ENABLED              = bool(reen.get("enabled",               False)),
+            REENTRY_COOLDOWN_MIN         = int(reen.get("cooldown_min",            30)),
+            REENTRY_MAX_LOSS_FOR_REENTRY = float(reen.get("max_loss_for_reentry", 2000)),
+            REENTRY_MAX_PER_DAY          = int(reen.get("max_reentries_per_day",   1)),
 
             # Section 8 — Expiry
             AUTO_EXPIRY   = bool(expiry.get("auto_expiry",   True)),

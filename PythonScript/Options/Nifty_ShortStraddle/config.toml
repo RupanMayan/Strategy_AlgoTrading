@@ -1,7 +1,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 #  NIFTY SHORT STRADDLE — PARTIAL SQUARE OFF  |  Configuration File
 #  Strategy : Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS
-#  Version  : 5.9.0
+#  Version  : 6.0.0
 #
 #  Sections:
 #    1.  OpenAlgo Connection
@@ -282,6 +282,16 @@ leg_sl_percent              = 20.0   # % of entry premium per leg  (0 = disabled
 daily_profit_target_per_lot =  5000  # Rs. profit target PER LOT   (0 = disabled)
 daily_loss_limit_per_lot    = -4000  # Rs. loss limit PER LOT — NEGATIVE  (0 = disabled)
 
+# ── DTE-aware SL override ──
+# On DTE2+ days (Fri/Thu/Wed) premiums are thinner and morning volatility
+# can easily breach a 20% SL. Widening SL on these days reduces false SL hits.
+# Keys are DTE values (int); values are SL % to use INSTEAD of leg_sl_percent.
+# Omitted DTEs use leg_sl_percent as default.
+[risk.dte_sl_override]
+"2" = 25.0   # DTE2 = Friday  — wider SL (moderate premium, opening vol)
+"3" = 28.0   # DTE3 = Thursday — wider still (low premium, fragile)
+"4" = 30.0   # DTE4 = Wednesday — widest (thin premium, max false-SL risk)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  SECTION 7A — PRE-TRADE MARGIN GUARD
@@ -406,7 +416,10 @@ abs_floor        = 18.0   # Minimum absolute VIX required to confirm a spike exi
 [risk.trailing_sl]
 enabled     = true
 trigger_pct = 50.0   # Activate when LTP falls to this % of entry price
-lock_pct    = 30.0   # Trailing SL = current_LTP × (1 + lock_pct/100)
+lock_pct    = 15.0   # Trailing SL = current_LTP × (1 + lock_pct/100)
+                     # Was 30% — lowered to 15% so trailing SL is meaningfully
+                     # tighter than the fixed SL. At 30%, trailing SL equals
+                     # fixed SL at activation, providing zero benefit.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -549,7 +562,16 @@ decay_threshold_pct = 30.0   # Book surviving leg when LTP <= 30% of entry price
 # ──────────────────────────────────────────────────────────────────────────────
 
 [risk.breakeven_sl]
-enabled = true   # Tighten surviving leg SL to combined breakeven after partial exit
+enabled          = true    # Tighten surviving leg SL to combined breakeven after partial exit
+grace_period_min = 5       # Minutes to wait after partial close before arming breakeven SL.
+                           # Prevents instant trigger — gives the surviving leg time to
+                           # decay further and offset the closed leg's loss.
+                           # 0 = no grace (original behaviour — fires immediately)
+buffer_pct       = 10.0    # % buffer ABOVE the mathematical breakeven price.
+                           # be_sl = breakeven_price × (1 + buffer_pct/100)
+                           # A 10% buffer on Rs.207 = Rs.227.70 — the surviving leg
+                           # must bounce significantly before the SL fires.
+                           # 0 = no buffer (exact breakeven — aggressive)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -581,6 +603,38 @@ enabled = true   # Tighten surviving leg SL to combined breakeven after partial 
 enabled          = true
 spot_multiplier  = 1.0   # Exit when NIFTY moves >= 1.0× combined premium from entry spot
 check_interval_s = 60    # Throttle: fetch NIFTY spot at most once per 60s
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7H — RE-ENTRY AFTER EARLY CLOSE
+#
+#  WHY THIS EXISTS:
+#    When a position closes early with a small loss (e.g. Rs.-517 at 09:46),
+#    the strategy sits idle for the rest of the day. If the early close was
+#    caused by transient morning volatility (common on DTE2+), re-entering
+#    after conditions stabilise can recover the loss and capture the day's
+#    remaining theta.
+#
+#  HOW IT WORKS:
+#    After a full close, the strategy records the close time and P&L.
+#    On subsequent entry job firings (DTE-map times), if:
+#      1. cooldown_min minutes have passed since the last close
+#      2. the previous trade's loss was <= max_loss_for_reentry (absolute Rs.)
+#      3. all normal entry filters still pass (VIX, IVR/IVP, ORB, margin)
+#      4. max_reentries_per_day has not been reached
+#    then a new entry is allowed.
+#
+#  SAFETY:
+#    Re-entry uses a FRESH set of entry filters — VIX, ORB, margin are all
+#    re-checked. If VIX spiked since the first trade, the VIX filter blocks.
+#    max_reentries_per_day prevents runaway re-entry loops.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.reentry]
+enabled                = true
+cooldown_min           = 30     # Minutes to wait after full close before re-entry
+max_loss_for_reentry   = 2000   # Re-enter only if previous trade loss <= Rs.2000 (absolute)
+max_reentries_per_day  = 1      # Max number of re-entries per day (1 = one retry after initial trade)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
