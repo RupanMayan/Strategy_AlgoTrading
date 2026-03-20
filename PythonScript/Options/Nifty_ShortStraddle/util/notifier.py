@@ -83,8 +83,14 @@ from util.logger import debug, error, info, warn
 
 __all__ = ["TelegramNotifier", "notify", "telegram", "html_escape", "flush"]
 
-# ── Strategy version — update when Nifty_ShortStraddle_Partial.py version changes
-_VERSION = "5.9.0"
+# ── Strategy version — resolved lazily from src._shared.VERSION to avoid
+#    circular imports (src._shared imports util.notifier at module level).
+def _get_version() -> str:
+    try:
+        from src._shared import VERSION
+        return VERSION
+    except ImportError:
+        return "6.0.0"
 
 # ── Telegram API base URL ─────────────────────────────────────────────────────
 _TELEGRAM_API_BASE = "https://api.telegram.org"
@@ -148,7 +154,7 @@ class TelegramNotifier:
                 self._http_session = requests.Session()
                 self._http_session.headers.update({
                     "Content-Type" : "application/json",
-                    "User-Agent"   : f"NiftyShortStraddle/{_VERSION}",
+                    "User-Agent"   : f"NiftyShortStraddle/{_get_version()}",
                 })
             return self._http_session
 
@@ -172,12 +178,12 @@ class TelegramNotifier:
         Prepend the strategy name + version header and enforce the 4096-char limit.
 
         Format (matches original script exactly):
-            [Short Straddle v5.9.0]
+            [Short Straddle v6.0.0]
             <message body>
         """
         cfg = self._get_config()
         strategy_name = cfg.STRATEGY_NAME if cfg else "Short Straddle"
-        header = f"[{strategy_name} v{_VERSION}]\n"
+        header = f"[{strategy_name} v{_get_version()}]\n"
 
         available = _MAX_MSG_LEN - len(header) - len(_TRUNCATE_TAIL)
         if len(msg) > available:
@@ -482,7 +488,7 @@ if __name__ == "__main__":
     else:
         print(f"  Bot token  : ***{cfg.TELEGRAM_BOT_TOKEN[-6:]}")
         print(f"  Chat ID    : {cfg.TELEGRAM_CHAT_ID}")
-        print(f"  Strategy   : {cfg.STRATEGY_NAME}  v{_VERSION}")
+        print(f"  Strategy   : {cfg.STRATEGY_NAME}  v{_get_version()}")
         print()
         print("  Sending test messages — check your Telegram chat...")
         print()
