@@ -43,7 +43,7 @@ telegram = notify
 #  Change user-facing settings in config.toml only.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VERSION     = "6.2.0"
+VERSION     = "6.3.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)

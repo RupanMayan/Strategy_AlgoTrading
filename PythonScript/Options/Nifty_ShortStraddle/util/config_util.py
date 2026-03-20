@@ -177,6 +177,25 @@ class Config:
     # ── Section 7 — DTE-aware SL Override ──────────────────────────────────────
     DTE_SL_OVERRIDE: dict              # {int → float}  DTE → SL% override
 
+    # ── Section 7H-B — Recovery Lock ────────────────────────────────────────────
+    RECOVERY_LOCK_ENABLED:          bool
+    RECOVERY_LOCK_MIN_RS_PER_LOT:   float   # min recovery per lot before trail activates
+    RECOVERY_LOCK_TRAIL_PCT:        float   # exit if recovery retraces this % from peak
+
+    # ── Section 7H-C — Momentum Filter ──────────────────────────────────────────
+    MOMENTUM_FILTER_ENABLED:        bool
+    MOMENTUM_MAX_DRIFT_PCT:         float   # max intraday NIFTY drift from day open for entry
+
+    # ── Section 7H-D — Asymmetric Leg Booking ──────────────────────────────────
+    ASYMMETRIC_BOOKING_ENABLED:     bool
+    ASYMMETRIC_WINNER_DECAY_PCT:    float   # book winner when decayed below this %
+    ASYMMETRIC_LOSER_INTACT_PCT:    float   # only if other leg is above this % of entry
+
+    # ── Section 7H-E — Combined Profit Trailing ────────────────────────────────
+    COMBINED_PROFIT_TRAIL_ENABLED:  bool
+    COMBINED_PROFIT_TRAIL_ACTIVATE_PCT: float  # activate after combined decays this %
+    COMBINED_PROFIT_TRAIL_PCT:      float   # exit if combined retraces this % from peak
+
     # ── Section 7G — Breakeven SL ─────────────────────────────────────────────
     BREAKEVEN_AFTER_PARTIAL_ENABLED: bool
     BREAKEVEN_GRACE_PERIOD_MIN:      int     # minutes before breakeven SL arms
@@ -588,6 +607,10 @@ class Config:
         besl   = risk.get("breakeven_sl",       {})
         sme    = risk.get("spot_move_exit",     {})
         reen   = risk.get("reentry",            {})
+        rcvr   = risk.get("recovery_lock",      {})
+        momf   = raw.get("filters", {}).get("momentum", {})
+        asym   = risk.get("asymmetric_booking", {})
+        cpt    = risk.get("combined_profit_trail", {})
         dte_sl = risk.get("dte_sl_override",    {})
         expiry = raw.get("expiry",              {})
         strat  = raw.get("strategy",            {})
@@ -752,6 +775,25 @@ class Config:
 
             # Section 7 — DTE-aware SL Override
             DTE_SL_OVERRIDE = dte_sl_map,
+
+            # Section 7H-B — Recovery Lock
+            RECOVERY_LOCK_ENABLED        = bool(rcvr.get("enabled",              True)),
+            RECOVERY_LOCK_MIN_RS_PER_LOT = float(rcvr.get("min_recovery_rs_per_lot", 500)),
+            RECOVERY_LOCK_TRAIL_PCT      = float(rcvr.get("trail_pct",           50.0)),
+
+            # Section 7H-C — Momentum Filter
+            MOMENTUM_FILTER_ENABLED = bool(momf.get("enabled",       True)),
+            MOMENTUM_MAX_DRIFT_PCT  = float(momf.get("max_drift_pct", 0.5)),
+
+            # Section 7H-D — Asymmetric Leg Booking
+            ASYMMETRIC_BOOKING_ENABLED  = bool(asym.get("enabled",           True)),
+            ASYMMETRIC_WINNER_DECAY_PCT = float(asym.get("winner_decay_pct", 40.0)),
+            ASYMMETRIC_LOSER_INTACT_PCT = float(asym.get("loser_intact_pct", 80.0)),
+
+            # Section 7H-E — Combined Profit Trailing
+            COMBINED_PROFIT_TRAIL_ENABLED      = bool(cpt.get("enabled",      True)),
+            COMBINED_PROFIT_TRAIL_ACTIVATE_PCT = float(cpt.get("activate_pct", 30.0)),
+            COMBINED_PROFIT_TRAIL_PCT          = float(cpt.get("trail_pct",    40.0)),
 
             # Section 7G — Breakeven SL
             BREAKEVEN_AFTER_PARTIAL_ENABLED = bool(besl.get("enabled", True)),

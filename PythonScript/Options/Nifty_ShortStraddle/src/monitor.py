@@ -6,9 +6,12 @@ Intraday P&L / SL monitor — one instance, lives for the session.
 Execution order per tick:
   1. Per-leg SL loop: LTP fetch → trailing SL update → SL check
   2. Broker connectivity escalation
-  3. Combined premium decay exit
-  4. Winner-leg early booking
+  3. Combined premium decay exit (both legs active)
+  3A. Asymmetric leg booking (both legs, one deeply decayed)
+  3B. Combined profit trailing (both legs, retracement from peak)
+  4. Winner-leg early booking (single survivor, deep decay)
   5. Combined P&L update
+  5A. Post-partial recovery lock (single survivor, P&L recovery trail)
   6. VIX spike check (throttled)
   7. Spot-move / breakeven breach check (throttled)
   8. Daily profit target check
@@ -514,6 +517,93 @@ class Monitor:
                     self._oe.close_all(reason=f"Combined Premium {decay_pct:.1f}% Decay Target Reached")
                     return
 
+        # ── FIX-XXVII: ASYMMETRIC LEG BOOKING ────────────────────────────────
+        # When both legs are active but one is deeply decayed while the other
+        # barely moved, book the winner to reduce naked-leg gamma exposure.
+        if (
+            cfg.ASYMMETRIC_BOOKING_ENABLED
+            and state["ce_active"] and state["pe_active"]
+            and "CE" in leg_ltps and "PE" in leg_ltps
+        ):
+            ce_entry = state["entry_price_ce"]
+            pe_entry = state["entry_price_pe"]
+            if ce_entry > 0 and pe_entry > 0:
+                ce_pct = (leg_ltps["CE"] / ce_entry) * 100.0
+                pe_pct = (leg_ltps["PE"] / pe_entry) * 100.0
+                # Check if CE is deeply decayed while PE barely moved
+                if ce_pct <= cfg.ASYMMETRIC_WINNER_DECAY_PCT and pe_pct >= cfg.ASYMMETRIC_LOSER_INTACT_PCT:
+                    info(
+                        f"ASYMMETRIC BOOKING: CE deeply decayed ({ce_pct:.1f}% of entry) "
+                        f"while PE barely moved ({pe_pct:.1f}% of entry) — booking CE"
+                    )
+                    telegram(
+                        f"📊 ASYMMETRIC LEG BOOKING\n"
+                        f"CE: Rs.{leg_ltps['CE']:.2f} = {ce_pct:.1f}% of entry (deep profit)\n"
+                        f"PE: Rs.{leg_ltps['PE']:.2f} = {pe_pct:.1f}% of entry (barely moved)\n"
+                        f"Booking CE to reduce naked-PE gamma exposure."
+                    )
+                    self._oe.close_one_leg("CE", reason=f"Asymmetric Booking (CE {ce_pct:.1f}%)", current_ltp=leg_ltps["CE"])
+                    return
+                # Check if PE is deeply decayed while CE barely moved
+                if pe_pct <= cfg.ASYMMETRIC_WINNER_DECAY_PCT and ce_pct >= cfg.ASYMMETRIC_LOSER_INTACT_PCT:
+                    info(
+                        f"ASYMMETRIC BOOKING: PE deeply decayed ({pe_pct:.1f}% of entry) "
+                        f"while CE barely moved ({ce_pct:.1f}% of entry) — booking PE"
+                    )
+                    telegram(
+                        f"📊 ASYMMETRIC LEG BOOKING\n"
+                        f"PE: Rs.{leg_ltps['PE']:.2f} = {pe_pct:.1f}% of entry (deep profit)\n"
+                        f"CE: Rs.{leg_ltps['CE']:.2f} = {ce_pct:.1f}% of entry (barely moved)\n"
+                        f"Booking PE to reduce naked-CE gamma exposure."
+                    )
+                    self._oe.close_one_leg("PE", reason=f"Asymmetric Booking (PE {pe_pct:.1f}%)", current_ltp=leg_ltps["PE"])
+                    return
+
+        # ── FIX-XXVIII: COMBINED PROFIT TRAILING ────────────────────────────
+        # When both legs are active and combined decay reaches activate_pct,
+        # trail the peak combined decay. Exit if it retraces by trail_pct.
+        if (
+            cfg.COMBINED_PROFIT_TRAIL_ENABLED
+            and state["ce_active"] and state["pe_active"]
+            and "CE" in leg_ltps and "PE" in leg_ltps
+        ):
+            ce_entry = state["entry_price_ce"]
+            pe_entry = state["entry_price_pe"]
+            if ce_entry > 0 and pe_entry > 0:
+                combined_entry   = ce_entry + pe_entry
+                combined_current = leg_ltps["CE"] + leg_ltps["PE"]
+                decay_pct        = round((1.0 - combined_current / combined_entry) * 100.0, 2)
+
+                if decay_pct >= cfg.COMBINED_PROFIT_TRAIL_ACTIVATE_PCT:
+                    peak_decay = state.get("combined_decay_peak", 0.0)
+                    if not state.get("combined_trail_active", False):
+                        # First activation
+                        state["combined_trail_active"] = True
+                        state["combined_decay_peak"]   = decay_pct
+                        debug(f"Combined profit trail ACTIVATED at {decay_pct:.1f}% decay")
+                    elif decay_pct > peak_decay:
+                        state["combined_decay_peak"] = decay_pct
+                        debug(f"Combined decay peak updated: {decay_pct:.1f}%")
+
+                    peak_decay = state["combined_decay_peak"]
+                    retracement = peak_decay - decay_pct
+                    if retracement >= cfg.COMBINED_PROFIT_TRAIL_PCT:
+                        info(
+                            f"COMBINED PROFIT TRAIL EXIT: decay retraced {retracement:.1f} points "
+                            f"(peak {peak_decay:.1f}% → current {decay_pct:.1f}%) "
+                            f">= trail {cfg.COMBINED_PROFIT_TRAIL_PCT:.0f} points — closing all"
+                        )
+                        telegram(
+                            f"📉 COMBINED PROFIT TRAIL EXIT\n"
+                            f"Combined decay retraced from peak {peak_decay:.1f}% "
+                            f"to {decay_pct:.1f}% (−{retracement:.1f} points)\n"
+                            f"Trail threshold: {cfg.COMBINED_PROFIT_TRAIL_PCT:.0f} points\n"
+                            f"CE Rs.{leg_ltps['CE']:.2f}  |  PE Rs.{leg_ltps['PE']:.2f}\n"
+                            f"Locking remaining combined profit."
+                        )
+                        self._oe.close_all(reason=f"Combined Profit Trail ({peak_decay:.1f}%→{decay_pct:.1f}%)")
+                        return
+
         # ── WINNER-LEG EARLY BOOKING ──────────────────────────────────────────
         # One surviving leg, deeply decayed → close it to lock profits.
         # Uses a FRESH LTP fetch — never relies on the SL loop's LTP cache.
@@ -564,6 +654,71 @@ class Monitor:
             f"Target: Rs.{cfg.DAILY_PROFIT_TARGET} | "
             f"Limit: Rs.{cfg.DAILY_LOSS_LIMIT}"
         )
+
+        # ── FIX-XXV: POST-PARTIAL RECOVERY LOCK ─────────────────────────────
+        # After partial exit at loss, when combined P&L recovers to positive,
+        # trail the recovery peak. Exit if it retraces too much or drops to zero.
+        if (
+            cfg.RECOVERY_LOCK_ENABLED
+            and state["closed_pnl"] < 0
+            and len(active) == 1
+        ):
+            min_recovery = cfg.RECOVERY_LOCK_MIN_RS_PER_LOT * cfg.NUMBER_OF_LOTS
+            if combined_pnl > 0:
+                if not state.get("recovery_lock_active", False):
+                    # First time crossing positive
+                    if combined_pnl >= min_recovery:
+                        state["recovery_lock_active"] = True
+                        state["recovery_peak_pnl"]    = combined_pnl
+                        info(
+                            f"RECOVERY LOCK ACTIVATED: combined P&L Rs.{combined_pnl:.0f} "
+                            f"crossed positive (min Rs.{min_recovery:.0f}) — trailing peak"
+                        )
+                        telegram(
+                            f"🔒 RECOVERY LOCK ACTIVATED\n"
+                            f"Combined P&L recovered to Rs.{combined_pnl:.0f}\n"
+                            f"(Closed: Rs.{state['closed_pnl']:.0f} + Open: Rs.{open_mtm:.0f})\n"
+                            f"Trailing recovery peak — will exit on {cfg.RECOVERY_LOCK_TRAIL_PCT:.0f}% retracement."
+                        )
+                else:
+                    # Already tracking — update peak
+                    peak = state.get("recovery_peak_pnl", 0.0)
+                    if combined_pnl > peak:
+                        state["recovery_peak_pnl"] = combined_pnl
+                        debug(f"Recovery peak updated: Rs.{combined_pnl:.0f}")
+
+                    peak = state["recovery_peak_pnl"]
+                    if peak > 0:
+                        retracement_pct = (peak - combined_pnl) / peak * 100.0
+                        if retracement_pct >= cfg.RECOVERY_LOCK_TRAIL_PCT:
+                            info(
+                                f"RECOVERY LOCK EXIT: combined P&L retraced {retracement_pct:.1f}% "
+                                f"from peak Rs.{peak:.0f} → current Rs.{combined_pnl:.0f} "
+                                f"(trail {cfg.RECOVERY_LOCK_TRAIL_PCT:.0f}%) — closing survivor"
+                            )
+                            telegram(
+                                f"🔓 RECOVERY LOCK EXIT\n"
+                                f"Recovery retraced {retracement_pct:.1f}% from peak Rs.{peak:.0f}\n"
+                                f"Current combined: Rs.{combined_pnl:.0f}\n"
+                                f"Trail threshold: {cfg.RECOVERY_LOCK_TRAIL_PCT:.0f}%\n"
+                                f"Locking remaining recovery profit."
+                            )
+                            self._oe.close_all(reason=f"Recovery Lock ({peak:.0f}→{combined_pnl:.0f})")
+                            return
+
+            elif state.get("recovery_lock_active", False):
+                # Was in recovery but combined P&L dropped back to negative
+                info(
+                    f"RECOVERY LOCK EXIT: combined P&L dropped back to "
+                    f"Rs.{combined_pnl:.0f} (negative) — closing to prevent further loss"
+                )
+                telegram(
+                    f"🔓 RECOVERY LOST — EXITING\n"
+                    f"Combined P&L dropped back to Rs.{combined_pnl:.0f}\n"
+                    f"Recovery gains lost — closing survivor to stop bleeding."
+                )
+                self._oe.close_all(reason=f"Recovery Lock — P&L back to negative Rs.{combined_pnl:.0f}")
+                return
 
         # ── VIX spike check (throttled) ───────────────────────────────────────
         # Must run BEFORE daily target/limit — a spike exit fires even on profit.

@@ -90,7 +90,7 @@ def _get_version() -> str:
         from src._shared import VERSION
         return VERSION
     except ImportError:
-        return "6.2.0"
+        return "6.3.0"
 
 # ── Telegram API base URL ─────────────────────────────────────────────────────
 _TELEGRAM_API_BASE = "https://api.telegram.org"
@@ -178,7 +178,7 @@ class TelegramNotifier:
         Prepend the strategy name + version header and enforce the 4096-char limit.
 
         Format (matches original script exactly):
-            [Short Straddle v6.2.0]
+            [Short Straddle v6.3.0]
             <message body>
         """
         cfg = self._get_config()

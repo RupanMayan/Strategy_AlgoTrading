@@ -908,6 +908,11 @@ class StrategyCore:
         if not self._filter.orb_filter_ok():
             return
 
+        # ── 5B. FIX-XXVI: Momentum filter (re-entry only) ────────────────────
+        if not is_first_trade:
+            if not self._filter.momentum_filter_ok():
+                return
+
         # ── 6. Resolve expiry ONCE (FIX-A) and run margin guard ───────────────
         expiry = self._filter.get_expiry()
         if not self._margin_guard.check(expiry):

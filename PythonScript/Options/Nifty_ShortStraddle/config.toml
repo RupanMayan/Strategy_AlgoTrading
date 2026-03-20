@@ -1,7 +1,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 #  NIFTY SHORT STRADDLE — PARTIAL SQUARE OFF  |  Configuration File
 #  Strategy : Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS
-#  Version  : 6.2.0
+#  Version  : 6.3.0
 #
 #  Sections:
 #    1.  OpenAlgo Connection
@@ -20,6 +20,11 @@
 #    7E. Combined Premium Decay Exit
 #    7F. Winner-Leg Early Booking
 #    7G. Breakeven SL + Spot-Move Exit
+#    7H. Re-Entry After Early Close
+#    7H-B. Post-Partial Recovery Lock
+#    7H-C. Momentum Filter (Re-Entry)
+#    7H-D. Asymmetric Leg Booking
+#    7H-E. Combined Profit Trailing
 #    8.  Expiry
 #    9.  Strategy Name
 #    10. Telegram Alerts
@@ -654,6 +659,159 @@ enabled                = true
 cooldown_min           = 30     # Minutes to wait after full close before re-entry
 max_loss_for_reentry   = 2000   # Re-enter only if previous trade loss <= Rs.2000 (absolute)
 max_reentries_per_day  = 1      # Max number of re-entries per day (1 = one retry after initial trade)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7H-B — POST-PARTIAL RECOVERY LOCK  (FIX-XXV)
+#
+#  WHY THIS EXISTS:
+#    After partial exit at a loss (one leg SL hit), FIX-XXIV lets the winning
+#    survivor continue running. As it decays further, the combined P&L
+#    (negative closed_pnl + growing winner MTM) crosses from negative to
+#    positive — the position has RECOVERED from the SL loss. But without
+#    protection, a sudden reversal can erase this hard-won recovery.
+#
+#  HOW IT WORKS:
+#    1. After partial exit (closed_pnl < 0, one leg active), monitor tracks
+#       combined_pnl = closed_pnl + open_mtm each tick.
+#    2. When combined_pnl first crosses positive → "recovery achieved"
+#    3. Track recovery_peak_pnl (highest combined_pnl after recovery)
+#    4. If combined_pnl retraces trail_pct% from peak → close survivor
+#       to lock the remaining recovery profit.
+#    5. If combined_pnl drops back below zero → close immediately (recovery lost)
+#
+#  min_recovery_rs_per_lot: prevents premature trailing on tiny recoveries.
+#    Recovery must reach this Rs. amount (per lot) before trailing activates.
+#    500/lot = Rs.500 per lot minimum recovery before trail kicks in.
+#
+#  trail_pct: how much retracement from peak triggers exit.
+#    50% → if peak recovery was Rs.2000, exit when it drops to Rs.1000
+#    30% → tighter — exit at Rs.1400 (locks more profit, more exits)
+#    70% → looser — exit at Rs.600 (fewer exits, more risk)
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.recovery_lock]
+enabled                = true
+min_recovery_rs_per_lot = 500    # Min recovery per lot before trailing starts
+trail_pct              = 50.0    # Exit if recovery retraces 50% from peak
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7H-C — MOMENTUM FILTER  (FIX-XXVI)
+#
+#  WHY THIS EXISTS:
+#    A short straddle profits from range-bound markets. After an early exit
+#    (one-sided move), re-entering a fresh straddle into the SAME trend is
+#    dangerous — the new losing leg starts under pressure immediately.
+#    This filter blocks entry when NIFTY has drifted significantly from the
+#    session open, indicating a trending (not range-bound) market.
+#
+#  HOW IT WORKS:
+#    At entry time, fetches current NIFTY spot and compares to the ORB
+#    reference price (captured at 09:17 IST). If the absolute % drift from
+#    ORB reference exceeds max_drift_pct, entry is blocked.
+#
+#    drift_pct = |current_spot - orb_reference| / orb_reference × 100
+#    If drift_pct > max_drift_pct → skip entry
+#
+#  max_drift_pct guidance:
+#    0.3% → conservative — blocks when NIFTY has moved ~70 points
+#    0.5% → balanced     — blocks when NIFTY has moved ~115 points (recommended)
+#    0.8% → relaxed      — allows wider drift before blocking
+#
+#  NOTE: Only applies to RE-ENTRIES (not first trade of day). The first trade
+#    relies on ORB filter alone. Re-entries need additional trend awareness
+#    because the market has already shown directional bias.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[filters.momentum]
+enabled       = true
+max_drift_pct = 0.5   # Block re-entry when NIFTY has drifted > 0.5% from ORB reference
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7H-D — ASYMMETRIC LEG BOOKING  (FIX-XXVII)
+#
+#  WHY THIS EXISTS:
+#    When both legs are active but one has decayed significantly while the
+#    other hasn't, the position is effectively naked on the non-decayed side.
+#    Example: CE at 40% of entry (deep profit), PE at 90% of entry (barely
+#    moved) — the position is basically a naked PE short. Gamma risk is
+#    concentrated on the PE side. Booking the deeply decayed CE locks
+#    profit and reduces the gamma exposure to a single-leg position.
+#
+#  HOW IT WORKS:
+#    Every monitor tick, when BOTH legs are active:
+#      winner_pct = winner_ltp / winner_entry × 100
+#      loser_pct  = loser_ltp / loser_entry × 100
+#    If winner_pct <= winner_decay_pct AND loser_pct >= loser_intact_pct:
+#      → Book the deeply decayed winner via close_one_leg()
+#      → Surviving loser continues with normal SL management
+#
+#  winner_decay_pct guidance:
+#    30% → aggressive — book when 70% profit captured (earlier exit)
+#    40% → balanced   — book when 60% profit captured (recommended)
+#    50% → conservative — book when 50% profit captured (more room)
+#
+#  loser_intact_pct guidance:
+#    70% → trigger on moderate asymmetry
+#    80% → balanced — only when loser barely moved (recommended)
+#    90% → strict — only extreme asymmetry triggers booking
+#
+#  NOTE: This is different from combined decay exit (which requires BOTH
+#    legs to have decayed). Asymmetric booking fires when legs have
+#    DIVERGED — one deep profit, one barely moved.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.asymmetric_booking]
+enabled          = true
+winner_decay_pct = 40.0   # Book winner when LTP <= 40% of entry (60%+ profit)
+loser_intact_pct = 80.0   # Only if other leg LTP >= 80% of entry (barely moved)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 7H-E — COMBINED PROFIT TRAILING  (FIX-XXVIII)
+#
+#  WHY THIS EXISTS:
+#    When BOTH legs are actively decaying and the combined position is nicely
+#    profitable, per-leg SLs protect individual legs but the COMBINED profit
+#    has no floor. A sudden spike on one side can erase combined gains before
+#    the combined decay exit target is reached.
+#
+#  HOW IT WORKS:
+#    When BOTH legs are active:
+#      combined_entry   = CE_entry + PE_entry
+#      combined_current = CE_ltp + PE_ltp
+#      combined_decay   = (1 - combined_current / combined_entry) × 100
+#
+#    Phase 1 — ACTIVATE:
+#      When combined_decay first reaches activate_pct → record peak_decay
+#
+#    Phase 2 — TRAIL:
+#      Track peak combined_decay. If combined_decay retraces below
+#      (peak_decay - trail_pct) → close both legs.
+#      Combined decay only moves AWAY from peak by trail_pct before exit.
+#
+#  activate_pct guidance:
+#    25% → early activation — more protection, more premature exits
+#    30% → balanced (recommended)
+#    40% → late activation — less protection, fewer exits
+#
+#  trail_pct guidance:
+#    30% → tight — exit if decay drops 30 points from peak (e.g. 50→20)
+#    40% → balanced (recommended)
+#    50% → loose — allows wider retracement before exit
+#
+#  NOTE: This does NOT replace the combined decay exit (Section 7E).
+#    Combined decay exit is a TARGET (exit WHEN decayed enough).
+#    Combined profit trail is a FLOOR (exit if LOSING decay progress).
+#    Both can coexist — target fires first if reached; trail catches reversal.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[risk.combined_profit_trail]
+enabled      = true
+activate_pct = 30.0   # Start trailing after combined decay reaches 30%
+trail_pct    = 40.0   # Exit if combined decay retraces 40 points from peak
 
 
 # ──────────────────────────────────────────────────────────────────────────────

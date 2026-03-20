@@ -308,3 +308,62 @@ class FilterEngine:
             f"(Rs.{current_spot:.2f}) ≤ {cfg.ORB_MAX_MOVE_PCT}% — OK to trade"
         )
         return True
+
+    # ── FIX-XXVI: Momentum Filter ───────────────────────────────────────────
+
+    def momentum_filter_ok(self) -> bool:
+        """
+        Intraday momentum / drift filter — blocks re-entry into trending markets.
+
+        Compares current NIFTY spot to the ORB reference price. If the
+        absolute drift exceeds MOMENTUM_MAX_DRIFT_PCT, the market is
+        trending and a fresh straddle is dangerous.
+
+        Only applies to RE-ENTRIES (not first trade of day).
+        Fail-open on LTP unavailability.
+        """
+        if not cfg.MOMENTUM_FILTER_ENABLED:
+            return True
+
+        orb_px = state.get("orb_price", 0.0)
+        if orb_px <= 0:
+            debug("Momentum filter: ORB reference not available — bypassed (fail-open)")
+            return True
+
+        try:
+            q = _get_client().quotes(symbol=cfg.UNDERLYING, exchange=INDEX_EXCH)
+            if is_api_success(q):
+                current_spot = float(q.get("data", {}).get("ltp", 0) or 0)
+            else:
+                current_spot = 0.0
+        except Exception as exc:
+            warn(f"Momentum filter: spot LTP exception — {exc} — bypassed (fail-open)")
+            return True
+
+        if current_spot <= 0:
+            warn("Momentum filter: NIFTY LTP fetch failed — bypassed (fail-open)")
+            return True
+
+        drift_pct = abs(current_spot - orb_px) / orb_px * 100.0
+        direction = "↑" if current_spot > orb_px else "↓"
+
+        if drift_pct > cfg.MOMENTUM_MAX_DRIFT_PCT:
+            warn(
+                f"Momentum filter: NIFTY has drifted {direction} {drift_pct:.2f}% "
+                f"from ORB Rs.{orb_px:.2f} (now Rs.{current_spot:.2f}) "
+                f"> {cfg.MOMENTUM_MAX_DRIFT_PCT}% — trending market, re-entry blocked"
+            )
+            telegram(
+                f"📊 MOMENTUM FILTER — Re-entry BLOCKED\n"
+                f"NIFTY {direction} {drift_pct:.2f}% from ORB Rs.{orb_px:.2f}\n"
+                f"Current: Rs.{current_spot:.2f}\n"
+                f"Max drift: {cfg.MOMENTUM_MAX_DRIFT_PCT}%\n"
+                f"Market is trending — straddle re-entry too risky."
+            )
+            return False
+
+        info(
+            f"Momentum filter: NIFTY drift {direction} {drift_pct:.2f}% from ORB "
+            f"(Rs.{orb_px:.2f} → Rs.{current_spot:.2f}) ≤ {cfg.MOMENTUM_MAX_DRIFT_PCT}% — OK"
+        )
+        return True

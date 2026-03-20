@@ -230,6 +230,12 @@ class OrderEngine:
         # FIX-XX: Clear Net P&L Guard deferral timestamps from previous trade
         state["net_pnl_defer_start_ce"]    = None
         state["net_pnl_defer_start_pe"]    = None
+        # FIX-XXV: Clear recovery lock state from previous trade
+        state["recovery_lock_active"]      = False
+        state["recovery_peak_pnl"]         = 0.0
+        # FIX-XXVIII: Clear combined profit trail state from previous trade
+        state["combined_trail_active"]     = False
+        state["combined_decay_peak"]       = 0.0
 
         # FIX-I (v5.5.0): save BEFORE fill capture — crash during fill capture
         # still leaves a valid in_position=True state file.
