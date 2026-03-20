@@ -28,6 +28,7 @@ from src._shared import (
     _get_client,
     VIX_SYMBOL, INDEX_EXCH,
     now_ist,
+    is_api_success,
 )
 
 
@@ -46,6 +47,28 @@ class VIXManager:
     This makes VIXManager safe to call from background threads and multiple jobs.
     """
 
+    _NSE_HEADERS = {
+        "User-Agent"      : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept"          : "application/json, text/plain, */*",
+        "Accept-Language" : "en-US,en;q=0.9",
+        "Referer"         : "https://www.nseindia.com/",
+    }
+
+    def __init__(self) -> None:
+        # Persistent session for NSE fallback — avoids creating a new session per call
+        self._nse_session: Optional[requests.Session] = None
+
+    def _get_nse_session(self) -> requests.Session:
+        """Return a reusable NSE session with cookies pre-initialized."""
+        if self._nse_session is None:
+            self._nse_session = requests.Session()
+            self._nse_session.headers.update(self._NSE_HEADERS)
+            try:
+                self._nse_session.get("https://www.nseindia.com", timeout=8)
+            except Exception:
+                pass  # Cookie pre-auth is best-effort
+        return self._nse_session
+
     # ── Live VIX fetch ────────────────────────────────────────────────────────
 
     def fetch_vix(self) -> float:
@@ -60,7 +83,7 @@ class VIXManager:
         # Primary: OpenAlgo SDK
         try:
             resp = _get_client().quotes(symbol=VIX_SYMBOL, exchange=INDEX_EXCH)
-            if isinstance(resp, dict) and resp.get("status") == "success":
+            if is_api_success(resp):
                 ltp = float(resp.get("data", {}).get("ltp", -1))
                 if ltp > 0:
                     info(f"India VIX (OpenAlgo): {ltp:.2f}")
@@ -68,18 +91,10 @@ class VIXManager:
         except Exception as exc:
             warn(f"OpenAlgo VIX exception: {exc}")
 
-        # Fallback: NSE direct API
+        # Fallback: NSE direct API (reuses persistent session)
         try:
-            hdrs = {
-                "User-Agent"      : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept"          : "application/json, text/plain, */*",
-                "Accept-Language" : "en-US,en;q=0.9",
-                "Referer"         : "https://www.nseindia.com/",
-            }
-            sess = requests.Session()
-            sess.get("https://www.nseindia.com", headers=hdrs, timeout=8)
-            sess.get("https://www.nseindia.com/option-chain", headers=hdrs, timeout=8)
-            r = sess.get("https://www.nseindia.com/api/allIndices", headers=hdrs, timeout=8)
+            sess = self._get_nse_session()
+            r = sess.get("https://www.nseindia.com/api/allIndices", timeout=8)
             r.raise_for_status()
             for item in r.json().get("data", []):
                 if item.get("index", "").replace(" ", "").upper() == "INDIAVIX":
@@ -87,6 +102,8 @@ class VIXManager:
                     info(f"India VIX (NSE fallback): {vix:.2f}")
                     return vix
         except Exception as exc:
+            # Reset session on failure so next call re-initializes cookies
+            self._nse_session = None
             warn(f"NSE VIX fallback exception: {exc}")
 
         error("India VIX unavailable from all sources")
@@ -378,20 +395,14 @@ class VIXManager:
         )
         info(f"  Target file : {os.path.abspath(cfg.VIX_HISTORY_FILE)}")
 
-        hdrs = {
-            "User-Agent"      : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept"          : "application/json, text/plain, */*",
-            "Accept-Language" : "en-US,en;q=0.9",
-            "Referer"         : "https://www.nseindia.com/",
-        }
-
         raw: list = []
         try:
             sess = requests.Session()
-            sess.get("https://www.nseindia.com", headers=hdrs, timeout=10)
+            sess.headers.update(self._NSE_HEADERS)
+            sess.get("https://www.nseindia.com", timeout=10)
             sess.get(
                 "https://www.nseindia.com/reports-indices-historical-vix",
-                headers=hdrs, timeout=10,
+                timeout=10,
             )
             for i, (chunk_from, chunk_to) in enumerate(chunks):
                 if i > 0:
@@ -402,7 +413,7 @@ class VIXManager:
                     f"https://www.nseindia.com/api/historicalOR/vixhistory"
                     f"?from={from_str}&to={to_str}"
                 )
-                r = sess.get(url, headers=hdrs, timeout=20)
+                r = sess.get(url, timeout=20)
                 r.raise_for_status()
                 chunk_data = r.json().get("data", [])
                 info(f"  Chunk {from_str} → {to_str}: {len(chunk_data)} records")

@@ -28,6 +28,7 @@ from src._shared import (
     INDEX_EXCH,
     _monitor_lock,
     now_ist, active_legs, sl_level, _dynamic_sl_percent, qty,
+    is_api_success, get_api_error,
 )
 
 # Module-level globals shared with other modules via _shared
@@ -76,13 +77,10 @@ class Monitor:
         try:
             client = _get_client()
             q = client.quotes(symbol=cfg.UNDERLYING, exchange=INDEX_EXCH)
-            if isinstance(q, dict) and q.get("status") == "success":
+            if is_api_success(q):
                 ltp = float(q.get("data", {}).get("ltp", 0) or 0)
                 return ltp if ltp > 0 else 0.0
-            warn(
-                f"_fetch_spot_ltp: quotes({cfg.UNDERLYING}) failed: "
-                f"{q.get('message', '') if isinstance(q, dict) else str(q)}"
-            )
+            warn(f"_fetch_spot_ltp: quotes({cfg.UNDERLYING}) failed: {get_api_error(q)}")
             return 0.0
         except Exception as exc:
             warn(f"_fetch_spot_ltp: exception: {exc}")
@@ -389,6 +387,8 @@ class Monitor:
                 # defer the SL exit — the overall position is profitable and
                 # the daily loss limit will catch genuine deterioration.
                 # Does NOT apply to trailing SL (already locking profits).
+                # FIX-XX: Time-capped — defers at most NET_PNL_GUARD_MAX_DEFER_MIN
+                # minutes to prevent slow bleed when closed_pnl masks open-leg loss.
                 if (
                     not is_trailing
                     and not _is_breakeven
@@ -396,13 +396,35 @@ class Monitor:
                 ):
                     net_pnl = state["closed_pnl"] + leg_mtm
                     if net_pnl > 0:
-                        debug(
-                            f"  {leg} SL deferred: net P&L Rs.{net_pnl:.0f} > 0 "
-                            f"(closed Rs.{state['closed_pnl']:.0f} + open Rs.{leg_mtm:.0f}). "
-                            f"Deferring to daily loss limit."
-                        )
-                        open_mtm += leg_mtm
-                        continue
+                        # Check time cap on deferral
+                        defer_expired = False
+                        if cfg.NET_PNL_GUARD_MAX_DEFER_MIN > 0:
+                            defer_key = f"net_pnl_defer_start_{leg.lower()}"
+                            defer_start = state.get(defer_key)
+                            if defer_start is None:
+                                # First deferral tick — record start time
+                                state[defer_key] = now_ist().isoformat()
+                            else:
+                                from src._shared import parse_ist_datetime
+                                start_dt = parse_ist_datetime(defer_start)
+                                if start_dt:
+                                    defer_min = (now_ist() - start_dt).total_seconds() / 60.0
+                                    if defer_min >= cfg.NET_PNL_GUARD_MAX_DEFER_MIN:
+                                        defer_expired = True
+                                        warn(
+                                            f"  {leg} Net P&L Guard TIME CAP expired "
+                                            f"({defer_min:.0f}m >= {cfg.NET_PNL_GUARD_MAX_DEFER_MIN}m) "
+                                            f"— SL will fire despite net P&L Rs.{net_pnl:.0f} > 0"
+                                        )
+
+                        if not defer_expired:
+                            debug(
+                                f"  {leg} SL deferred: net P&L Rs.{net_pnl:.0f} > 0 "
+                                f"(closed Rs.{state['closed_pnl']:.0f} + open Rs.{leg_mtm:.0f}). "
+                                f"Deferring to daily loss limit."
+                            )
+                            open_mtm += leg_mtm
+                            continue
 
                 warn(
                     f"SL HIT [{sl_type}]: {leg}  |  "
@@ -468,17 +490,23 @@ class Monitor:
                 combined_entry   = ce_entry + pe_entry
                 combined_current = leg_ltps["CE"] + leg_ltps["PE"]
                 decay_pct        = round((1.0 - combined_current / combined_entry) * 100.0, 2)
-                if decay_pct >= cfg.COMBINED_DECAY_TARGET_PCT:
+                # FIX-XXIII: DTE-aware decay target — use override if configured
+                current_dte = state.get("current_dte")
+                decay_target = cfg.COMBINED_DECAY_DTE_OVERRIDE.get(
+                    current_dte, cfg.COMBINED_DECAY_TARGET_PCT
+                ) if current_dte is not None else cfg.COMBINED_DECAY_TARGET_PCT
+                if decay_pct >= decay_target:
+                    _dte_label = f" (DTE{current_dte})" if current_dte is not None else ""
                     info(
                         f"COMBINED DECAY EXIT: {decay_pct:.1f}% decay "
                         f"(CE Rs.{leg_ltps['CE']:.2f} + PE Rs.{leg_ltps['PE']:.2f} = "
                         f"Rs.{combined_current:.2f} vs entry Rs.{combined_entry:.2f}) "
-                        f">= target {cfg.COMBINED_DECAY_TARGET_PCT:.0f}% — closing all"
+                        f">= target {decay_target:.0f}%{_dte_label} — closing all"
                     )
                     telegram(
                         f"🎯 COMBINED DECAY EXIT\n"
                         f"Combined premium decayed {decay_pct:.1f}% "
-                        f"(target {cfg.COMBINED_DECAY_TARGET_PCT:.0f}%)\n"
+                        f"(target {decay_target:.0f}%{_dte_label})\n"
                         f"CE ltp Rs.{leg_ltps['CE']:.2f}  |  PE ltp Rs.{leg_ltps['PE']:.2f}\n"
                         f"Combined: Rs.{combined_current:.2f} vs entry Rs.{combined_entry:.2f}\n"
                         f"Locking in profits — closing both legs now."

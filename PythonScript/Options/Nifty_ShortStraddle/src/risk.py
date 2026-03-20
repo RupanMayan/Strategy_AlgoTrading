@@ -21,6 +21,7 @@ from src._shared import (
     _get_client,
     INDEX_EXCH, OPTION_EXCH,
     qty, now_ist,
+    is_api_success, get_api_error,
 )
 
 
@@ -51,7 +52,7 @@ class MarginGuard:
         """
         try:
             q = _get_client().quotes(symbol=cfg.UNDERLYING, exchange=INDEX_EXCH)
-            if isinstance(q, dict) and q.get("status") == "success":
+            if is_api_success(q):
                 ltp = float(q.get("data", {}).get("ltp", 0))
                 if ltp > 0:
                     atm = round(ltp / cfg.ATM_STRIKE_ROUNDING) * cfg.ATM_STRIKE_ROUNDING
@@ -86,7 +87,7 @@ class MarginGuard:
 
         try:
             funds_resp = _get_client().funds()
-            if isinstance(funds_resp, dict) and funds_resp.get("status") == "success":
+            if is_api_success(funds_resp):
                 data           = funds_resp.get("data", {})
                 available_cash = float(data.get("availablecash",  0) or 0)
                 collateral     = float(data.get("collateral",     0) or 0)
@@ -95,11 +96,7 @@ class MarginGuard:
                 info(f"  Collateral      : Rs.{collateral:,.2f}  (pledged securities)")
                 info(f"  Utilised debits : Rs.{utilised:,.2f}  (existing margin)")
             else:
-                msg = (
-                    funds_resp.get("message", "") if isinstance(funds_resp, dict)
-                    else str(funds_resp)
-                )
-                warn(f"funds() failed: {msg}")
+                warn(f"funds() failed: {get_api_error(funds_resp)}")
                 if cfg.MARGIN_GUARD_FAIL_OPEN:
                     warn("Margin guard fail-open: proceeding despite funds() failure")
                     return True
@@ -153,7 +150,7 @@ class MarginGuard:
                 ]
             )
 
-            if isinstance(margin_resp, dict) and margin_resp.get("status") == "success":
+            if is_api_success(margin_resp):
                 margin_data     = margin_resp.get("data", {})
                 required_margin = float(margin_data.get("total_margin_required", 0) or 0)
                 span_margin     = float(margin_data.get("span_margin",     0) or 0)
@@ -162,11 +159,7 @@ class MarginGuard:
                 info(f"  Exposure margin : Rs.{exposure_margin:,.2f}")
                 info(f"  Required total  : Rs.{required_margin:,.2f}")
             else:
-                msg = (
-                    margin_resp.get("message", "") if isinstance(margin_resp, dict)
-                    else str(margin_resp)
-                )
-                warn(f"margin() failed: {msg}")
+                warn(f"margin() failed: {get_api_error(margin_resp)}")
                 if cfg.MARGIN_GUARD_FAIL_OPEN:
                     warn("Margin guard fail-open: proceeding despite margin() failure")
                     return True

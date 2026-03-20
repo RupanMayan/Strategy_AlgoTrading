@@ -24,6 +24,7 @@ from src._shared import (
     _get_client,
     OPTION_EXCH, IST,
     now_ist, active_legs, sl_level,
+    is_api_success, parse_ist_datetime,
 )
 
 if TYPE_CHECKING:
@@ -58,7 +59,7 @@ class StartupReconciler:
         try:
             client = _get_client()
             resp = client.positionbook()
-            if not isinstance(resp, dict) or resp.get("status") != "success":
+            if not is_api_success(resp):
                 warn(f"positionbook() failed: {resp}")
                 return []
 
@@ -139,15 +140,8 @@ class StartupReconciler:
                     state[key] = saved[key]
 
             # Restore entry_time as IST-aware datetime
-            if isinstance(state.get("entry_time"), str):
-                try:
-                    parsed = datetime.fromisoformat(state["entry_time"])
-                    if parsed.tzinfo is None:
-                        state["entry_time"] = IST.localize(parsed)
-                    else:
-                        state["entry_time"] = parsed.astimezone(IST)
-                except Exception:
-                    state["entry_time"] = now_ist()
+            parsed_et = parse_ist_datetime(state.get("entry_time"))
+            state["entry_time"] = parsed_et if parsed_et else now_ist()
 
             # ── Symbol verification ────────────────────────────────────────────
             # Confirm that the saved leg symbols are actually open at the broker.

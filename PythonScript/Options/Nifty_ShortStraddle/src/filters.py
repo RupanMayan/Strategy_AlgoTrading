@@ -28,6 +28,7 @@ from src._shared import (
     INDEX_EXCH,
     DAY_NAMES, MONTH_NAMES,
     now_ist,
+    is_api_success,
 )
 
 if TYPE_CHECKING:
@@ -273,7 +274,7 @@ class FilterEngine:
 
         try:
             q = _get_client().quotes(symbol=cfg.UNDERLYING, exchange=INDEX_EXCH)
-            if isinstance(q, dict) and q.get("status") == "success":
+            if is_api_success(q):
                 current_spot = float(q.get("data", {}).get("ltp", 0) or 0)
             else:
                 current_spot = 0.0

@@ -34,6 +34,7 @@ from src._shared import (
     IST,
     DAY_NAMES, MONTH_NAMES,
     now_ist, qty, parse_hhmm, active_legs, sl_level,
+    is_api_success, parse_ist_datetime,
 )
 
 from src.vix_manager import VIXManager
@@ -685,7 +686,7 @@ class StrategyCore:
         try:
             client = _get_client()
             resp = client.funds()
-            if isinstance(resp, dict) and resp.get("status") == "success":
+            if is_api_success(resp):
                 data = resp.get("data", {})
                 cash = float(data.get("availablecash",  0) or 0)
                 coll = float(data.get("collateral",     0) or 0)
@@ -867,12 +868,8 @@ class StrategyCore:
 
             # Check cooldown
             if last_close_time:
-                try:
-                    from datetime import datetime as _dt
-                    close_dt = _dt.fromisoformat(str(last_close_time))
-                    if close_dt.tzinfo is None:
-                        from src._shared import IST as _IST
-                        close_dt = _IST.localize(close_dt)
+                close_dt = parse_ist_datetime(last_close_time)
+                if close_dt:
                     elapsed_min = (now_ist() - close_dt).total_seconds() / 60.0
                     if elapsed_min < cfg.REENTRY_COOLDOWN_MIN:
                         info(
@@ -880,8 +877,6 @@ class StrategyCore:
                             f"{cfg.REENTRY_COOLDOWN_MIN}m required — skipping"
                         )
                         return
-                except Exception as exc:
-                    debug(f"Re-entry cooldown check failed: {exc} — allowing entry")
 
             # Check previous trade loss threshold
             if last_trade_pnl < 0 and abs(last_trade_pnl) > cfg.REENTRY_MAX_LOSS_FOR_REENTRY:
@@ -919,9 +914,24 @@ class StrategyCore:
             error("Entry ABORTED — insufficient margin (cash + collateral)")
             return
 
-        # ── 7. Reset daily counters and place entry ────────────────────────────
-        state["today_pnl"]  = 0.0
-        state["closed_pnl"] = 0.0
+        # ── 7. Reset trade-level counters and place entry ──────────────────────
+        # FIX-XVII: On re-entry, carry forward cumulative daily P&L so the daily
+        # loss limit sees the TOTAL day's losses, not just the current trade.
+        # First trade of the day starts from zero; re-entries carry forward.
+        if is_first_trade:
+            state["cumulative_daily_pnl"] = 0.0
+            state["today_pnl"]  = 0.0
+            state["closed_pnl"] = 0.0
+        else:
+            prev_pnl = state.get("last_trade_pnl", 0.0)
+            cumulative = state.get("cumulative_daily_pnl", 0.0) + prev_pnl
+            state["cumulative_daily_pnl"] = cumulative
+            state["today_pnl"]  = cumulative
+            state["closed_pnl"] = cumulative
+            info(
+                f"  Cumulative daily P&L carried forward: Rs.{cumulative:.0f} "
+                f"(prev trade: Rs.{prev_pnl:.0f})"
+            )
 
         # Store current DTE for DTE-aware SL override (used by _base_sl_percent())
         if dte_now is None:

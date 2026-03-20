@@ -192,12 +192,7 @@ def active_legs() -> list[str]:
     Possible values: ['CE', 'PE'] | ['CE'] | ['PE'] | []
     Reads directly from the shared state singleton.
     """
-    result = []
-    if state["ce_active"]:
-        result.append("CE")
-    if state["pe_active"]:
-        result.append("PE")
-    return result
+    return [leg for leg, key in (("CE", "ce_active"), ("PE", "pe_active")) if state[key]]
 
 
 def _base_sl_percent() -> float:
@@ -240,6 +235,36 @@ def _dynamic_sl_percent() -> float:
     return base
 
 
+def parse_ist_datetime(raw: str | datetime | None) -> datetime | None:
+    """
+    Parse a raw value (ISO string or datetime) into an IST-aware datetime.
+
+    Returns None if parsing fails or raw is None/empty.
+    Used across modules to avoid duplicating datetime parsing + IST localization.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else IST.localize(raw)
+    try:
+        parsed = datetime.fromisoformat(str(raw))
+        return parsed if parsed.tzinfo else IST.localize(parsed)
+    except (ValueError, TypeError):
+        return None
+
+
+def is_api_success(resp: object) -> bool:
+    """Check if an OpenAlgo API response indicates success."""
+    return isinstance(resp, dict) and resp.get("status") == "success"
+
+
+def get_api_error(resp: object) -> str:
+    """Extract error message from a failed OpenAlgo API response."""
+    if isinstance(resp, dict):
+        return resp.get("message", str(resp))
+    return str(resp)
+
+
 def sl_level(leg: str) -> float:
     """
     Return the CURRENT effective SL trigger price for a given leg.
@@ -256,7 +281,20 @@ def sl_level(leg: str) -> float:
     leg_lower = leg.lower()
     entry = state[f"entry_price_{leg_lower}"]
     if entry <= 0:
-        return 0.0
+        # FIX-XIX: Fallback SL when fill price is unknown (fill capture failed).
+        # Use the other leg's entry price as a proxy — ATM straddle legs have
+        # near-identical premium. This prevents the leg from running with NO SL
+        # protection for the entire session.
+        other_leg = "ce" if leg_lower == "pe" else "pe"
+        other_entry = state.get(f"entry_price_{other_leg}", 0.0)
+        if other_entry > 0:
+            fallback_sl = round(other_entry * (1.0 + _dynamic_sl_percent() / 100.0), 2)
+            warn(
+                f"sl_level({leg}): entry_price=0 — using other leg's entry "
+                f"Rs.{other_entry:.2f} as proxy → fallback SL Rs.{fallback_sl:.2f}"
+            )
+            return fallback_sl
+        return 0.0  # Both legs have no fill price — truly no SL possible
 
     # 1. Trailing SL takes highest priority once activated
     if cfg.TRAILING_SL_ENABLED and state.get(f"trailing_active_{leg_lower}", False):
@@ -265,35 +303,30 @@ def sl_level(leg: str) -> float:
             return trail_sl
 
     # 2. Breakeven SL — only when tighter than fixed SL AND grace period has elapsed
+    fixed_sl = round(entry * (1.0 + _dynamic_sl_percent() / 100.0), 2)
+
     if cfg.BREAKEVEN_AFTER_PARTIAL_ENABLED and state.get(f"breakeven_active_{leg_lower}", False):
-        be_sl    = state.get(f"breakeven_sl_{leg_lower}", 0.0)
-        fixed_sl = round(entry * (1.0 + _dynamic_sl_percent() / 100.0), 2)
+        be_sl = state.get(f"breakeven_sl_{leg_lower}", 0.0)
         if be_sl > 0 and be_sl < fixed_sl:
-            # ── Grace period gate ────────────────────────────────────
-            # Only apply the breakeven SL after BREAKEVEN_GRACE_PERIOD_MIN
-            # minutes have passed since it was activated. During the grace
-            # window, the normal fixed/dynamic SL protects the leg, giving
-            # it time to decay and reach the breakeven level organically.
-            be_activated_at = state.get(f"breakeven_activated_at_{leg_lower}")
-            if be_activated_at and cfg.BREAKEVEN_GRACE_PERIOD_MIN > 0:
-                try:
-                    if isinstance(be_activated_at, str):
-                        be_activated_at = datetime.fromisoformat(be_activated_at)
-                    if be_activated_at.tzinfo is None:
-                        be_activated_at = IST.localize(be_activated_at)
-                    elapsed_min = (now_ist() - be_activated_at).total_seconds() / 60.0
-                    if elapsed_min < cfg.BREAKEVEN_GRACE_PERIOD_MIN:
-                        # Grace period still active — fall through to fixed SL
-                        pass
-                    else:
-                        return be_sl  # Grace period elapsed — breakeven SL active
-                except Exception:
-                    return be_sl  # Parse error — fail-safe to breakeven
-            else:
-                return be_sl  # No grace period or no timestamp — apply immediately
+            # Grace period gate: apply breakeven SL only after the grace window
+            # has elapsed. During the grace window, the normal fixed/dynamic SL
+            # protects the leg, giving it time to decay organically.
+            if not cfg.BREAKEVEN_GRACE_PERIOD_MIN:
+                return be_sl  # No grace period configured — apply immediately
+
+            be_activated_at = parse_ist_datetime(
+                state.get(f"breakeven_activated_at_{leg_lower}")
+            )
+            if be_activated_at is None:
+                return be_sl  # No timestamp — fail-safe to breakeven
+
+            elapsed_min = (now_ist() - be_activated_at).total_seconds() / 60.0
+            if elapsed_min >= cfg.BREAKEVEN_GRACE_PERIOD_MIN:
+                return be_sl  # Grace period elapsed — breakeven SL active
+            # Grace period still active — fall through to fixed SL
 
     # 3. Fixed SL (time-graduated when DYNAMIC_SL_ENABLED, DTE-aware via _base_sl_percent)
-    return round(entry * (1.0 + _dynamic_sl_percent() / 100.0), 2)
+    return fixed_sl
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

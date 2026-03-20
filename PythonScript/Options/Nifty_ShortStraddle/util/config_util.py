@@ -142,6 +142,7 @@ class Config:
     DAILY_LOSS_LIMIT_PER_LOT:    float
     DAILY_PROFIT_TARGET:         float   # derived: per_lot × number_of_lots
     DAILY_LOSS_LIMIT:            float   # derived: per_lot × number_of_lots
+    NET_PNL_GUARD_MAX_DEFER_MIN: int     # max minutes to defer SL via Net P&L Guard (0 = unlimited)
 
     # ── Section 7A — Margin Guard ─────────────────────────────────────────────
     MARGIN_GUARD_ENABLED:   bool
@@ -167,6 +168,7 @@ class Config:
     # ── Section 7E — Combined Premium Decay Exit ─────────────────────────────
     COMBINED_DECAY_EXIT_ENABLED: bool
     COMBINED_DECAY_TARGET_PCT:   float
+    COMBINED_DECAY_DTE_OVERRIDE: dict    # {int → float} DTE → decay target % override
 
     # ── Section 7F — Winner-Leg Early Booking ────────────────────────────────
     WINNER_LEG_EARLY_EXIT_ENABLED:  bool
@@ -716,6 +718,7 @@ class Config:
             DAILY_LOSS_LIMIT_PER_LOT    = loss_per_lot,
             DAILY_PROFIT_TARGET         = profit_per_lot * number_of_lots,  # derived
             DAILY_LOSS_LIMIT            = loss_per_lot   * number_of_lots,  # derived
+            NET_PNL_GUARD_MAX_DEFER_MIN = int(risk.get("net_pnl_guard_max_defer_min", 15)),
 
             # Section 7A — Margin Guard
             MARGIN_GUARD_ENABLED   = bool(mg.get("enabled",         True)),
@@ -741,6 +744,7 @@ class Config:
             # Section 7E — Combined Premium Decay Exit
             COMBINED_DECAY_EXIT_ENABLED = bool(cde.get("enabled",          True)),
             COMBINED_DECAY_TARGET_PCT   = float(cde.get("decay_target_pct", 60.0)),
+            COMBINED_DECAY_DTE_OVERRIDE = {int(k): float(v) for k, v in cde.get("dte_override", {}).items()},
 
             # Section 7F — Winner-Leg Early Booking
             WINNER_LEG_EARLY_EXIT_ENABLED  = bool(wlb.get("enabled",             True)),

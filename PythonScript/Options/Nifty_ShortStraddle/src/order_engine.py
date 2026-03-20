@@ -28,6 +28,7 @@ from src._shared import (
     OPTION_EXCH, IST,
     _monitor_lock,
     now_ist, qty, active_legs, sl_level, _dynamic_sl_percent,
+    is_api_success, get_api_error, parse_ist_datetime,
 )
 
 # Module-level globals shared with other modules via _shared
@@ -118,10 +119,9 @@ class OrderEngine:
             telegram(f"ENTRY EXCEPTION\n{exc}")
             return False
 
-        if not isinstance(resp, dict) or resp.get("status") != "success":
-            err = resp.get("message", str(resp)) if isinstance(resp, dict) else str(resp)
-            error(f"Entry FAILED: {err}")
-            telegram(f"ENTRY FAILED\n{err}")
+        if not is_api_success(resp):
+            error(f"Entry FAILED: {get_api_error(resp)}")
+            telegram(f"ENTRY FAILED\n{get_api_error(resp)}")
             return False
 
         # ── Parse per-leg results ─────────────────────────────────────────────
@@ -186,16 +186,50 @@ class OrderEngine:
         state["symbol_pe"]          = filled_legs["PE"]["symbol"]
         state["orderid_ce"]         = filled_legs["CE"]["orderid"]
         state["orderid_pe"]         = filled_legs["PE"]["orderid"]
-        state["underlying_ltp"]     = float(resp.get("underlying_ltp", 0))
+        # FIX-XXII: Prefer fresh NIFTY spot fetch over API response value.
+        # The optionsmultiorder response's underlying_ltp can be stale (pre-fill
+        # snapshot) on volatile opens, skewing the spot-move exit threshold.
+        _api_spot = float(resp.get("underlying_ltp", 0))
+        try:
+            _fresh_q = _get_client().quotes(symbol=cfg.UNDERLYING, exchange="NSE_INDEX")
+            if is_api_success(_fresh_q):
+                _fresh_spot = float(_fresh_q.get("data", {}).get("ltp", 0) or 0)
+                if _fresh_spot > 0:
+                    state["underlying_ltp"] = _fresh_spot
+                    if abs(_fresh_spot - _api_spot) > 5:
+                        debug(
+                            f"  Spot corrected: API response had Rs.{_api_spot:.2f}, "
+                            f"fresh quote Rs.{_fresh_spot:.2f}"
+                        )
+                else:
+                    state["underlying_ltp"] = _api_spot
+            else:
+                state["underlying_ltp"] = _api_spot
+        except Exception:
+            state["underlying_ltp"] = _api_spot
         state["entry_time"]         = now_dt.isoformat()
         state["entry_date"]         = now_dt.strftime("%Y-%m-%d")
-        state["closed_pnl"]         = 0.0
-        state["today_pnl"]          = 0.0
+        # FIX-XVII: Preserve cumulative daily P&L set by strategy_core on re-entry.
+        # On first trade, these are already 0.0. On re-entry, strategy_core set
+        # them to the carry-forward cumulative value — do NOT reset to 0.
+        # Only reset exit_reason (new trade starts fresh).
         state["exit_reason"]        = ""
         state["trailing_active_ce"] = False
         state["trailing_active_pe"] = False
         state["trailing_sl_ce"]     = 0.0
         state["trailing_sl_pe"]     = 0.0
+        # FIX-XVIII: Clear stale breakeven state from previous trade (critical for re-entry).
+        # Without this, a re-entry could inherit breakeven SL from the prior trade and
+        # trigger an immediate SL hit on the new position.
+        state["breakeven_active_ce"]       = False
+        state["breakeven_active_pe"]       = False
+        state["breakeven_sl_ce"]           = 0.0
+        state["breakeven_sl_pe"]           = 0.0
+        state["breakeven_activated_at_ce"] = None
+        state["breakeven_activated_at_pe"] = None
+        # FIX-XX: Clear Net P&L Guard deferral timestamps from previous trade
+        state["net_pnl_defer_start_ce"]    = None
+        state["net_pnl_defer_start_pe"]    = None
 
         # FIX-I (v5.5.0): save BEFORE fill capture — crash during fill capture
         # still leaves a valid in_position=True state file.
@@ -230,7 +264,7 @@ class OrderEngine:
                     order_id = oid,
                     strategy = cfg.STRATEGY_NAME,
                 )
-                if isinstance(resp, dict) and resp.get("status") == "success":
+                if is_api_success(resp):
                     avg_px = float(resp.get("data", {}).get("average_price", 0) or 0)
                     if avg_px > 0:
                         state[f"entry_price_{leg.lower()}"] = avg_px
@@ -242,8 +276,7 @@ class OrderEngine:
                     else:
                         debug(f"  Fill [{leg}]: avg_px=0 on attempt {attempt}, retrying...")
                 else:
-                    msg = resp.get("message", "") if isinstance(resp, dict) else str(resp)
-                    debug(f"  orderstatus [{leg}] attempt {attempt} failed: {msg}")
+                    debug(f"  orderstatus [{leg}] attempt {attempt} failed: {get_api_error(resp)}")
             except Exception as exc:
                 debug(f"  orderstatus [{leg}] attempt {attempt} exception: {exc}")
 
@@ -356,7 +389,7 @@ class OrderEngine:
                     order_id = orderid,
                     strategy = cfg.STRATEGY_NAME,
                 )
-                if isinstance(resp, dict) and resp.get("status") == "success":
+                if is_api_success(resp):
                     avg_px = float(resp.get("data", {}).get("average_price", 0) or 0)
                     if avg_px > 0:
                         return avg_px
@@ -413,38 +446,49 @@ class OrderEngine:
         info(f"  Entry       : Rs.{entry_px:.2f}  |  LTP (approx): Rs.{current_ltp:.2f}")
         info(f"  Approx P&L  : Rs.{approx_pnl:.0f}")
 
-        # ── Place BUY MARKET ──────────────────────────────────────────────────
-        try:
-            resp = _get_client().placeorder(
-                strategy  = cfg.STRATEGY_NAME,
-                symbol    = symbol,
-                exchange  = OPTION_EXCH,
-                action    = "BUY",
-                quantity  = qty(),
-                pricetype = "MARKET",
-                product   = cfg.PRODUCT,
-                price     = 0,
-            )
-        except Exception as exc:
-            error(f"close_one_leg({leg_upper}) ORDER EXCEPTION: {exc}")
-            error(f"*** MANUAL ACTION REQUIRED — close {symbol} in broker terminal ***")
-            telegram(
-                f"🚨 EXIT FAILED — {leg_upper} ORDER EXCEPTION\n"
-                f"MANUAL ACTION REQUIRED\n"
-                f"Symbol : {symbol}\n"
-                f"Error  : {exc}"
-            )
-            return
+        # ── Place BUY MARKET with retry (FIX-XXI) ────────────────────────────
+        # SL exits are critical — retry up to 3 times with 1s backoff before
+        # falling back to manual intervention. Prevents missed close when the
+        # first attempt fails due to transient network/broker issue.
+        MAX_CLOSE_ATTEMPTS = 3
+        CLOSE_RETRY_DELAY  = 1.0
+        resp = None
+        last_error = ""
 
-        if not (isinstance(resp, dict) and resp.get("status") == "success"):
-            err = resp.get("message", str(resp)) if isinstance(resp, dict) else str(resp)
-            error(f"close_one_leg({leg_upper}) ORDER REJECTED: {err}")
+        for attempt in range(1, MAX_CLOSE_ATTEMPTS + 1):
+            try:
+                resp = _get_client().placeorder(
+                    strategy  = cfg.STRATEGY_NAME,
+                    symbol    = symbol,
+                    exchange  = OPTION_EXCH,
+                    action    = "BUY",
+                    quantity  = qty(),
+                    pricetype = "MARKET",
+                    product   = cfg.PRODUCT,
+                    price     = 0,
+                )
+                if is_api_success(resp):
+                    if attempt > 1:
+                        info(f"  Close order succeeded on attempt {attempt}")
+                    break  # Success — exit retry loop
+                last_error = get_api_error(resp)
+                warn(f"close_one_leg({leg_upper}) attempt {attempt}/{MAX_CLOSE_ATTEMPTS} rejected: {last_error}")
+            except Exception as exc:
+                last_error = str(exc)
+                warn(f"close_one_leg({leg_upper}) attempt {attempt}/{MAX_CLOSE_ATTEMPTS} exception: {exc}")
+                resp = None
+
+            if attempt < MAX_CLOSE_ATTEMPTS:
+                time.sleep(CLOSE_RETRY_DELAY)
+
+        if resp is None or not is_api_success(resp):
+            error(f"close_one_leg({leg_upper}) FAILED after {MAX_CLOSE_ATTEMPTS} attempts: {last_error}")
             error(f"*** MANUAL ACTION REQUIRED — close {symbol} in broker terminal ***")
             telegram(
-                f"🚨 EXIT FAILED — {leg_upper} ORDER REJECTED\n"
+                f"🚨 EXIT FAILED — {leg_upper} after {MAX_CLOSE_ATTEMPTS} retries\n"
                 f"MANUAL ACTION REQUIRED\n"
                 f"Symbol : {symbol}\n"
-                f"Error  : {err}"
+                f"Error  : {last_error}"
             )
             return
 
@@ -595,12 +639,10 @@ class OrderEngine:
             closepos_err = ""
             try:
                 resp = _get_client().closeposition(strategy=cfg.STRATEGY_NAME)
-                if isinstance(resp, dict) and resp.get("status") == "success":
+                if is_api_success(resp):
                     closepos_ok = True
                 else:
-                    closepos_err = (
-                        resp.get("message", str(resp)) if isinstance(resp, dict) else str(resp)
-                    )
+                    closepos_err = get_api_error(resp)
             except Exception as exc:
                 closepos_err = str(exc)
 
@@ -682,11 +724,11 @@ class OrderEngine:
         info("Emergency close via closeposition()...")
         try:
             resp = _get_client().closeposition(strategy=cfg.STRATEGY_NAME)
-            if isinstance(resp, dict) and resp.get("status") == "success":
+            if is_api_success(resp):
                 info("Emergency close: SUCCESS")
                 return True
             else:
-                err = resp.get("message", str(resp)) if isinstance(resp, dict) else str(resp)
+                err = get_api_error(resp)
                 error(f"Emergency close FAILED: {err}")
                 error("*** MANUAL ACTION REQUIRED in broker terminal ***")
                 telegram(
@@ -719,13 +761,10 @@ class OrderEngine:
             return 0.0
         try:
             q = _get_client().quotes(symbol=symbol, exchange=OPTION_EXCH)
-            if isinstance(q, dict) and q.get("status") == "success":
+            if is_api_success(q):
                 ltp = float(q.get("data", {}).get("ltp", 0) or 0)
                 return ltp if ltp > 0 else 0.0
-            warn(
-                f"quotes() failed [{leg}]: "
-                f"{q.get('message', '') if isinstance(q, dict) else str(q)}"
-            )
+            warn(f"quotes() failed [{leg}]: {get_api_error(q)}")
             return 0.0
         except Exception as exc:
             warn(f"quotes() exception [{leg}]: {exc}")
@@ -745,17 +784,11 @@ class OrderEngine:
             return
 
         try:
-            entry_dt  = None
-            held_mins = None
-            raw_et    = state.get("entry_time")
-            if raw_et:
-                try:
-                    entry_dt = datetime.fromisoformat(str(raw_et))
-                    if entry_dt.tzinfo is None:
-                        entry_dt = IST.localize(entry_dt)
-                    held_mins = int((exit_dt - entry_dt).total_seconds() // 60)
-                except Exception:
-                    pass
+            entry_dt  = parse_ist_datetime(state.get("entry_time"))
+            held_mins = (
+                int((exit_dt - entry_dt).total_seconds() // 60)
+                if entry_dt else None
+            )
 
             record = {
                 "date"            : exit_dt.strftime("%Y-%m-%d"),
@@ -800,15 +833,10 @@ class OrderEngine:
         exit_dt      = now_ist()
         duration_str = ""
 
-        if state.get("entry_time"):
-            try:
-                entry_dt = datetime.fromisoformat(str(state["entry_time"]))
-                if entry_dt.tzinfo is None:
-                    entry_dt = IST.localize(entry_dt)
-                held_mins    = int((exit_dt - entry_dt).total_seconds() // 60)
-                duration_str = f"  |  Held: {held_mins} min"
-            except Exception:
-                pass
+        entry_dt = parse_ist_datetime(state.get("entry_time"))
+        if entry_dt:
+            held_mins    = int((exit_dt - entry_dt).total_seconds() // 60)
+            duration_str = f"  |  Held: {held_mins} min"
 
         self._append_trade_log(reason, final_pnl, exit_dt)
 
