@@ -160,6 +160,17 @@ INITIAL_STATE: dict[str, Any] = {
     # ── Running P&L (updated every monitor cycle) ─────────────────────────────
     "today_pnl"           : 0.0,
 
+    # ── Enriched trade log context ─────────────────────────────────────────────
+    # sl_events tracks each partial close as it happens (list of dicts):
+    #   [{"leg": "CE", "trigger": "trailing_sl", "time": "...", "ltp": 45.2,
+    #     "entry_px": 100.0, "pnl": 3575.0}]
+    "sl_events"           : [],
+    # filters_passed records which entry filters were checked (list of strings):
+    #   ["vix", "ivr", "ivp", "orb", "margin", "momentum"]
+    "filters_passed"      : [],
+    # is_reentry flags whether this trade was a re-entry after early close
+    "is_reentry"          : False,
+
     # ── Session statistics ─────────────────────────────────────────────────────
     "trade_count"         : 0,
     "exit_reason"         : "",

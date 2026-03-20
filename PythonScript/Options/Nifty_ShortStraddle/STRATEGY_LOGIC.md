@@ -1,6 +1,6 @@
 # NIFTY Short Straddle — Partial Square Off Strategy
 
-**Version 6.3.0** | OpenAlgo + Dhan API | Restart-Safe | Production Grade
+**Version 6.4.0** | OpenAlgo + Dhan API | Restart-Safe | Production Grade
 
 ---
 
@@ -26,6 +26,7 @@
 14. [Worked Examples with Sample Data](#14-worked-examples-with-sample-data)
 15. [Edge Cases & Fail-Safe Behaviour](#15-edge-cases--fail-safe-behaviour)
 16. [State Keys Reference](#16-state-keys-reference)
+16A. [Enriched Trade Log](#16a-enriched-trade-log-tradesjsonl-v640)
 17. [Configuration Reference](#17-configuration-reference)
 18. [Telegram Notifications](#18-telegram-notifications)
 
@@ -1255,6 +1256,14 @@ Both can coexist. Target fires first if reached; trail catches reversal.
 | `margin_required` | float | Margin consumed by the straddle |
 | `margin_available` | float | Account capital at entry time |
 
+### Enriched Trade Log State [v6.4.0]
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `sl_events` | list[dict] | Partial close events — leg, trigger, time, prices, P&L |
+| `filters_passed` | list[str] | Entry filters that passed (e.g. "dte", "vix", "orb") |
+| `is_reentry` | bool | Whether this trade is a re-entry after early close |
+
 ### Re-Entry State
 
 | Key | Type | Description |
@@ -1262,6 +1271,93 @@ Both can coexist. Target fires first if reached; trail catches reversal.
 | `last_close_time` | str (ISO) | When last position fully closed |
 | `last_trade_pnl` | float | P&L of last completed trade |
 | `reentry_count_today` | int | Number of re-entries today |
+
+---
+
+## 16A. Enriched Trade Log (trades.jsonl) [v6.4.0]
+
+Each completed trade appends one JSON line to `data/trades.jsonl` with full decision
+metadata for post-session analysis and parameter tuning.
+
+### Record Structure
+
+```json
+{
+  "date": "2026-03-21",
+  "entry_time": "2026-03-21T09:35:00+05:30",
+  "exit_time": "2026-03-21T14:22:15+05:30",
+  "duration_min": 287,
+  "symbol_ce": "NIFTY25MAR2623300CE",
+  "symbol_pe": "NIFTY25MAR2623300PE",
+  "entry_price_ce": 102.5,
+  "entry_price_pe": 97.3,
+  "exit_price_ce": 45.2,
+  "exit_price_pe": 12.0,
+  "combined_premium": 199.8,
+  "ce_pnl": 3724,
+  "pe_pnl": 5545,
+  "closed_pnl": 9269,
+  "exit_reason": "Combined Premium 62.0% Decay Target Reached",
+  "trade_count": 1,
+
+  "vix_at_entry": 16.8,
+  "ivr_at_entry": 45.2,
+  "ivp_at_entry": 62.0,
+  "underlying_ltp": 23465,
+  "orb_price": 23450,
+  "margin_required": 125000,
+  "margin_available": 250000,
+
+  "vix_at_exit": 17.2,
+  "spot_at_exit": 23490,
+  "spot_move_pct": 0.11,
+
+  "dte": 2,
+  "number_of_lots": 1,
+  "lot_size": 65,
+  "is_reentry": false,
+
+  "filters_passed": ["dte", "vix", "ivr_ivp", "orb", "margin"],
+
+  "sl_events": [
+    {
+      "leg": "CE",
+      "trigger": "Trailing SL Hit",
+      "time": "2026-03-21T13:10:22+05:30",
+      "ltp": 45.2,
+      "entry_px": 102.5,
+      "fill_px": 45.5,
+      "pnl": 3705
+    }
+  ],
+
+  "trailing_activated_ce": true,
+  "trailing_activated_pe": false,
+  "trailing_sl_ce": 46.8,
+  "trailing_sl_pe": 0.0,
+  "breakeven_activated_ce": false,
+  "breakeven_activated_pe": false,
+  "breakeven_sl_ce": 0.0,
+  "breakeven_sl_pe": 0.0,
+  "recovery_lock_fired": false,
+  "recovery_peak_pnl": 0.0,
+  "combined_trail_fired": false,
+  "combined_decay_peak": 0.0
+}
+```
+
+### What Each Section Enables
+
+| Section | Fields | Analysis Use |
+|---------|--------|-------------|
+| **Core trade** | entry/exit prices, P&L, duration | Basic win/loss tracking |
+| **Per-leg P&L** | ce_pnl, pe_pnl, combined_premium | Which leg contributed, premium quality |
+| **Entry context** | VIX, IVR, IVP, ORB, margin | Correlate market regime with outcomes |
+| **Exit context** | vix_at_exit, spot_at_exit, spot_move_pct | How market moved during trade |
+| **DTE + lots** | dte, number_of_lots, is_reentry | Performance by DTE, re-entry success rate |
+| **Filters** | filters_passed | Which filters contributed to entries |
+| **SL events** | sl_events[] | Partial close timing, which triggers fire |
+| **Risk layers** | trailing/breakeven/recovery/trail states | Which risk layer was active at exit |
 
 ---
 

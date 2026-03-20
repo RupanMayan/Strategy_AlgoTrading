@@ -236,6 +236,10 @@ class OrderEngine:
         # FIX-XXVIII: Clear combined profit trail state from previous trade
         state["combined_trail_active"]     = False
         state["combined_decay_peak"]       = 0.0
+        # Enriched trade log: reset per-trade decision tracking
+        state["sl_events"]                 = []
+        state["filters_passed"]            = []
+        # is_reentry is set by strategy_core BEFORE place_entry() — don't reset it
 
         # FIX-I (v5.5.0): save BEFORE fill capture — crash during fill capture
         # still leaves a valid in_position=True state file.
@@ -521,6 +525,20 @@ class OrderEngine:
         )
         state[active_key]   = False
         state["closed_pnl"] = state["closed_pnl"] + realised_pnl
+
+        # ── Record SL event for enriched trade log ──────────────────────────
+        sl_event = {
+            "leg"      : leg_upper,
+            "trigger"  : reason,
+            "time"     : now_ist().isoformat(),
+            "ltp"      : round(current_ltp, 2),
+            "entry_px" : round(entry_px, 2),
+            "fill_px"  : round(actual_fill_px if actual_fill_px > 0 else current_ltp, 2),
+            "pnl"      : round(realised_pnl, 2),
+        }
+        if not isinstance(state.get("sl_events"), list):
+            state["sl_events"] = []
+        state["sl_events"].append(sl_event)
 
         info(f"  {leg_upper} LEG CLOSED  |  Reason: {reason}")
         info(f"  Realised this-leg P&L  : Rs.{realised_pnl:.0f}")
@@ -815,6 +833,11 @@ class OrderEngine:
 
         Called from _mark_fully_flat() BEFORE state is reset, so all entry
         context (prices, symbols, VIX, IVR, margin) is still readable.
+
+        Enriched record captures decision metadata (filters, SL events,
+        trailing/breakeven state, DTE, VIX at exit, spot at exit) for
+        cross-day analysis and parameter tuning.
+
         A corrupt or incomplete final line is safe to ignore on read (JSONL format).
         """
         if not cfg.TRADE_LOG_FILE:
@@ -827,25 +850,95 @@ class OrderEngine:
                 if entry_dt else None
             )
 
+            # ── Fetch live context at exit (best-effort, non-blocking) ──────
+            vix_at_exit  = 0.0
+            spot_at_exit = 0.0
+            try:
+                vix_q = _get_client().quotes(symbol="INDIAVIX", exchange="NSE_INDEX")
+                if is_api_success(vix_q):
+                    vix_at_exit = float(vix_q.get("data", {}).get("ltp", 0) or 0)
+            except Exception:
+                pass
+            try:
+                spot_q = _get_client().quotes(symbol=cfg.UNDERLYING, exchange="NSE_INDEX")
+                if is_api_success(spot_q):
+                    spot_at_exit = float(spot_q.get("data", {}).get("ltp", 0) or 0)
+            except Exception:
+                pass
+
+            # ── Compute per-leg P&L and combined premium ────────────────────
+            ce_entry = state.get("entry_price_ce", 0.0)
+            pe_entry = state.get("entry_price_pe", 0.0)
+            ce_exit  = state.get("exit_price_ce", 0.0)
+            pe_exit  = state.get("exit_price_pe", 0.0)
+            combined_premium = round(ce_entry + pe_entry, 2)
+            ce_pnl = round((ce_entry - ce_exit) * qty(), 2) if ce_entry > 0 and ce_exit > 0 else 0.0
+            pe_pnl = round((pe_entry - pe_exit) * qty(), 2) if pe_entry > 0 and pe_exit > 0 else 0.0
+
+            # ── Build enriched record ───────────────────────────────────────
             record = {
+                # ── Core trade data (existing) ──────────────────────────────
                 "date"            : exit_dt.strftime("%Y-%m-%d"),
                 "entry_time"      : entry_dt.isoformat() if entry_dt else None,
                 "exit_time"       : exit_dt.isoformat(),
                 "duration_min"    : held_mins,
                 "symbol_ce"       : state.get("symbol_ce", ""),
                 "symbol_pe"       : state.get("symbol_pe", ""),
-                "entry_price_ce"  : state.get("entry_price_ce", 0.0),
-                "entry_price_pe"  : state.get("entry_price_pe", 0.0),
-                "exit_price_ce"   : state.get("exit_price_ce", 0.0),
-                "exit_price_pe"   : state.get("exit_price_pe", 0.0),
+                "entry_price_ce"  : ce_entry,
+                "entry_price_pe"  : pe_entry,
+                "exit_price_ce"   : ce_exit,
+                "exit_price_pe"   : pe_exit,
+                "combined_premium": combined_premium,
+                "ce_pnl"          : ce_pnl,
+                "pe_pnl"          : pe_pnl,
                 "closed_pnl"      : round(final_pnl, 2),
                 "exit_reason"     : reason,
                 "trade_count"     : state.get("trade_count", 0) + 1,
+
+                # ── Market context at entry ─────────────────────────────────
                 "vix_at_entry"    : state.get("vix_at_entry", 0.0),
                 "ivr_at_entry"    : state.get("ivr_at_entry", 0.0),
                 "ivp_at_entry"    : state.get("ivp_at_entry", 0.0),
                 "underlying_ltp"  : state.get("underlying_ltp", 0.0),
+                "orb_price"       : state.get("orb_price", 0.0),
                 "margin_required" : state.get("margin_required", 0.0),
+                "margin_available": state.get("margin_available", 0.0),
+
+                # ── Market context at exit ──────────────────────────────────
+                "vix_at_exit"     : vix_at_exit,
+                "spot_at_exit"    : spot_at_exit,
+                "spot_move_pct"   : (
+                    round(abs(spot_at_exit - state.get("underlying_ltp", 0.0))
+                          / state["underlying_ltp"] * 100, 2)
+                    if spot_at_exit > 0 and state.get("underlying_ltp", 0) > 0
+                    else 0.0
+                ),
+
+                # ── DTE and session info ────────────────────────────────────
+                "dte"             : state.get("current_dte", None),
+                "number_of_lots"  : cfg.NUMBER_OF_LOTS,
+                "lot_size"        : cfg.LOT_SIZE,
+                "is_reentry"      : state.get("is_reentry", False),
+
+                # ── Entry filter chain results ──────────────────────────────
+                "filters_passed"  : state.get("filters_passed", []),
+
+                # ── SL events (partial closes) ──────────────────────────────
+                "sl_events"       : state.get("sl_events", []),
+
+                # ── Risk layer state at exit ────────────────────────────────
+                "trailing_activated_ce": state.get("trailing_active_ce", False),
+                "trailing_activated_pe": state.get("trailing_active_pe", False),
+                "trailing_sl_ce"      : state.get("trailing_sl_ce", 0.0),
+                "trailing_sl_pe"      : state.get("trailing_sl_pe", 0.0),
+                "breakeven_activated_ce": state.get("breakeven_active_ce", False),
+                "breakeven_activated_pe": state.get("breakeven_active_pe", False),
+                "breakeven_sl_ce"     : state.get("breakeven_sl_ce", 0.0),
+                "breakeven_sl_pe"     : state.get("breakeven_sl_pe", 0.0),
+                "recovery_lock_fired" : state.get("recovery_lock_active", False),
+                "recovery_peak_pnl"   : state.get("recovery_peak_pnl", 0.0),
+                "combined_trail_fired": state.get("combined_trail_active", False),
+                "combined_decay_peak" : state.get("combined_decay_peak", 0.0),
             }
 
             with open(cfg.TRADE_LOG_FILE, "a", encoding="utf-8") as f:
@@ -919,6 +1012,9 @@ class OrderEngine:
         state["entry_date"]               = None
         state["margin_required"]          = 0.0
         state["margin_available"]         = 0.0
+        state["sl_events"]                = []
+        state["filters_passed"]           = []
+        state["is_reentry"]               = False
         state["exit_reason"]              = reason
         state["trade_count"]             += 1
 

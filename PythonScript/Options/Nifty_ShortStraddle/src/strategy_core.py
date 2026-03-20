@@ -894,32 +894,41 @@ class StrategyCore:
                 f"cooldown OK) — running full filter chain"
             )
 
+        # ── Track which filters pass for enriched trade log ─────────────────────
+        filters_passed: list[str] = []
+
         # ── 2. DTE filter + month filter ───────────────────────────────────────
         if not self._filter.dte_filter_ok(dte_now):
             return
+        filters_passed.append("dte")
 
         # ── 3. VIX filter ──────────────────────────────────────────────────────
         if not self._filter.vix_ok():
             return
+        filters_passed.append("vix")
 
         # ── 4. IVR / IVP filter — reuses VIX stored in state by vix_ok() ──────
         if not self._vix_manager.ivr_ivp_ok(state["vix_at_entry"]):
             return
+        filters_passed.append("ivr_ivp")
 
         # ── 5. Opening range filter ────────────────────────────────────────────
         if not self._filter.orb_filter_ok():
             return
+        filters_passed.append("orb")
 
         # ── 5B. FIX-XXVI: Momentum filter (re-entry only) ────────────────────
         if not is_first_trade:
             if not self._filter.momentum_filter_ok():
                 return
+            filters_passed.append("momentum")
 
         # ── 6. Resolve expiry ONCE (FIX-A) and run margin guard ───────────────
         expiry = self._filter.get_expiry()
         if not self._margin_guard.check(expiry):
             error("Entry ABORTED — insufficient margin (cash + collateral)")
             return
+        filters_passed.append("margin")
 
         # ── 7. Reset trade-level counters and place entry ──────────────────────
         # FIX-XVII: On re-entry, carry forward cumulative daily P&L so the daily
@@ -946,10 +955,16 @@ class StrategyCore:
         state["current_dte"] = dte_now
 
         success = self._order_engine.place_entry(expiry)
-        if success and not is_first_trade:
-            # Track re-entry count
-            state["reentry_count_today"] = reentry_count + 1
-            info(f"Re-entry #{state['reentry_count_today']} placed successfully")
+        if success:
+            # Store enriched trade log context AFTER place_entry() — place_entry()
+            # resets sl_events/filters_passed to [], so we set them after.
+            state["filters_passed"] = filters_passed
+            state["is_reentry"]     = not is_first_trade
+            save_state()
+            if not is_first_trade:
+                # Track re-entry count
+                state["reentry_count_today"] = reentry_count + 1
+                info(f"Re-entry #{state['reentry_count_today']} placed successfully")
         if not success:
             error("Entry FAILED — no position opened today")
             telegram("Entry FAILED — no position opened. Check logs.")

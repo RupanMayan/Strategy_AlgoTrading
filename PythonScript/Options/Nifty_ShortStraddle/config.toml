@@ -1,7 +1,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 #  NIFTY SHORT STRADDLE — PARTIAL SQUARE OFF  |  Configuration File
 #  Strategy : Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS
-#  Version  : 6.3.0
+#  Version  : 6.4.0
 #
 #  Sections:
 #    1.  OpenAlgo Connection
