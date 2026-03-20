@@ -1,6 +1,6 @@
 # NIFTY Short Straddle — Partial Square Off Strategy
 
-**Version 6.0.0** | OpenAlgo + Dhan API | Restart-Safe | Production Grade
+**Version 6.3.0** | OpenAlgo + Dhan API | Restart-Safe | Production Grade
 
 ---
 
@@ -12,12 +12,16 @@
 4. [Entry Filter Chain](#4-entry-filter-chain)
 5. [Stop-Loss Priority Chain](#5-stop-loss-priority-chain)
 6. [Partial Square Off Logic](#6-partial-square-off-logic)
-7. [Breakeven SL — Grace Period + Buffer](#7-breakeven-sl--grace-period--buffer)
+7. [Breakeven SL — Context-Aware + Grace Period + Buffer](#7-breakeven-sl--context-aware--grace-period--buffer)
 8. [Trailing Stop-Loss Engine](#8-trailing-stop-loss-engine)
 9. [DTE-Aware SL Widening](#9-dte-aware-sl-widening)
 10. [Dynamic Time-of-Day SL Tightening](#10-dynamic-time-of-day-sl-tightening)
 11. [Combined Net-P&L Guard](#11-combined-net-pl-guard)
 12. [Re-Entry After Early Close](#12-re-entry-after-early-close)
+12A. [Momentum Filter (Re-Entry)](#12a-momentum-filter-re-entry)
+12B. [Post-Partial Recovery Lock](#12b-post-partial-recovery-lock)
+12C. [Asymmetric Leg Booking](#12c-asymmetric-leg-booking)
+12D. [Combined Profit Trailing](#12d-combined-profit-trailing)
 13. [Risk Controls Summary](#13-risk-controls-summary)
 14. [Worked Examples with Sample Data](#14-worked-examples-with-sample-data)
 15. [Edge Cases & Fail-Safe Behaviour](#15-edge-cases--fail-safe-behaviour)
@@ -136,8 +140,11 @@ StrategyCore
        ├─ Update trailing SL (if applicable)
        ├─ Check per-leg SL (fixed/dynamic/trailing/breakeven)
        ├─ Check combined premium decay exit
+       ├─ Check asymmetric leg booking [v6.3.0]
+       ├─ Check combined profit trailing [v6.3.0]
        ├─ Check winner-leg early booking
        ├─ Update combined P&L
+       ├─ Check post-partial recovery lock [v6.3.0]
        ├─ Check VIX spike (throttled, every 5 min)
        ├─ Check spot-move breach (throttled, every 60s)
        ├─ Check daily profit target
@@ -224,6 +231,11 @@ The entry job runs a **sequential filter chain** — short-circuits on the first
 │     ├─ Compare to ORB reference (captured at 09:17)      │
 │     ├─ move_pct = |spot - orb_price| / orb_price × 100  │
 │     └─ move_pct > 0.5% → skip (directional gap)         │
+│                                                          │
+│  5B. MOMENTUM FILTER (RE-ENTRY ONLY) [FIX-XXVI v6.3.0]  │
+│     ├─ Only applies to re-entries (not first trade)      │
+│     ├─ drift = |current_spot - orb_ref| / orb_ref × 100 │
+│     └─ drift > 0.5% → block (market trending)           │
 │                                                          │
 │  6. MARGIN GUARD                                         │
 │     ├─ Fetch available cash + collateral via funds()     │
@@ -393,7 +405,28 @@ state["ce_active"]    = True
 
 ---
 
-## 7. Breakeven SL — Grace Period + Buffer
+## 7. Breakeven SL — Context-Aware + Grace Period + Buffer
+
+### Context-Aware Activation (FIX-XXIV, v6.2.0)
+
+Before checking grace period or buffer, the breakeven SL now checks whether the
+surviving leg is **winning or losing** at the moment of partial exit:
+
+```
+PE SL hit at loss → close_one_leg("PE") → inspect surviving CE:
+
+  CE LTP < CE entry?  →  CE is WINNING (profitable for short)
+    ├─ SKIP breakeven SL entirely
+    ├─ CE continues with trailing SL / fixed-dynamic SL / winner booking
+    └─ Reason: breakeven price is BELOW winning LTP → would kill profit
+
+  CE LTP >= CE entry?  →  CE is LOSING (losing for short)
+    ├─ ACTIVATE breakeven SL (with grace + buffer)
+    └─ Reason: protects against combined position loss exceeding breakeven
+```
+
+This prevents the v5.9.0 scenario where breakeven SL immediately killed a
+profitable surviving leg after partial exit.
 
 ### The Problem (v5.9.0)
 
@@ -724,17 +757,21 @@ LAYER 1 — ENTRY GATES (prevent bad trades)
 ├─ VIX filter       : VIX must be 14–28 (not too thin, not dangerous)
 ├─ IVR/IVP filter   : IV must be historically rich (IV-crush tailwind)
 ├─ ORB filter       : skip if NIFTY gapped > 0.5% at open
+├─ Momentum filter  : block re-entry when NIFTY trending > 0.5% [v6.3.0]
 └─ Margin guard     : sufficient funds with 20% buffer
 
 LAYER 2 — PER-LEG PROTECTION (limit individual leg losses)
 ├─ Fixed SL         : 20–30% based on DTE (entry × 1.20–1.30)
 ├─ Dynamic SL       : tightens through the day (15% → 10% → 7%)
 ├─ Trailing SL      : locks profit when leg decays to 50% of entry
-└─ Breakeven SL     : after partial close, tighten to net breakeven
+└─ Breakeven SL     : context-aware — only on losing survivor [v6.2.0]
 
 LAYER 3 — POSITION-LEVEL PROTECTION (limit overall exposure)
 ├─ Combined decay   : exit when both legs decayed 60% combined
+├─ Asymmetric book  : book deeply decayed winner when legs diverge [v6.3.0]
+├─ Combined trail   : exit if combined decay retraces from peak [v6.3.0]
 ├─ Winner booking   : book deeply profitable surviving leg (< 30% of entry)
+├─ Recovery lock    : trail combined P&L recovery after partial exit [v6.3.0]
 ├─ Net P&L guard    : defer SL when combined P&L is positive
 ├─ Daily target     : close all at Rs.5000 profit
 └─ Daily loss limit : close all at Rs.-4000 loss
@@ -988,6 +1025,173 @@ SCENARIO: Script running on Saturday (somehow)
 | First trade was profit target hit | `last_trade_pnl > 0` → loss check passes |
 | VIX spikes between trades | VIX filter blocks re-entry |
 | No DTE-map entry time remaining | No entry job fires → no re-entry |
+| NIFTY drifted >0.5% from ORB | Momentum filter blocks re-entry [v6.3.0] |
+
+---
+
+## 12A. Momentum Filter (Re-Entry) — FIX-XXVI, v6.3.0
+
+### The Problem
+
+After an early exit from a one-sided move (e.g., NIFTY drops 100 points, PE SL hit),
+re-entering a fresh ATM straddle into the **same trend** is dangerous — the new losing
+leg starts under pressure immediately.
+
+### How It Works
+
+On **re-entries only** (not first trade), checks NIFTY intraday drift from ORB reference:
+
+```
+drift_pct = |current_spot - orb_reference| / orb_reference × 100
+
+If drift_pct > max_drift_pct (0.5%) → BLOCK re-entry
+```
+
+### Configuration
+
+```toml
+[filters.momentum]
+enabled       = true
+max_drift_pct = 0.5   # Block when NIFTY drifted > 0.5% (~115 points) from ORB
+```
+
+### Example
+
+```
+09:17  ORB capture: NIFTY = 23,300
+09:35  First entry. NIFTY drops → PE SL hit → CE winner booked
+10:05  Position fully closed. P&L = -1,500
+
+10:35  Re-entry check:
+       Current NIFTY: 23,150 (dropped 150 points from ORB)
+       drift = |23150 - 23300| / 23300 × 100 = 0.64%
+       0.64% > 0.5% → MOMENTUM FILTER BLOCKS RE-ENTRY
+       Market is trending down — straddle is too risky
+```
+
+---
+
+## 12B. Post-Partial Recovery Lock — FIX-XXV, v6.3.0
+
+### The Problem
+
+After FIX-XXIV lets the winning survivor continue running, the combined P&L
+(negative `closed_pnl` + growing winner MTM) can cross from negative to positive —
+the position has **recovered** from the SL loss. But there's no mechanism to lock
+this recovery. A reversal can erase it.
+
+### How It Works
+
+```
+After partial exit (closed_pnl < 0, one leg active):
+
+1. Monitor tracks combined_pnl = closed_pnl + open_mtm each tick
+2. When combined_pnl first crosses positive AND >= min threshold → ACTIVATE
+   └─ min_recovery = 500 Rs/lot × number_of_lots
+3. Track recovery_peak_pnl = max(previous peak, current combined_pnl)
+4. If combined_pnl retraces trail_pct% from peak → EXIT
+   └─ Locks remaining recovery profit
+5. If combined_pnl drops back below zero → EXIT immediately
+   └─ Recovery lost — stop bleeding
+```
+
+### Configuration
+
+```toml
+[risk.recovery_lock]
+enabled                 = true
+min_recovery_rs_per_lot = 500    # Min Rs.500/lot recovery before trail starts
+trail_pct               = 50.0   # Exit if recovery retraces 50% from peak
+```
+
+### Example
+
+```
+09:46  PE SL hit → closed_pnl = -3,136
+       CE at Rs.215 (winning) → open MTM = +2,619
+       Combined = -517 (negative — recovery lock NOT active)
+
+10:15  CE decays to Rs.180 → open MTM = +4,881
+       Combined = +1,745 → POSITIVE → recovery lock ACTIVATES (>= Rs.500/lot)
+       Peak = 1,745
+
+10:45  CE decays to Rs.150 → open MTM = +6,848
+       Combined = +3,712 → peak updated to 3,712
+
+11:15  Market reverses, CE rises to Rs.200 → open MTM = +3,598
+       Combined = +462 → retracement = (3712-462)/3712 = 87.6%
+       87.6% > 50% trail → RECOVERY LOCK EXIT
+       Locks Rs.462 profit instead of potentially giving back everything
+```
+
+---
+
+## 12C. Asymmetric Leg Booking — FIX-XXVII, v6.3.0
+
+### The Problem
+
+When both legs are active but severely skewed (one deeply decayed, other barely moved),
+the position is effectively a **naked short** on the non-decayed side. Combined
+decay exit won't fire because total decay is below target.
+
+### How It Works
+
+```
+Every monitor tick when BOTH legs are active:
+
+  winner_pct = winner_ltp / winner_entry × 100
+  loser_pct  = loser_ltp / loser_entry × 100
+
+  If winner_pct <= 40% AND loser_pct >= 80%:
+    → Book the deeply decayed winner
+    → Surviving loser continues with normal SL management
+```
+
+### Configuration
+
+```toml
+[risk.asymmetric_booking]
+enabled          = true
+winner_decay_pct = 40.0   # Book when LTP <= 40% of entry (60%+ profit)
+loser_intact_pct = 80.0   # Only if other leg >= 80% of entry
+```
+
+---
+
+## 12D. Combined Profit Trailing — FIX-XXVIII, v6.3.0
+
+### The Problem
+
+When both legs are actively decaying and the combined position is profitable,
+a sudden spike on one side can erase combined gains before the combined decay
+exit target is reached.
+
+### How It Works
+
+```
+When BOTH legs are active:
+
+  combined_decay = (1 - combined_current / combined_entry) × 100
+
+  Phase 1 — ACTIVATE: when combined_decay first reaches 30% → track peak
+  Phase 2 — TRAIL: if combined_decay drops (peak - 40 points) → EXIT
+```
+
+### Configuration
+
+```toml
+[risk.combined_profit_trail]
+enabled      = true
+activate_pct = 30.0   # Start trailing after 30% combined decay
+trail_pct    = 40.0   # Exit if decay retraces 40 points from peak
+```
+
+### Interaction with Combined Decay Exit
+
+- Combined Decay Exit = TARGET — exit WHEN decayed enough (profit booking)
+- Combined Profit Trail = FLOOR — exit if LOSING decay progress (reversal guard)
+
+Both can coexist. Target fires first if reached; trail catches reversal.
 
 ---
 
@@ -1035,6 +1239,10 @@ SCENARIO: Script running on Saturday (somehow)
 | `breakeven_sl_pe` | float | Breakeven SL price for PE (buffered) |
 | `breakeven_activated_at_ce` | str (ISO) | When breakeven was activated for CE |
 | `breakeven_activated_at_pe` | str (ISO) | When breakeven was activated for PE |
+| `recovery_lock_active` | bool | Recovery trailing active after partial exit [v6.3.0] |
+| `recovery_peak_pnl` | float | Peak combined P&L during recovery [v6.3.0] |
+| `combined_trail_active` | bool | Combined profit trailing active [v6.3.0] |
+| `combined_decay_peak` | float | Peak combined decay % [v6.3.0] |
 
 ### Filter State
 
