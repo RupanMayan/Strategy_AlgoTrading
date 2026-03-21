@@ -79,6 +79,60 @@ def get_dynamic_sl_pct(
     return base_sl_pct
 
 
+# ── Transaction Costs (Dhan Options Intraday) ─────────────────────────
+def calculate_charges(
+    ce_entry: float, pe_entry: float,
+    ce_exit: float, pe_exit: float,
+    qty: int,
+    num_exit_orders: int = 2,
+) -> dict:
+    """
+    Calculate all transaction costs for a short straddle trade.
+
+    Dhan OPTIONS INTRADAY (MIS) charges:
+      - Brokerage: ₹20/executed order (flat)
+      - STT: 0.0625% on sell-side premium turnover
+      - Exchange txn charges (NSE F&O): 0.0495% on total premium turnover
+      - GST: 18% on (brokerage + exchange charges)
+      - SEBI charges: ₹10 per crore of turnover
+      - Stamp duty: 0.003% on buy-side premium turnover
+    """
+    # Turnover
+    sell_turnover = (ce_entry + pe_entry) * qty   # entry = SELL
+    buy_turnover = (ce_exit + pe_exit) * qty      # exit = BUY to close
+    total_turnover = sell_turnover + buy_turnover
+
+    # Orders: 2 entry (sell CE + sell PE) + exit orders
+    num_orders = 2 + num_exit_orders
+    brokerage = num_orders * 20
+
+    # STT: 0.0625% on sell-side premium (entry for short straddle)
+    stt = sell_turnover * 0.000625
+
+    # Exchange transaction charges: 0.0495% on total turnover
+    exchange = total_turnover * 0.000495
+
+    # GST: 18% on (brokerage + exchange charges)
+    gst = (brokerage + exchange) * 0.18
+
+    # SEBI: ₹10 per crore
+    sebi = total_turnover / 1e7 * 10
+
+    # Stamp duty: 0.003% on buy-side
+    stamp = buy_turnover * 0.00003
+
+    total = brokerage + stt + exchange + gst + sebi + stamp
+    return {
+        "brokerage": round(brokerage, 2),
+        "stt": round(stt, 2),
+        "exchange_charges": round(exchange, 2),
+        "gst": round(gst, 2),
+        "sebi": round(sebi, 2),
+        "stamp_duty": round(stamp, 2),
+        "total_charges": round(total, 2),
+    }
+
+
 # ── Effective SL Level (Priority Chain) ────────────────────────────────
 def get_effective_sl(
     entry_px: float,
@@ -652,6 +706,17 @@ def simulate_day(
     pe_pnl = (pe_entry - pe_exit_price) * qty
     total_pnl = ce_pnl + pe_pnl
 
+    # ── Transaction costs ──
+    # Count exit orders: partial exit adds an extra order
+    num_exit_orders = 2
+    if ce_sl_hit != pe_sl_hit:  # one SL hit, other closed later = 3 exits effectively
+        num_exit_orders = 3
+    charges = calculate_charges(
+        ce_entry, pe_entry, ce_exit_price, pe_exit_price,
+        qty, num_exit_orders,
+    )
+    net_pnl = total_pnl - charges["total_charges"]
+
     # Determine the last exit timestamp (for re-entry chaining)
     last_exit_ts = None
     if ce_exit_time and pe_exit_time:
@@ -676,6 +741,9 @@ def simulate_day(
         "ce_pnl": round(ce_pnl, 2),
         "pe_pnl": round(pe_pnl, 2),
         "total_pnl": round(total_pnl, 2),
+        "charges": round(charges["total_charges"], 2),
+        "charges_detail": charges,
+        "net_pnl": round(net_pnl, 2),
         "exit_reason": exit_reason,
         "ce_trailing_activated": ce_trailing_active,
         "pe_trailing_activated": pe_trailing_active,
@@ -784,15 +852,29 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
     lot_size = config["instrument"]["lot_size"]
     num_lots = config["instrument"]["number_of_lots"]
 
-    trades_df.to_csv(output_dir / "bt_trades.csv", index=False)
+    csv_df = trades_df.drop(columns=["charges_detail"], errors="ignore")
+    csv_df.to_csv(output_dir / "bt_trades.csv", index=False)
     log.info(f"Trade log saved to {output_dir / 'bt_trades.csv'}")
 
     trades_df["date"] = pd.to_datetime(trades_df["date"])
     trades_df = trades_df.sort_values("date").reset_index(drop=True)
     trades_df["cumulative_pnl"] = trades_df["total_pnl"].cumsum()
+    trades_df["cumulative_net_pnl"] = trades_df["net_pnl"].cumsum()
+
+    # ── Charges breakdown (per component) ──
+    charges_breakdown = {
+        "brokerage": round(trades_df["charges_detail"].apply(lambda c: c.get("brokerage", 0) if isinstance(c, dict) else 0).sum(), 2),
+        "stt": round(trades_df["charges_detail"].apply(lambda c: c.get("stt", 0) if isinstance(c, dict) else 0).sum(), 2),
+        "exchange_charges": round(trades_df["charges_detail"].apply(lambda c: c.get("exchange_charges", 0) if isinstance(c, dict) else 0).sum(), 2),
+        "gst": round(trades_df["charges_detail"].apply(lambda c: c.get("gst", 0) if isinstance(c, dict) else 0).sum(), 2),
+        "sebi": round(trades_df["charges_detail"].apply(lambda c: c.get("sebi", 0) if isinstance(c, dict) else 0).sum(), 2),
+        "stamp_duty": round(trades_df["charges_detail"].apply(lambda c: c.get("stamp_duty", 0) if isinstance(c, dict) else 0).sum(), 2),
+    }
 
     # ── Summary Statistics ──
     total_pnl = trades_df["total_pnl"].sum()
+    total_charges = trades_df["charges"].sum()
+    total_net_pnl = trades_df["net_pnl"].sum()
     num_trades = len(trades_df)
     winners = trades_df[trades_df["total_pnl"] > 0]
     losers = trades_df[trades_df["total_pnl"] < 0]
@@ -858,17 +940,43 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
         win_rate=("total_pnl", lambda x: (x > 0).sum() / len(x) * 100),
     ).to_dict(orient="index")
 
+    # Net P&L metrics
+    net_winners = trades_df[trades_df["net_pnl"] > 0]
+    net_losers = trades_df[trades_df["net_pnl"] < 0]
+    net_win_rate = len(net_winners) / num_trades * 100 if num_trades > 0 else 0
+    net_avg_win = net_winners["net_pnl"].mean() if len(net_winners) > 0 else 0
+    net_avg_loss = net_losers["net_pnl"].mean() if len(net_losers) > 0 else 0
+    net_profit_factor = (
+        abs(net_winners["net_pnl"].sum() / net_losers["net_pnl"].sum())
+        if len(net_losers) > 0 and net_losers["net_pnl"].sum() != 0
+        else float("inf")
+    )
+
+    # Net drawdown
+    net_cumulative = trades_df["cumulative_net_pnl"]
+    net_running_max = net_cumulative.cummax()
+    net_drawdown = net_cumulative - net_running_max
+    net_max_drawdown = net_drawdown.min()
+
     summary = {
         "iteration": 3,
         "features": "full_production_parity",
         "total_pnl": round(total_pnl, 2),
+        "total_charges": round(total_charges, 2),
+        "total_net_pnl": round(total_net_pnl, 2),
+        "charges_pct": round(total_charges / total_pnl * 100, 2) if total_pnl != 0 else 0,
         "num_trades": num_trades,
         "win_rate_pct": round(win_rate, 2),
         "avg_win": round(avg_win, 2),
         "avg_loss": round(avg_loss, 2),
         "profit_factor": round(profit_factor, 4),
+        "net_win_rate_pct": round(net_win_rate, 2),
+        "net_avg_win": round(net_avg_win, 2),
+        "net_avg_loss": round(net_avg_loss, 2),
+        "net_profit_factor": round(net_profit_factor, 4),
         "max_drawdown": round(max_drawdown, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
+        "net_max_drawdown": round(net_max_drawdown, 2),
         "sharpe_ratio": round(sharpe, 4),
         "sortino_ratio": round(sortino, 4),
         "calmar_ratio": round(calmar, 4),
@@ -881,22 +989,25 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
         "lot_size": lot_size,
         "num_lots": num_lots,
         "backtest_period": f"{config['backtest']['from_date']} to {config['backtest']['to_date']}",
+        "charges_breakdown": charges_breakdown,
     }
 
     with open(output_dir / "bt_summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, default=lambda o: int(o) if hasattr(o, 'item') else str(o))
     log.info(f"Summary saved to {output_dir / 'bt_summary.json'}")
 
     # ── Charts ──
 
-    # 1. Equity Curve
+    # 1. Equity Curve (Gross + Net)
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(trades_df["date"], trades_df["cumulative_pnl"], linewidth=1.5, color="blue")
-    ax.fill_between(trades_df["date"], trades_df["cumulative_pnl"], alpha=0.15, color="blue")
+    ax.plot(trades_df["date"], trades_df["cumulative_pnl"], linewidth=1.5, color="blue", label=f"Gross P&L: ₹{total_pnl:,.0f}")
+    ax.plot(trades_df["date"], trades_df["cumulative_net_pnl"], linewidth=1.5, color="green", label=f"Net P&L: ₹{total_net_pnl:,.0f}")
+    ax.fill_between(trades_df["date"], trades_df["cumulative_net_pnl"], alpha=0.10, color="green")
     ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
-    ax.set_title(f"Equity Curve — Nifty Short Straddle v3 (Total P&L: ₹{total_pnl:,.0f})")
+    ax.set_title(f"Equity Curve — Nifty Short Straddle (Charges: ₹{total_charges:,.0f})")
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative P&L (₹)")
+    ax.legend(loc="upper left")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(charts_dir / "equity_curve.png", dpi=150)
@@ -971,17 +1082,37 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
 
     # ── Console Summary ──
     print(f"\n{'='*60}")
-    print(f"  BACKTEST RESULTS — Nifty Short Straddle (Iteration 3)")
-    print(f"  Full Production Parity: All FIX-XX to FIX-XXVIII")
+    print(f"  BACKTEST RESULTS — Nifty Short Straddle")
+    print(f"  Full Production Parity + Transaction Costs")
     print(f"{'='*60}")
     print(f"  Period:         {config['backtest']['from_date']} → {config['backtest']['to_date']}")
     print(f"  Total Trades:   {num_trades}")
-    print(f"  Total P&L:      ₹{total_pnl:,.2f}")
-    print(f"  Win Rate:       {win_rate:.1f}%")
-    print(f"  Avg Win:        ₹{avg_win:,.2f}")
-    print(f"  Avg Loss:       ₹{avg_loss:,.2f}")
-    print(f"  Profit Factor:  {profit_factor:.2f}")
-    print(f"  Max Drawdown:   ₹{max_drawdown:,.2f}")
+    print(f"{'─'*60}")
+    print(f"  GROSS P&L:      ₹{total_pnl:,.2f}")
+    print(f"  Total Charges:  ₹{total_charges:,.2f} ({total_charges/total_pnl*100:.1f}% of gross)" if total_pnl != 0 else f"  Total Charges:  ₹{total_charges:,.2f}")
+    print(f"  NET P&L:        ₹{total_net_pnl:,.2f}")
+    print(f"{'─'*60}")
+    print(f"  Charges Breakdown:")
+    print(f"    Brokerage:    ₹{charges_breakdown['brokerage']:,.2f}")
+    print(f"    STT:          ₹{charges_breakdown['stt']:,.2f}")
+    print(f"    Exchange:     ₹{charges_breakdown['exchange_charges']:,.2f}")
+    print(f"    GST:          ₹{charges_breakdown['gst']:,.2f}")
+    print(f"    SEBI:         ₹{charges_breakdown['sebi']:,.2f}")
+    print(f"    Stamp Duty:   ₹{charges_breakdown['stamp_duty']:,.2f}")
+    print(f"{'─'*60}")
+    print(f"  Gross Metrics:")
+    print(f"    Win Rate:       {win_rate:.1f}%")
+    print(f"    Avg Win:        ₹{avg_win:,.2f}")
+    print(f"    Avg Loss:       ₹{avg_loss:,.2f}")
+    print(f"    Profit Factor:  {profit_factor:.2f}")
+    print(f"    Max Drawdown:   ₹{max_drawdown:,.2f}")
+    print(f"  Net Metrics:")
+    print(f"    Win Rate:       {net_win_rate:.1f}%")
+    print(f"    Avg Win:        ₹{net_avg_win:,.2f}")
+    print(f"    Avg Loss:       ₹{net_avg_loss:,.2f}")
+    print(f"    Profit Factor:  {net_profit_factor:.2f}")
+    print(f"    Max Drawdown:   ₹{net_max_drawdown:,.2f}")
+    print(f"{'─'*60}")
     print(f"  Sharpe Ratio:   {sharpe:.2f}")
     print(f"  Sortino Ratio:  {sortino:.2f}")
     print(f"  Calmar Ratio:   {calmar:.2f}")
