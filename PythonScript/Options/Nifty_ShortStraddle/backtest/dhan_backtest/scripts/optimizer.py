@@ -30,6 +30,7 @@ import numpy as np
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from nifty_straddle_bt import load_config, run_backtest
@@ -326,7 +327,7 @@ def main():
     args = parser.parse_args()
 
     base_config = load_config()
-    output_dir = SCRIPT_DIR / "output" / "optimizer"
+    output_dir = PROJECT_DIR / "results" / "optimizer"
     results = {}
 
     print("\n" + "=" * 70)

@@ -32,6 +32,7 @@ import numpy as np
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent  # dhan_backtest/
 sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
@@ -51,7 +52,7 @@ log = logging.getLogger(__name__)
 
 # ── Config Loading ─────────────────────────────────────────────────────
 def load_config() -> dict:
-    config_path = SCRIPT_DIR / "config_backtest.toml"
+    config_path = PROJECT_DIR / "config" / "config_backtest.toml"
     with open(config_path, "rb") as f:
         return tomli.load(f)
 
@@ -686,7 +687,7 @@ def simulate_day(
 
 # ── Run Full Backtest ──────────────────────────────────────────────────
 def run_backtest(config: dict) -> pd.DataFrame:
-    data_path = SCRIPT_DIR / "data" / "nifty_options_2025" / "nifty_atm_weekly_1min.parquet"
+    data_path = PROJECT_DIR / "data" / "nifty_options_2025" / "nifty_atm_weekly_1min.parquet"
     if not data_path.exists():
         log.error(f"Data file not found: {data_path}")
         log.error("Run dhan_data_fetcher.py first to download data.")
@@ -771,7 +772,7 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    output_dir = SCRIPT_DIR / "output"
+    output_dir = PROJECT_DIR / "results" / "final"
     charts_dir = output_dir / "charts"
     output_dir.mkdir(parents=True, exist_ok=True)
     charts_dir.mkdir(parents=True, exist_ok=True)
