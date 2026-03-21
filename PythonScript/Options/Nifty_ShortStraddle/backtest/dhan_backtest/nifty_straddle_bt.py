@@ -15,6 +15,7 @@ Runs a day-by-day simulation matching FULL production exit hierarchy:
 - Spot-move / breakeven breach exit
 - Daily profit target / loss limit
 - Hard exit at 15:15 IST
+- Intraday re-entry after early exit (configurable cooldown, max/day, loss cap)
 
 Usage:
     python nifty_straddle_bt.py
@@ -110,6 +111,9 @@ def simulate_day(
     day_df: pd.DataFrame,
     trading_date: date,
     config: dict,
+    start_after: pd.Timestamp | None = None,
+    trade_number: int = 1,
+    cumulative_day_pnl: float = 0.0,
 ) -> dict | None:
     dte = compute_dte(trading_date)
     expiry = get_weekly_expiry(trading_date)
@@ -138,7 +142,14 @@ def simulate_day(
     day_df = day_df.copy()
     day_df["time"] = day_df["timestamp"].dt.time
 
-    entry_candles = day_df[day_df["time"] >= entry_time]
+    # For re-entry, find first candle after start_after
+    if start_after is not None:
+        entry_candles = day_df[
+            (day_df["timestamp"] >= start_after)
+            & (day_df["time"] <= exit_time)
+        ]
+    else:
+        entry_candles = day_df[day_df["time"] >= entry_time]
     if entry_candles.empty:
         return None
 
@@ -218,6 +229,9 @@ def simulate_day(
     sme_cfg = risk_cfg.get("spot_move_exit", {})
     sme_enabled = sme_cfg.get("enabled", False)
     sme_multiplier = sme_cfg.get("spot_multiplier", 1.0)
+
+    # ── Breakeven buffer direction (optimizer override) ──
+    be_direction = config.get("_be_buffer_direction", "up")  # "up" = production, "down" = tighter
 
     # ── Monitor candles ──
     monitor_df = day_df[
@@ -369,8 +383,10 @@ def simulate_day(
                         survivor_is_winner = (pe_ltp > 0 and pe_ltp < pe_entry)
                         if not survivor_is_winner:
                             raw_be = pe_entry + closed_pnl / qty
-                            # Production direction: buffer UP
-                            be_price = round(raw_be * (1 + be_buffer_pct / 100), 2)
+                            if be_direction == "down":
+                                be_price = round(raw_be * (1 - be_buffer_pct / 100), 2)
+                            else:
+                                be_price = round(raw_be * (1 + be_buffer_pct / 100), 2)
                             if 0 < be_price < pe_entry * (1 + eff_sl_pct / 100):
                                 pe_breakeven_active = True
                                 pe_breakeven_sl = be_price
@@ -416,8 +432,10 @@ def simulate_day(
                         survivor_is_winner = (ce_ltp > 0 and ce_ltp < ce_entry)
                         if not survivor_is_winner:
                             raw_be = ce_entry + closed_pnl / qty
-                            # Production direction: buffer UP
-                            be_price = round(raw_be * (1 + be_buffer_pct / 100), 2)
+                            if be_direction == "down":
+                                be_price = round(raw_be * (1 - be_buffer_pct / 100), 2)
+                            else:
+                                be_price = round(raw_be * (1 + be_buffer_pct / 100), 2)
                             if 0 < be_price < ce_entry * (1 + eff_sl_pct / 100):
                                 ce_breakeven_active = True
                                 ce_breakeven_sl = be_price
@@ -629,6 +647,15 @@ def simulate_day(
     pe_pnl = (pe_entry - pe_exit_price) * qty
     total_pnl = ce_pnl + pe_pnl
 
+    # Determine the last exit timestamp (for re-entry chaining)
+    last_exit_ts = None
+    if ce_exit_time and pe_exit_time:
+        last_exit_ts = max(ce_exit_time, pe_exit_time) if isinstance(ce_exit_time, pd.Timestamp) else ce_exit_time
+    elif ce_exit_time:
+        last_exit_ts = ce_exit_time
+    elif pe_exit_time:
+        last_exit_ts = pe_exit_time
+
     return {
         "date": trading_date.isoformat(),
         "expiry": expiry.isoformat(),
@@ -652,6 +679,8 @@ def simulate_day(
         "entry_time": entry_str,
         "ce_exit_time": str(ce_exit_time) if ce_exit_time else None,
         "pe_exit_time": str(pe_exit_time) if pe_exit_time else None,
+        "trade_number": trade_number,
+        "_last_exit_ts": last_exit_ts,  # Internal: for re-entry chaining
     }
 
 
@@ -672,13 +701,60 @@ def run_backtest(config: dict) -> pd.DataFrame:
     df["trading_date"] = df["timestamp"].dt.date
     grouped = df.groupby("trading_date")
 
+    # Re-entry config
+    reentry_cfg = config.get("risk", {}).get("reentry", {})
+    reentry_enabled = reentry_cfg.get("enabled", False)
+    reentry_max_per_day = reentry_cfg.get("max_per_day", 1)
+    reentry_cooldown_min = reentry_cfg.get("cooldown_min", 30)
+    reentry_max_loss = reentry_cfg.get("max_loss_per_lot", 3000) * config["instrument"]["number_of_lots"]
+
     trades = []
     for trading_date, day_df in tqdm(grouped, desc="Backtesting"):
         if not is_trading_day(trading_date):
             continue
+
+        # First trade of the day
         result = simulate_day(day_df, trading_date, config)
-        if result:
-            trades.append(result)
+        if not result:
+            continue
+        trades.append(result)
+
+        # Re-entry loop
+        if reentry_enabled:
+            reentry_count = 0
+            cumulative_pnl = result["total_pnl"]
+
+            while reentry_count < reentry_max_per_day:
+                # Only re-enter after early exits (not hard_exit or profit_target)
+                if result["exit_reason"] in ("hard_exit", "profit_target"):
+                    break
+
+                # Check loss threshold
+                if result["total_pnl"] < 0 and abs(result["total_pnl"]) > reentry_max_loss:
+                    break
+
+                # Calculate re-entry time (exit + cooldown)
+                last_exit_ts = result.get("_last_exit_ts")
+                if last_exit_ts is None:
+                    break
+                if not isinstance(last_exit_ts, pd.Timestamp):
+                    last_exit_ts = pd.Timestamp(last_exit_ts)
+                if last_exit_ts.tzinfo is None:
+                    last_exit_ts = last_exit_ts.tz_localize("Asia/Kolkata")
+                reentry_ts = last_exit_ts + pd.Timedelta(minutes=reentry_cooldown_min)
+
+                # Re-enter
+                reentry_count += 1
+                result = simulate_day(
+                    day_df, trading_date, config,
+                    start_after=reentry_ts,
+                    trade_number=reentry_count + 1,
+                    cumulative_day_pnl=cumulative_pnl,
+                )
+                if not result:
+                    break
+                trades.append(result)
+                cumulative_pnl += result["total_pnl"]
 
     if not trades:
         log.error("No trades generated!")

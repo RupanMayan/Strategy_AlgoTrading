@@ -87,6 +87,12 @@ max_defer_min = 15             # Max deferral of per-leg SL when net positive
 enabled         = true
 spot_multiplier = 1.0          # Exit when NIFTY moves >= 1.0x premium from entry
 
+[risk.reentry]
+enabled              = false
+max_per_day          = 1        # Max re-entries per day (on top of first trade)
+cooldown_min         = 30       # Minutes to wait after close before re-entry
+max_loss_per_lot     = 3000     # Skip re-entry if previous loss > this per lot
+
 [backtest]
 from_date    = "2025-03-21"
 to_date      = "2026-03-21"

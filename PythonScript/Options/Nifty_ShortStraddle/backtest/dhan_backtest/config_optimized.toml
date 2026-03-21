@@ -1,0 +1,89 @@
+# Optimized Nifty Short Straddle Configuration
+# Generated: 2026-03-21
+# Backtest period: 2025-03-21 to 2026-03-21
+# Expected: P&L ₹189K (0% slip) / ₹168K (1% slip), WR 64%, PF 2.15
+
+[instrument]
+underlying     = "NIFTY"
+lot_size       = 65
+number_of_lots = 1
+
+[timing]
+entry_time         = "09:30"
+exit_time          = "15:15"
+use_dte_entry_map  = true
+
+[timing.dte_entry_time_map]
+"0" = "09:30"
+"1" = "09:30"
+"2" = "09:35"
+"3" = "09:40"
+"4" = "09:45"
+
+[risk]
+leg_sl_percent              = 30.0     # Wider SL — lets trades breathe for theta
+daily_profit_target_per_lot = 10000    # Higher target — capture full theta
+daily_loss_limit_per_lot    = -6000    # Wider limit — fewer premature stops
+
+[risk.dte_sl_override]
+"2" = 25.0
+"3" = 28.0
+"4" = 30.0
+
+[risk.dynamic_sl]
+enabled = false    # DISABLED — time-of-day tightening hurts more than helps
+
+[risk.trailing_sl]
+enabled = false    # DISABLED — rarely triggers, cuts winners when it does
+
+[risk.breakeven_sl]
+enabled          = true
+grace_period_min = 5
+buffer_pct       = 5.0     # Tighter than production (was 10%)
+
+[risk.combined_decay_exit]
+enabled          = true
+decay_target_pct = 60.0
+
+[risk.combined_decay_exit.dte_override]
+"0" = 60.0
+"1" = 65.0
+"2" = 60.0
+"3" = 50.0
+"4" = 50.0
+
+[risk.winner_leg_booking]
+enabled             = true
+decay_threshold_pct = 30.0
+
+[risk.asymmetric_booking]
+enabled           = true
+winner_decay_pct  = 40.0
+loser_intact_pct  = 80.0
+
+[risk.combined_profit_trail]
+enabled      = true
+activate_pct = 30.0
+trail_pct    = 40.0
+
+[risk.recovery_lock]
+enabled = false    # DISABLED — was cutting profits short
+
+[risk.net_pnl_guard]
+max_defer_min = 15
+
+[risk.spot_move_exit]
+enabled = false    # DISABLED — was exiting profitable positions
+
+[risk.reentry]
+enabled              = true     # NEW — re-enter after early SL exits
+max_per_day          = 2        # Max 2 re-entries per day
+cooldown_min         = 45       # Wait 45 min after close
+max_loss_per_lot     = 2000     # Skip re-entry if previous loss > ₹2000/lot
+
+[backtest]
+from_date    = "2025-03-21"
+to_date      = "2026-03-21"
+skip_months  = [11]
+trade_dte    = [0, 1, 2, 3, 4]    # ALL DTEs profitable with optimized params
+slippage_pct = 0.0
