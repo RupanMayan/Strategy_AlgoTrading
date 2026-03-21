@@ -79,6 +79,18 @@ max_per_day          = 2        # Max 2 re-entries per day
 cooldown_min         = 45       # Wait 45 min after close
 max_loss_per_lot     = 2000     # Skip re-entry if previous loss > ₹2000/lot
 
+# ── VIX / IVR / IVP Filters (matching production config.toml) ──
+[vix_filter]
+enabled = true
+vix_min = 14.0    # Skip if VIX < 14 (premiums too thin)
+vix_max = 28.0    # Skip if VIX > 28 (danger zone)
+
+[ivr_ivp_filter]
+ivr_filter_enabled = true
+ivr_min            = 30.0    # Skip if IVR < 30 (IV in bottom 30% of 52wk range)
+ivp_filter_enabled = true
+ivp_min            = 40.0    # Skip if IVP < 40% (IV below 40th percentile)
+
 [backtest]
 from_date    = "2021-03-22"
 to_date      = "2026-03-21"

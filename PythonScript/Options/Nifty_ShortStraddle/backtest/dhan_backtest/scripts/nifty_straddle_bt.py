@@ -61,6 +61,110 @@ def load_config(config_file: str | None = None) -> dict:
         return tomli.load(f)
 
 
+# ── VIX / IVR / IVP Filter ────────────────────────────────────────────
+def load_vix_history(config: dict) -> dict[date, float]:
+    """Load daily VIX closing values from CSV. Returns {date: vix_close}."""
+    vix_cfg = config.get("vix_filter", {})
+    if not vix_cfg.get("enabled", False):
+        return {}
+
+    vix_path = PROJECT_DIR / "data" / "vix_history.csv"
+    if not vix_path.exists():
+        log.warning(f"VIX history file not found: {vix_path} — VIX filter disabled")
+        return {}
+
+    vix_map: dict[date, float] = {}
+    with open(vix_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("date"):
+                continue
+            parts = line.split(",")
+            if len(parts) >= 2:
+                try:
+                    d = datetime.strptime(parts[0].strip(), "%Y-%m-%d").date()
+                    v = float(parts[1].strip())
+                    if v > 0:
+                        vix_map[d] = v
+                except (ValueError, IndexError):
+                    continue
+
+    log.info(f"VIX history loaded: {len(vix_map)} days")
+    return vix_map
+
+
+def compute_ivr(current_vix: float, history: list[float]) -> float:
+    """IV Rank = (current - 52wk_low) / (52wk_high - 52wk_low) * 100."""
+    low, high = min(history), max(history)
+    if high == low:
+        return 50.0
+    return round(max(0.0, min(100.0, (current_vix - low) / (high - low) * 100)), 1)
+
+
+def compute_ivp(current_vix: float, history: list[float]) -> float:
+    """IV Percentile = count(days VIX < current) / total * 100."""
+    if not history:
+        return 50.0
+    return round(sum(1 for v in history if v < current_vix) / len(history) * 100, 1)
+
+
+def vix_filter_ok(
+    trading_date: date,
+    vix_map: dict[date, float],
+    config: dict,
+) -> tuple[bool, float, float, float]:
+    """
+    Check VIX range + IVR + IVP filters for a trading date.
+
+    Returns (pass, vix, ivr, ivp). If VIX data is missing, uses fail-open.
+    """
+    vix_cfg = config.get("vix_filter", {})
+    if not vix_cfg.get("enabled", False):
+        return True, -1.0, -1.0, -1.0
+
+    # Get VIX for this date (or nearest prior trading day)
+    vix = -1.0
+    for offset in range(4):  # Look back up to 3 days for nearest data
+        check_date = trading_date - timedelta(days=offset)
+        if check_date in vix_map:
+            vix = vix_map[check_date]
+            break
+
+    if vix <= 0:
+        return True, -1.0, -1.0, -1.0  # Fail-open: no data
+
+    # VIX range check
+    vix_min = vix_cfg.get("vix_min", 0.0)
+    vix_max = vix_cfg.get("vix_max", 100.0)
+    if vix < vix_min or vix > vix_max:
+        return False, vix, -1.0, -1.0
+
+    # IVR / IVP check (need 252 trading days of history)
+    ivr_cfg = config.get("ivr_ivp_filter", {})
+    ivr_enabled = ivr_cfg.get("ivr_filter_enabled", False)
+    ivp_enabled = ivr_cfg.get("ivp_filter_enabled", False)
+
+    if not ivr_enabled and not ivp_enabled:
+        return True, vix, -1.0, -1.0
+
+    # Build 252-day lookback from dates strictly before trading_date
+    sorted_dates = sorted(d for d in vix_map if d < trading_date)
+    if len(sorted_dates) < 100:
+        return True, vix, -1.0, -1.0  # Fail-open: insufficient history
+
+    history_values = [vix_map[d] for d in sorted_dates[-252:]]
+    ivr = compute_ivr(vix, history_values)
+    ivp = compute_ivp(vix, history_values)
+
+    if ivr_enabled and ivr < ivr_cfg.get("ivr_min", 30.0):
+        return False, vix, ivr, ivp
+
+    if ivp_enabled and ivp < ivr_cfg.get("ivp_min", 40.0):
+        return False, vix, ivr, ivp
+
+    return True, vix, ivr, ivp
+
+
 # ── Dynamic SL Tightening ─────────────────────────────────────────────
 def get_dynamic_sl_pct(
     current_time: time,
@@ -774,6 +878,10 @@ def run_backtest(config: dict) -> pd.DataFrame:
     df["trading_date"] = df["timestamp"].dt.date
     grouped = df.groupby("trading_date")
 
+    # VIX filter
+    vix_map = load_vix_history(config)
+    vix_skipped = 0
+
     # Re-entry config
     reentry_cfg = config.get("risk", {}).get("reentry", {})
     reentry_enabled = reentry_cfg.get("enabled", False)
@@ -784,6 +892,12 @@ def run_backtest(config: dict) -> pd.DataFrame:
     trades = []
     for trading_date, day_df in tqdm(grouped, desc="Backtesting"):
         if not is_trading_day(trading_date):
+            continue
+
+        # VIX / IVR / IVP filter
+        vix_ok, day_vix, day_ivr, day_ivp = vix_filter_ok(trading_date, vix_map, config)
+        if not vix_ok:
+            vix_skipped += 1
             continue
 
         # First trade of the day
@@ -832,6 +946,9 @@ def run_backtest(config: dict) -> pd.DataFrame:
     if not trades:
         log.error("No trades generated!")
         sys.exit(1)
+
+    if vix_skipped > 0:
+        log.info(f"VIX/IVR/IVP filter skipped {vix_skipped} trading days")
 
     trades_df = pd.DataFrame(trades)
     log.info(f"Generated {len(trades_df)} trades")
