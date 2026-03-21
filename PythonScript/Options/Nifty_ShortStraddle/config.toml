@@ -459,13 +459,13 @@ lock_pct    = 15.0   # Trailing SL = current_LTP × (1 + lock_pct/100)
 #
 #    schedule is a list of (time, sl_pct) entries evaluated in descending time
 #    order. The FIRST entry whose time <= now() wins.
-#    Before the earliest threshold, leg_sl_percent (default 20%) is used.
+#    Before the earliest threshold, leg_sl_percent (default 30%) is used.
 #
 #  Schedule guidance (NIFTY intraday):
 #    After 14:30 → 7%  : Last 45 min; premium largely decayed, protect gains
 #    After 13:30 → 10% : Afternoon session; reduce exposure
 #    After 12:00 → 15% : Mid-session; moderate tightening
-#    Before 12:00 → leg_sl_percent (20%) : Morning; full width needed
+#    Before 12:00 → leg_sl_percent (30%) : Morning; full width needed
 # ──────────────────────────────────────────────────────────────────────────────
 
 [risk.dynamic_sl]
