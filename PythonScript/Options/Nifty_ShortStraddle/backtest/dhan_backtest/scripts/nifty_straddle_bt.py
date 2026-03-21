@@ -51,8 +51,12 @@ log = logging.getLogger(__name__)
 
 
 # ── Config Loading ─────────────────────────────────────────────────────
-def load_config() -> dict:
-    config_path = PROJECT_DIR / "config" / "config_backtest.toml"
+def load_config(config_file: str | None = None) -> dict:
+    if config_file:
+        config_path = Path(config_file).resolve()
+    else:
+        config_path = PROJECT_DIR / "config" / "config_backtest.toml"
+    log.info(f"Loading config: {config_path.name}")
     with open(config_path, "rb") as f:
         return tomli.load(f)
 
@@ -1002,7 +1006,13 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
 
 # ── Main ───────────────────────────────────────────────────────────────
 def main():
-    config = load_config()
+    import argparse
+    parser = argparse.ArgumentParser(description="Nifty Short Straddle Backtester")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to config TOML (default: config/config_backtest.toml)")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
     trades_df = run_backtest(config)
     generate_analytics(trades_df, config)
 

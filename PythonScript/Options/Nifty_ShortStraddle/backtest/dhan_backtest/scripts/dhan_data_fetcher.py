@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 # Resolve paths relative to this script
 SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
@@ -46,7 +47,7 @@ API_DELAY = 0.5  # delay between calls
 
 def load_config() -> dict:
     """Load config_backtest.toml."""
-    config_path = SCRIPT_DIR / "config_backtest.toml"
+    config_path = PROJECT_DIR / "config" / "config_backtest.toml"
     with open(config_path, "rb") as f:
         return tomli.load(f)
 
@@ -186,36 +187,55 @@ def main():
         sys.exit(1)
 
     # Create data directory
-    data_dir = SCRIPT_DIR / "data" / "nifty_options_2025"
+    data_dir = PROJECT_DIR / "data" / "nifty_options_2025"
     data_dir.mkdir(parents=True, exist_ok=True)
 
     # Output parquet path
     output_path = data_dir / "nifty_atm_weekly_1min.parquet"
 
-    # Check for existing data (resume capability)
+    # Check for existing data (resume capability — forward AND backward)
     existing_df = None
-    last_fetched_date = None
     if output_path.exists():
         existing_df = pd.read_parquet(output_path)
         if not existing_df.empty:
-            last_fetched_date = existing_df["timestamp"].max().date()
-            log.info(f"Existing data found up to {last_fetched_date}")
+            first_date = existing_df["timestamp"].min().date()
+            last_date = existing_df["timestamp"].max().date()
+            log.info(f"Existing data: {first_date} → {last_date} ({len(existing_df):,} rows)")
 
-    # Generate date batches
     from_date = bt_cfg["from_date"]
     to_date = bt_cfg["to_date"]
 
-    # If resuming, start from last fetched date
-    if last_fetched_date:
-        resume_date = (last_fetched_date + timedelta(days=1)).strftime("%Y-%m-%d")
-        if resume_date >= to_date:
+    # Build fetch ranges (skip already-covered period)
+    fetch_ranges = []
+    if existing_df is not None and not existing_df.empty:
+        first_date = existing_df["timestamp"].min().date()
+        last_date = existing_df["timestamp"].max().date()
+        req_start = datetime.strptime(from_date, "%Y-%m-%d").date()
+        req_end = datetime.strptime(to_date, "%Y-%m-%d").date()
+
+        # Backward gap: requested start is before existing start
+        if req_start < first_date:
+            gap_end = (first_date - timedelta(days=1)).strftime("%Y-%m-%d")
+            fetch_ranges.append((from_date, gap_end))
+            log.info(f"Backward gap: {from_date} → {gap_end}")
+
+        # Forward gap: requested end is after existing end
+        if req_end > last_date:
+            gap_start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+            fetch_ranges.append((gap_start, to_date))
+            log.info(f"Forward gap: {gap_start} → {to_date}")
+
+        if not fetch_ranges:
             log.info("Data already complete. Nothing to fetch.")
             return
-        from_date = resume_date
-        log.info(f"Resuming from {from_date}")
+    else:
+        fetch_ranges.append((from_date, to_date))
 
-    batches = get_date_batches(from_date, to_date)
-    log.info(f"Fetching {len(batches)} batches ({from_date} to {to_date})")
+    # Generate batches from all fetch ranges
+    batches = []
+    for range_from, range_to in fetch_ranges:
+        batches.extend(get_date_batches(range_from, range_to))
+    log.info(f"Fetching {len(batches)} batches across {len(fetch_ranges)} range(s)")
 
     all_dfs = []
     for batch_from, batch_to in tqdm(batches, desc="Fetching batches"):

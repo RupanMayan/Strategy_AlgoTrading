@@ -94,7 +94,7 @@ cooldown_min         = 30       # Minutes to wait after close before re-entry
 max_loss_per_lot     = 3000     # Skip re-entry if previous loss > this per lot
 
 [backtest]
-from_date    = "2025-03-21"
+from_date    = "2021-03-22"
 to_date      = "2026-03-21"
 skip_months  = [11]
 trade_dte    = [0, 1, 2, 3, 4]

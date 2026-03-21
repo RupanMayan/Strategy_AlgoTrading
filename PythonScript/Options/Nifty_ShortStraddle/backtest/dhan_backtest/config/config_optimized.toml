@@ -1,7 +1,7 @@
 # Optimized Nifty Short Straddle Configuration
 # Generated: 2026-03-21
-# Backtest period: 2025-03-21 to 2026-03-21
-# Expected: P&L ₹189K (0% slip) / ₹168K (1% slip), WR 64%, PF 2.15
+# Original 1yr period: 2025-03-21 to 2026-03-21 → P&L ₹189K, WR 64%, PF 2.15
+# Extended 5yr period: 2021-03-22 to 2026-03-21
 
 [instrument]
 underlying     = "NIFTY"
@@ -80,7 +80,7 @@ cooldown_min         = 45       # Wait 45 min after close
 max_loss_per_lot     = 2000     # Skip re-entry if previous loss > ₹2000/lot
 
 [backtest]
-from_date    = "2025-03-21"
+from_date    = "2021-03-22"
 to_date      = "2026-03-21"
 skip_months  = [11]
 trade_dte    = [0, 1, 2, 3, 4]    # ALL DTEs profitable with optimized params
