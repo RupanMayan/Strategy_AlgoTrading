@@ -81,15 +81,15 @@ max_loss_per_lot     = 2000     # Skip re-entry if previous loss > ₹2000/lot
 
 # ── VIX / IVR / IVP Filters (matching production config.toml) ──
 [vix_filter]
-enabled = true
-vix_min = 14.0    # Skip if VIX < 14 (premiums too thin)
-vix_max = 28.0    # Skip if VIX > 28 (danger zone)
+enabled = false   # DISABLED — 5yr backtest shows no DD reduction, costs 47% net P&L
+vix_min = 14.0
+vix_max = 28.0
 
 [ivr_ivp_filter]
-ivr_filter_enabled = true
-ivr_min            = 30.0    # Skip if IVR < 30 (IV in bottom 30% of 52wk range)
-ivp_filter_enabled = true
-ivp_min            = 40.0    # Skip if IVP < 40% (IV below 40th percentile)
+ivr_filter_enabled = false   # DISABLED — skips too many profitable days
+ivr_min            = 30.0
+ivp_filter_enabled = false   # DISABLED
+ivp_min            = 40.0
 
 [backtest]
 from_date    = "2021-03-22"

@@ -164,7 +164,11 @@ skip_months = [11]   # Skip November
 # ──────────────────────────────────────────────────────────────────────────────
 
 [vix_filter]
-enabled = true
+enabled = false  # Backtest-optimised: DISABLED (was true)
+                 # 5-year backtest shows no drawdown reduction from VIX filter.
+                 # Max DD identical with/without (-₹12,812). Disabling captures
+                 # ₹4.83L more net P&L. Intraday VIX spike monitor (Section 7B)
+                 # provides real-time protection instead.
 vix_min = 14.0   # Skip if VIX below this — premiums too thin
 vix_max = 28.0   # Skip if VIX above this — danger zone
 
@@ -217,9 +221,11 @@ vix_max = 28.0   # Skip if VIX above this — danger zone
 # ──────────────────────────────────────────────────────────────────────────────
 
 [ivr_ivp_filter]
-ivr_filter_enabled   = true
+ivr_filter_enabled   = false   # Backtest-optimised: DISABLED (was true)
+                               # IVR filter skipped 63% of profitable trading days.
+                               # Win rate improved 68→74% but net P&L dropped 47%.
 ivr_min              = 30.0    # Skip if IVR < 30  (IV in bottom 30% of 52wk range)
-ivp_filter_enabled   = true
+ivp_filter_enabled   = false   # Backtest-optimised: DISABLED (was true)
 ivp_min              = 40.0    # Skip if IVP < 40% (IV below 40th percentile)
 ivr_fail_open        = false   # false = skip trade if history unavailable (production-safe fail-closed)
 vix_history_file     = "vix_history.csv"   # Path to daily VIX closing data file

@@ -213,19 +213,16 @@ The entry job runs a **sequential filter chain** — short-circuits on the first
 │     ├─ Weekend guard (Sat/Sun → skip)                    │
 │     └─ Current month in SKIP_MONTHS? [11=November]       │
 │                                                          │
-│  3. VIX FILTER                                           │
-│     ├─ Fetch India VIX from OpenAlgo                     │
-│     ├─ VIX < 14.0 → skip (premiums too thin)            │
-│     ├─ VIX > 28.0 → skip (danger zone)                  │
-│     └─ Store vix_at_entry in state                       │
+│  3. VIX FILTER  ◀ DISABLED (v7.0.0)                      │
+│     ├─ 5yr backtest: no DD reduction, costs 47% net P&L  │
+│     ├─ Intraday VIX spike monitor (7B) provides          │
+│     │  real-time protection instead                       │
+│     └─ VIX still fetched + stored for analytics          │
 │                                                          │
-│  4. IVR / IVP FILTER                                     │
-│     ├─ Load 252 days of VIX history from CSV             │
-│     ├─ IVR = (VIX - 52wk_Low) / (52wk_High - 52wk_Low) │
-│     ├─ IVP = % of days with lower VIX than today        │
-│     ├─ IVR < 30.0 → skip (IV not rich enough)           │
-│     ├─ IVP < 40.0% → skip (IV below 40th percentile)    │
-│     └─ fail_open = false → skip if history unavailable   │
+│  4. IVR / IVP FILTER  ◀ DISABLED (v7.0.0)               │
+│     ├─ 5yr backtest: skipped 63% of profitable days      │
+│     ├─ Win rate +6% but net P&L -47%                     │
+│     └─ IVR/IVP still computed for analytics logging      │
 │                                                          │
 │  5. OPENING RANGE (ORB) FILTER                           │
 │     ├─ Fetch current NIFTY spot                          │
@@ -1397,7 +1394,7 @@ metadata for post-session analysis and parameter tuning.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `true` | Enable VIX range check |
+| `enabled` | `false` | Enable VIX range check — **DISABLED v7.0.0** |
 | `vix_min` | `14.0` | Minimum VIX (below = premiums too thin) |
 | `vix_max` | `28.0` | Maximum VIX (above = danger zone) |
 
@@ -1405,9 +1402,9 @@ metadata for post-session analysis and parameter tuning.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `ivr_filter_enabled` | `true` | Enable IV Rank check |
+| `ivr_filter_enabled` | `false` | Enable IV Rank check — **DISABLED v7.0.0** |
 | `ivr_min` | `30.0` | Minimum IVR (0–100 scale) |
-| `ivp_filter_enabled` | `true` | Enable IV Percentile check |
+| `ivp_filter_enabled` | `false` | Enable IV Percentile check — **DISABLED v7.0.0** |
 | `ivp_min` | `40.0` | Minimum IVP (0–100%) |
 | `ivr_fail_open` | `false` | Allow trade if history unavailable |
 | `vix_history_file` | `vix_history.csv` | Daily VIX data file |
