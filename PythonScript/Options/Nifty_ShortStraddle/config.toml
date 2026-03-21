@@ -1,7 +1,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 #  NIFTY SHORT STRADDLE — PARTIAL SQUARE OFF  |  Configuration File
 #  Strategy : Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS
-#  Version  : 6.4.0
+#  Version  : 7.0.0  (backtest-optimised — see docs/2026-03-21-optimization-results.md)
 #
 #  Sections:
 #    1.  OpenAlgo Connection
@@ -283,22 +283,29 @@ max_move_pct  = 0.5       # Skip trade if NIFTY moved > 0.5% from ORB price
 # ──────────────────────────────────────────────────────────────────────────────
 
 [risk]
-leg_sl_percent              = 20.0   # % of entry premium per leg  (0 = disabled)
-daily_profit_target_per_lot =  5000  # Rs. profit target PER LOT   (0 = disabled)
-daily_loss_limit_per_lot    = -4000  # Rs. loss limit PER LOT — NEGATIVE  (0 = disabled)
+leg_sl_percent              = 30.0   # % of entry premium per leg  (0 = disabled)
+                                     # Backtest-optimised: 30% (was 20%) — wider SL lets trades
+                                     # breathe for theta capture. Avoids false SL hits especially
+                                     # on DTE2+ where morning volatility spikes are common.
+daily_profit_target_per_lot = 10000  # Rs. profit target PER LOT   (0 = disabled)
+                                     # Backtest-optimised: 10000 (was 5000) — higher target captures
+                                     # full theta. Rarely hit anyway (2/291 trades), so raising it
+                                     # avoids capping big winning days.
+daily_loss_limit_per_lot    = -6000  # Rs. loss limit PER LOT — NEGATIVE  (0 = disabled)
+                                     # Backtest-optimised: -6000 (was -4000) — wider limit reduces
+                                     # premature stop-outs. Most SL exits recover intraday.
 net_pnl_guard_max_defer_min = 15     # Max minutes to defer SL via Net P&L Guard (0 = unlimited)
                                      # After this cap, per-leg SL fires regardless of net P&L.
                                      # Prevents slow bleed when closed_pnl masks open-leg loss.
 
 # ── DTE-aware SL override ──
-# On DTE2+ days (Fri/Thu/Wed) premiums are thinner and morning volatility
-# can easily breach a 20% SL. Widening SL on these days reduces false SL hits.
-# Keys are DTE values (int); values are SL % to use INSTEAD of leg_sl_percent.
-# Omitted DTEs use leg_sl_percent as default.
+# With base SL now at 30%, DTE overrides are no longer needed — the wider base
+# already handles DTE2+ volatility. Backtest confirmed 30% across all DTEs is
+# optimal. Overrides removed (all DTEs use leg_sl_percent = 30%).
+# Preserved as comments for reference:
+#   Previously: "2" = 25.0, "3" = 28.0, "4" = 30.0 (when base was 20%)
 [risk.dte_sl_override]
-"2" = 25.0   # DTE2 = Friday  — wider SL (moderate premium, opening vol)
-"3" = 28.0   # DTE3 = Thursday — wider still (low premium, fragile)
-"4" = 30.0   # DTE4 = Wednesday — widest (thin premium, max false-SL risk)
+# No overrides — all DTEs use base leg_sl_percent (30%)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -422,12 +429,13 @@ abs_floor        = 18.0   # Minimum absolute VIX required to confirm a spike exi
 # ──────────────────────────────────────────────────────────────────────────────
 
 [risk.trailing_sl]
-enabled     = true
+enabled     = false  # Backtest-optimised: DISABLED (was true)
+                     # Trailing SL rarely activates (3/224 trades in backtest) and when
+                     # it does, it cuts winners short. With wider 30% base SL and
+                     # breakeven SL protecting partial exits, trailing adds no value.
+                     # Re-enable only after live validation shows consistent benefit.
 trigger_pct = 50.0   # Activate when LTP falls to this % of entry price
 lock_pct    = 15.0   # Trailing SL = current_LTP × (1 + lock_pct/100)
-                     # Was 30% — lowered to 15% so trailing SL is meaningfully
-                     # tighter than the fixed SL. At 30%, trailing SL equals
-                     # fixed SL at activation, providing zero benefit.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -461,15 +469,19 @@ lock_pct    = 15.0   # Trailing SL = current_LTP × (1 + lock_pct/100)
 # ──────────────────────────────────────────────────────────────────────────────
 
 [risk.dynamic_sl]
-enabled = true
+enabled = false  # Backtest-optimised: DISABLED (was true)
+                 # Time-of-day SL tightening hurts more than helps with the wider 30%
+                 # base SL. The afternoon tightening (7-15%) creates false SL hits on
+                 # normal intraday bounces, cutting profitable positions. With 30% SL
+                 # and no trailing, the position naturally captures theta to hard exit.
 
 # Must be in DESCENDING time order (latest time first). First match wins.
+# Preserved for reference — re-enable with caution after live validation.
 schedule = [
     { time = "14:30", sl_pct = 7.0  },   # After 2:30 PM → very tight (last 45 min, max theta harvested)
     { time = "13:30", sl_pct = 10.0 },   # After 1:30 PM → medium-tight
     { time = "12:00", sl_pct = 15.0 },   # After 12:00 PM → slightly tighter than morning
 ]
-# Before 12:00 → falls back to risk.leg_sl_percent (20%)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -591,10 +603,11 @@ grace_period_min = 5       # Minutes to wait after partial close before arming b
                            # Prevents instant trigger — gives the surviving leg time to
                            # decay further and offset the closed leg's loss.
                            # 0 = no grace (original behaviour — fires immediately)
-buffer_pct       = 10.0    # % buffer ABOVE the mathematical breakeven price.
+buffer_pct       = 5.0     # % buffer ABOVE the mathematical breakeven price.
+                           # Backtest-optimised: 5% (was 10%) — tighter buffer locks
+                           # breakeven more precisely. At 10%, breakeven SL fires too
+                           # late and lets the survivor overshoot into loss territory.
                            # be_sl = breakeven_price × (1 + buffer_pct/100)
-                           # A 10% buffer on Rs.207 = Rs.227.70 — the surviving leg
-                           # must bounce significantly before the SL fires.
                            # 0 = no buffer (exact breakeven — aggressive)
 
 
@@ -624,7 +637,11 @@ buffer_pct       = 10.0    # % buffer ABOVE the mathematical breakeven price.
 # ──────────────────────────────────────────────────────────────────────────────
 
 [risk.spot_move_exit]
-enabled          = true
+enabled          = false  # Backtest-optimised: DISABLED (was true)
+                          # Spot-move exit was responsible for 26% of exits in production-match
+                          # backtest — most were premature. With wider 30% SL and per-leg
+                          # independence, positions naturally recover from directional moves.
+                          # Disabling improved P&L by ~₹40K in backtest.
 spot_multiplier  = 1.0   # Exit when NIFTY moves >= 1.0× combined premium from entry spot
 check_interval_s = 60    # Throttle: fetch NIFTY spot at most once per 60s
 
@@ -656,9 +673,15 @@ check_interval_s = 60    # Throttle: fetch NIFTY spot at most once per 60s
 
 [risk.reentry]
 enabled                = true
-cooldown_min           = 30     # Minutes to wait after full close before re-entry
+cooldown_min           = 45     # Backtest-optimised: 45 min (was 30)
+                                # 45-min cooldown lets market settle after adverse move.
+                                # 30-min re-enters into still-trending market (worse results).
 max_loss_per_lot       = 2000   # Per-lot Rs. threshold — effective = per_lot × number_of_lots
-max_reentries_per_day  = 1      # Max number of re-entries per day (1 = one retry after initial trade)
+                                # Backtest-optimised: 2000 (unchanged) — blocks re-entry after
+                                # large SL losses where market has moved significantly.
+max_reentries_per_day  = 2      # Backtest-optimised: 2 (was 1) — second re-entry captures
+                                # additional recovery after SL hits. Added +₹36K in backtest.
+                                # Combined with 45-min cooldown, ensures re-entries are selective.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -691,7 +714,12 @@ max_reentries_per_day  = 1      # Max number of re-entries per day (1 = one retr
 # ──────────────────────────────────────────────────────────────────────────────
 
 [risk.recovery_lock]
-enabled                = true
+enabled                = false   # Backtest-optimised: DISABLED (was true)
+                                 # Recovery lock was the #1 exit reason (42% of trades) in
+                                 # production-match backtest, cutting profits short. After
+                                 # partial exit, the surviving winner naturally decays via
+                                 # theta — recovery lock exits before this completes.
+                                 # Winner-leg booking (Section 7F) handles deep decay exits.
 min_recovery_rs_per_lot = 500    # Min recovery per lot before trailing starts
 trail_pct              = 50.0    # Exit if recovery retraces 50% from peak
 

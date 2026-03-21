@@ -1,6 +1,6 @@
 # NIFTY Short Straddle — Partial Square Off Strategy
 
-**Version 6.4.0** | OpenAlgo + Dhan API | Restart-Safe | Production Grade
+**Version 7.0.0** | OpenAlgo + Dhan API | Restart-Safe | Production Grade | Backtest-Optimised
 
 ---
 
