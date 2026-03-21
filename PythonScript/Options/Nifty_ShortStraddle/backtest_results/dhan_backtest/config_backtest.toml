@@ -1,0 +1,57 @@
+[instrument]
+underlying     = "NIFTY"
+lot_size       = 65
+number_of_lots = 1
+
+[timing]
+entry_time         = "09:30"
+exit_time          = "15:15"
+use_dte_entry_map  = true
+
+[timing.dte_entry_time_map]
+"0" = "09:30"
+"1" = "09:30"
+"2" = "09:35"
+"3" = "09:40"
+"4" = "09:45"
+
+[risk]
+leg_sl_percent              = 20.0
+daily_profit_target_per_lot = 5000
+daily_loss_limit_per_lot    = -4000
+
+[risk.dte_sl_override]
+"2" = 25.0
+"3" = 28.0
+"4" = 30.0
+
+[risk.dynamic_sl]
+enabled = true
+
+[[risk.dynamic_sl.schedule]]
+time = "14:30"
+sl_pct = 7.0
+
+[[risk.dynamic_sl.schedule]]
+time = "13:30"
+sl_pct = 10.0
+
+[[risk.dynamic_sl.schedule]]
+time = "12:00"
+sl_pct = 15.0
+
+[backtest]
+from_date    = "2025-03-21"
+to_date      = "2026-03-21"
+skip_months  = [11]
+trade_dte    = [0, 1, 2, 3, 4]
+slippage_pct = 0.0
+
+[dhan]
+# Credentials from env: DHAN_ACCESS_TOKEN, DHAN_CLIENT_ID
+security_id      = 13
+exchange_segment = "NSE_FNO"
+instrument       = "OPTIDX"
+expiry_flag      = "WEEK"
+expiry_code      = 0
+interval         = "1"
