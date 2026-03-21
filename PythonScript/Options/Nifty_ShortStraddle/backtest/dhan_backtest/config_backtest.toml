@@ -1,0 +1,104 @@
+[instrument]
+underlying     = "NIFTY"
+lot_size       = 65
+number_of_lots = 1
+
+[timing]
+entry_time         = "09:30"
+exit_time          = "15:15"
+use_dte_entry_map  = true
+
+[timing.dte_entry_time_map]
+"0" = "09:30"
+"1" = "09:30"
+"2" = "09:35"
+"3" = "09:40"
+"4" = "09:45"
+
+[risk]
+leg_sl_percent              = 20.0
+daily_profit_target_per_lot = 5000
+daily_loss_limit_per_lot    = -4000
+
+[risk.dte_sl_override]
+"2" = 25.0
+"3" = 28.0
+"4" = 30.0
+
+[risk.dynamic_sl]
+enabled = true
+
+[[risk.dynamic_sl.schedule]]
+time = "14:30"
+sl_pct = 7.0
+
+[[risk.dynamic_sl.schedule]]
+time = "13:30"
+sl_pct = 10.0
+
+[[risk.dynamic_sl.schedule]]
+time = "12:00"
+sl_pct = 15.0
+
+[risk.trailing_sl]
+enabled     = true
+trigger_pct = 50.0    # Activate when LTP decays to 50% of entry
+lock_pct    = 15.0    # Trailing SL = LTP * 1.15
+
+[risk.breakeven_sl]
+enabled          = true
+grace_period_min = 5      # Wait 5 min before arming
+buffer_pct       = 10.0   # Buffer above mathematical breakeven
+
+[risk.combined_decay_exit]
+enabled          = true
+decay_target_pct = 60.0   # Default: exit when combined decay >= 60%
+
+[risk.combined_decay_exit.dte_override]
+"0" = 70.0
+"1" = 65.0
+"2" = 60.0
+"3" = 50.0
+"4" = 50.0
+
+[risk.winner_leg_booking]
+enabled             = true
+decay_threshold_pct = 30.0   # Book when LTP <= 30% of entry (70%+ profit)
+
+[risk.asymmetric_booking]
+enabled           = true
+winner_decay_pct  = 40.0     # Book winner when LTP <= 40% of entry
+loser_intact_pct  = 80.0     # Only if loser LTP >= 80% of entry
+
+[risk.combined_profit_trail]
+enabled      = true
+activate_pct = 30.0           # Start trailing after 30% combined decay
+trail_pct    = 40.0           # Exit if decay retraces by 40 points from peak
+
+[risk.recovery_lock]
+enabled                = true
+min_recovery_rs_per_lot = 500   # Min recovery before trailing activates
+trail_pct              = 50.0   # Exit if recovery retraces 50% from peak
+
+[risk.net_pnl_guard]
+max_defer_min = 15             # Max deferral of per-leg SL when net positive
+
+[risk.spot_move_exit]
+enabled         = true
+spot_multiplier = 1.0          # Exit when NIFTY moves >= 1.0x premium from entry
+
+[backtest]
+from_date    = "2025-03-21"
+to_date      = "2026-03-21"
+skip_months  = [11]
+trade_dte    = [0, 1, 2, 3, 4]
+slippage_pct = 0.0
+
+[dhan]
+# Credentials from env: DHAN_ACCESS_TOKEN, DHAN_CLIENT_ID
+security_id      = 13
+exchange_segment = "NSE_FNO"
+instrument       = "OPTIDX"
+expiry_flag      = "WEEK"
+expiry_code      = 1
+interval         = "1"

@@ -1,0 +1,63 @@
+{
+  "iteration": 3,
+  "features": "full_production_parity",
+  "total_pnl": -23106.95,
+  "num_trades": 224,
+  "win_rate_pct": 59.38,
+  "avg_win": 935.67,
+  "avg_loss": -1621.44,
+  "profit_factor": 0.8434,
+  "max_drawdown": -31648.47,
+  "max_drawdown_pct": -370.53,
+  "sharpe_ratio": -0.8397,
+  "sortino_ratio": -1.3071,
+  "calmar_ratio": 0.7301,
+  "ce_sl_hits": 110,
+  "pe_sl_hits": 117,
+  "both_sl_hits": 29,
+  "no_sl_days": 26,
+  "exit_reasons": {
+    "recovery_lock": 94,
+    "spot_move": 58,
+    "both_sl_hit": 29,
+    "hard_exit": 26,
+    "profit_target": 9,
+    "loss_limit": 7,
+    "combined_decay": 1
+  },
+  "per_dte": {
+    "0": {
+      "count": 47,
+      "total_pnl": -5721.95,
+      "avg_pnl": -121.74,
+      "win_rate": 68.09
+    },
+    "1": {
+      "count": 48,
+      "total_pnl": -15800.2,
+      "avg_pnl": -329.17,
+      "win_rate": 50.0
+    },
+    "2": {
+      "count": 49,
+      "total_pnl": -21089.24,
+      "avg_pnl": -430.39,
+      "win_rate": 46.94
+    },
+    "3": {
+      "count": 46,
+      "total_pnl": 7427.45,
+      "avg_pnl": 161.47,
+      "win_rate": 63.04
+    },
+    "4": {
+      "count": 34,
+      "total_pnl": 12076.99,
+      "avg_pnl": 355.21,
+      "win_rate": 73.53
+    }
+  },
+  "lot_size": 65,
+  "num_lots": 1,
+  "backtest_period": "2025-03-21 to 2026-03-21"
+}
