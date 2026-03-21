@@ -53,5 +53,5 @@ security_id      = 13
 exchange_segment = "NSE_FNO"
 instrument       = "OPTIDX"
 expiry_flag      = "WEEK"
-expiry_code      = 0
+expiry_code      = 1
 interval         = "1"
