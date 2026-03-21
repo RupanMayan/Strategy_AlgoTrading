@@ -1146,19 +1146,29 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
     trades_df["month"] = trades_df["date"].dt.month
     monthly = trades_df.groupby(["year", "month"])["total_pnl"].sum().unstack(fill_value=0)
 
-    fig, ax = plt.subplots(figsize=(14, 4))
-    im = ax.imshow(monthly.values, cmap="RdYlGn", aspect="auto")
+    fig, ax = plt.subplots(figsize=(14, 5))
+    # Center color scale at zero so red = loss, green = profit
+    abs_max = max(abs(monthly.values.min()), abs(monthly.values.max()))
+    im = ax.imshow(monthly.values, cmap="RdYlGn", aspect="auto",
+                   vmin=-abs_max, vmax=abs_max)
+    month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     ax.set_xticks(range(len(monthly.columns)))
-    ax.set_xticklabels([f"M{m}" for m in monthly.columns])
+    ax.set_xticklabels([month_labels[m-1] for m in monthly.columns])
     ax.set_yticks(range(len(monthly.index)))
     ax.set_yticklabels(monthly.index)
     for i in range(len(monthly.index)):
         for j in range(len(monthly.columns)):
             val = monthly.values[i, j]
-            ax.text(j, i, f"₹{val:,.0f}", ha="center", va="center", fontsize=8,
-                    color="black" if abs(val) < monthly.values.max() * 0.5 else "white")
-    ax.set_title("Monthly P&L Heatmap (Iteration 3)")
-    fig.colorbar(im, ax=ax)
+            if val == 0:
+                label = "—"
+            else:
+                label = f"₹{val:,.0f}"
+            ax.text(j, i, label, ha="center", va="center", fontsize=7,
+                    fontweight="bold" if val < 0 else "normal",
+                    color="black")
+    ax.set_title(f"Monthly P&L Heatmap — Nifty Short Straddle (Net: ₹{total_net_pnl:,.0f})")
+    fig.colorbar(im, ax=ax, label="P&L (₹)")
     fig.tight_layout()
     fig.savefig(charts_dir / "monthly_heatmap.png", dpi=150)
     plt.close(fig)
