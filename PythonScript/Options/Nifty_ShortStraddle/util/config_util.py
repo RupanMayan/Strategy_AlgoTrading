@@ -382,13 +382,8 @@ class Config:
                 f"vix_filter.vix_min ({self.VIX_MIN}) — the floor will never activate because "
                 "VIX below vix_min would have blocked entry; raise abs_floor to >= vix_min"
             )
-        if self.VIX_SPIKE_MONITOR_ENABLED and not self.VIX_FILTER_ENABLED:
-            errors.append(
-                "[risk.vix_spike_monitor] enabled but [vix_filter] enabled = false — "
-                "the spike monitor relies on the VIX filter to establish a safe entry VIX "
-                "baseline; without it, entries at very low VIX make abs_floor and threshold "
-                "unreliable; either enable vix_filter or disable vix_spike_monitor"
-            )
+        # VIX spike monitor works without VIX filter — filters.py still fetches
+        # VIX at entry for the spike baseline even when VIX filter is disabled.
 
         # ── Section 7C — Trailing SL ──────────────────────────────────────────
         if not (0 < self.TRAIL_TRIGGER_PCT < 100):
