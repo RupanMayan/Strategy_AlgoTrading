@@ -18,17 +18,16 @@ Expiry helpers (used by job_entry and StrategyCore):
 from __future__ import annotations
 
 from datetime import datetime, date, timedelta
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from src._shared import (
     cfg, state,
     info, warn, debug,
     telegram,
-    _get_client,
+    fetch_ltp,
     INDEX_EXCH,
     DAY_NAMES, MONTH_NAMES,
     now_ist,
-    is_api_success,
 )
 
 if TYPE_CHECKING:
@@ -135,7 +134,7 @@ class FilterEngine:
 
     # ── DTE + month filter ────────────────────────────────────────────────────
 
-    def dte_filter_ok(self, dte: Optional[int] = None) -> bool:
+    def dte_filter_ok(self, dte: int | None = None) -> bool:
         """
         Return True if today passes: weekend guard → month filter → DTE filter.
 
@@ -272,16 +271,7 @@ class FilterEngine:
             )
             return True
 
-        try:
-            q = _get_client().quotes(symbol=cfg.UNDERLYING, exchange=INDEX_EXCH)
-            if is_api_success(q):
-                current_spot = float(q.get("data", {}).get("ltp", 0) or 0)
-            else:
-                current_spot = 0.0
-        except Exception as exc:
-            warn(f"ORB filter: spot LTP exception — {exc} — bypassed (fail-open)")
-            return True
-
+        current_spot = fetch_ltp(cfg.UNDERLYING, INDEX_EXCH)
         if current_spot <= 0:
             warn("ORB filter: NIFTY LTP fetch failed — bypassed (fail-open)")
             return True
@@ -330,16 +320,7 @@ class FilterEngine:
             debug("Momentum filter: ORB reference not available — bypassed (fail-open)")
             return True
 
-        try:
-            q = _get_client().quotes(symbol=cfg.UNDERLYING, exchange=INDEX_EXCH)
-            if is_api_success(q):
-                current_spot = float(q.get("data", {}).get("ltp", 0) or 0)
-            else:
-                current_spot = 0.0
-        except Exception as exc:
-            warn(f"Momentum filter: spot LTP exception — {exc} — bypassed (fail-open)")
-            return True
-
+        current_spot = fetch_ltp(cfg.UNDERLYING, INDEX_EXCH)
         if current_spot <= 0:
             warn("Momentum filter: NIFTY LTP fetch failed — bypassed (fail-open)")
             return True

@@ -75,7 +75,6 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from typing import Optional
 
 import requests
 
@@ -90,7 +89,7 @@ def _get_version() -> str:
         from src._shared import VERSION
         return VERSION
     except ImportError:
-        return "6.4.0"
+        return "7.1.0"
 
 # ── Telegram API base URL ─────────────────────────────────────────────────────
 _TELEGRAM_API_BASE = "https://api.telegram.org"
@@ -125,10 +124,10 @@ class TelegramNotifier:
     """
 
     def __init__(self) -> None:
-        self._send_queue: queue.Queue[Optional[str]] = queue.Queue()
-        self._http_session: Optional[requests.Session] = None
+        self._send_queue: queue.Queue[str | None] = queue.Queue()
+        self._http_session: requests.Session | None = None
         self._session_lock = threading.Lock()
-        self._worker_thread: Optional[threading.Thread] = None
+        self._worker_thread: threading.Thread | None = None
         self._worker_lock = threading.Lock()
 
     # ── Config access ─────────────────────────────────────────────────────────
@@ -383,16 +382,12 @@ class TelegramNotifier:
         if self._send_queue.empty():
             return True
 
-        try:
-            self._send_queue.join()
-            return True
-        except Exception:
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                if self._send_queue.empty():
-                    return True
-                time.sleep(0.1)
-            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._send_queue.empty():
+                return True
+            time.sleep(0.1)
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

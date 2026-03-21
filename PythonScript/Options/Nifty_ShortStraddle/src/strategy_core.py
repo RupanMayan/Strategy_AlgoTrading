@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import os
 import signal
-import tempfile
 from datetime import datetime
 
 from src._shared import (
@@ -118,22 +117,25 @@ class StrategyCore:
         # ── Timing ────────────────────────────────────────────────────────────
         try:
             eh, em = parse_hhmm(cfg.ENTRY_TIME)
-            assert 0 <= eh <= 23 and 0 <= em <= 59
-        except Exception:
+            if not (0 <= eh <= 23 and 0 <= em <= 59):
+                raise ValueError("out of range")
+        except (ValueError, TypeError):
             errors.append(f"ENTRY_TIME invalid: {cfg.ENTRY_TIME!r}  (expected HH:MM)")
         if cfg.USE_DTE_ENTRY_MAP:
             for dte_key, t in cfg.DTE_ENTRY_TIME_MAP.items():
                 try:
                     dh, dm = parse_hhmm(t)
-                    assert 0 <= dh <= 23 and 0 <= dm <= 59
-                except Exception:
+                    if not (0 <= dh <= 23 and 0 <= dm <= 59):
+                        raise ValueError("out of range")
+                except (ValueError, TypeError):
                     errors.append(
                         f"DTE_ENTRY_TIME_MAP[{dte_key}] invalid: {t!r}  (expected HH:MM)"
                     )
         try:
             xh, xm = parse_hhmm(cfg.EXIT_TIME)
-            assert 0 <= xh <= 23 and 0 <= xm <= 59
-        except Exception:
+            if not (0 <= xh <= 23 and 0 <= xm <= 59):
+                raise ValueError("out of range")
+        except (ValueError, TypeError):
             errors.append(f"EXIT_TIME invalid: {cfg.EXIT_TIME!r}  (expected HH:MM)")
 
         # Entry must precede exit
@@ -278,8 +280,9 @@ class StrategyCore:
             )
         try:
             vuh, vum = parse_hhmm(cfg.VIX_UPDATE_TIME)
-            assert 0 <= vuh <= 23 and 0 <= vum <= 59
-        except Exception:
+            if not (0 <= vuh <= 23 and 0 <= vum <= 59):
+                raise ValueError("out of range")
+        except (ValueError, TypeError):
             errors.append(
                 f"VIX_UPDATE_TIME invalid: {cfg.VIX_UPDATE_TIME!r}  (expected HH:MM)"
             )
@@ -329,8 +332,9 @@ class StrategyCore:
                 t_str, sl_pct = entry
                 try:
                     th, tm = parse_hhmm(t_str)
-                    assert 0 <= th <= 23 and 0 <= tm <= 59
-                except Exception:
+                    if not (0 <= th <= 23 and 0 <= tm <= 59):
+                        raise ValueError("out of range")
+                except (ValueError, TypeError):
                     errors.append(
                         f"DYNAMIC_SL_SCHEDULE[{i}] time {t_str!r} is invalid (expected HH:MM)"
                     )
@@ -378,8 +382,9 @@ class StrategyCore:
         if cfg.ORB_FILTER_ENABLED:
             try:
                 oh, om = parse_hhmm(cfg.ORB_CAPTURE_TIME)
-                assert 0 <= oh <= 23 and 0 <= om <= 59
-            except Exception:
+                if not (0 <= oh <= 23 and 0 <= om <= 59):
+                    raise ValueError("out of range")
+            except (ValueError, TypeError):
                 errors.append(
                     f"ORB_CAPTURE_TIME invalid: {cfg.ORB_CAPTURE_TIME!r}  (expected HH:MM)"
                 )
@@ -456,73 +461,8 @@ class StrategyCore:
     # ── VIX history startup check ─────────────────────────────────────────────
 
     def _check_vix_history_on_startup(self) -> None:
-        """
-        Validate VIX history file at startup and log actionable status.
-
-        Checks: file exists, row count (>= VIX_HISTORY_MIN_ROWS), staleness.
-        Does NOT block startup — only logs warnings.
-        If the file is missing, attempts auto-bootstrap from NSE.
-        """
-        if not cfg.IVR_FILTER_ENABLED and not cfg.IVP_FILTER_ENABLED:
-            info("IVR/IVP filter disabled — skipping VIX history startup check")
-            return
-
-        sep()
-        info("VIX HISTORY STARTUP CHECK")
-
-        if not os.path.exists(cfg.VIX_HISTORY_FILE):
-            warn(f"  VIX history file NOT FOUND: {os.path.abspath(cfg.VIX_HISTORY_FILE)}")
-            info("  Auto-bootstrapping from NSE historical VIX data...")
-            success = self._vix_manager.bootstrap_history()
-            if not success:
-                warn("  Auto-bootstrap FAILED.")
-                warn("  IVR/IVP filter will SKIP trades (fail-closed) until file is created.")
-                warn("  Manual fix: call check.manual_bootstrap_vix() or run main.py --bootstrap")
-                sep()
-                return
-
-        rows = self._vix_manager.load_history_raw()
-        n    = len(rows)
-
-        if n == 0:
-            warn(
-                f"  VIX history file EXISTS but has 0 valid rows: {cfg.VIX_HISTORY_FILE}\n"
-                f"  Check file format: header must be 'date,vix_close', values must be numeric"
-            )
-            sep()
-            return
-
-        latest_date_str = rows[-1][0]
-        latest_vix      = rows[-1][1]
-
-        info(f"  File        : {os.path.abspath(cfg.VIX_HISTORY_FILE)}")
-        info(f"  Rows        : {n}  (need >= {cfg.VIX_HISTORY_MIN_ROWS} for full accuracy)")
-        info(f"  Latest entry: {latest_date_str}  VIX {latest_vix:.2f}")
-
-        if n < cfg.VIX_HISTORY_MIN_ROWS:
-            warn(
-                f"  Row count {n} < {cfg.VIX_HISTORY_MIN_ROWS} minimum. "
-                f"IVR/IVP accuracy is limited. "
-                f"{'Add more history from NSE data.' if n < 50 else 'Growing — will improve over time.'}"
-            )
-
-        try:
-            from datetime import date as _date
-            latest_dt = _date.fromisoformat(latest_date_str)
-            today     = now_ist().date()
-            days_old  = (today - latest_dt).days
-            if days_old > 5:
-                warn(
-                    f"  ⚠ VIX history is {days_old} calendar days stale "
-                    f"(last: {latest_date_str}). "
-                    f"The 15:30 auto-update job will fix this today."
-                )
-            else:
-                info(f"  Freshness   : {days_old} calendar day(s) old — OK")
-        except (ValueError, TypeError):
-            warn(f"  Could not parse latest date: {latest_date_str!r}")
-
-        sep()
+        """Delegate to VIXManager — validates file, auto-bootstraps if missing."""
+        self._vix_manager.check_on_startup()
 
     # ── Startup banner ────────────────────────────────────────────────────────
 
@@ -989,63 +929,8 @@ class StrategyCore:
             self._monitor.monitor_pnl()
 
     def _job_update_vix_history(self) -> None:
-        """
-        Daily VIX history maintenance — fires once at VIX_UPDATE_TIME (15:30 IST).
-
-        Appends today's closing VIX to vix_history.csv for tomorrow's IVR/IVP
-        filter.  Duplicate-safe (idempotent), atomic write (temp + rename).
-        """
-        now_dt = now_ist()
-        if now_dt.weekday() >= 5:
-            debug("VIX history update: weekend — skipping")
-            return
-
-        today_str = now_dt.date().isoformat()
-
-        rows = self._vix_manager.load_history_raw()
-        if rows and rows[-1][0] == today_str:
-            debug(
-                f"VIX history: {today_str} already recorded "
-                f"(VIX {rows[-1][1]:.2f}) — no update needed"
-            )
-            return
-
-        vix = self._vix_manager.fetch_vix()
-        if vix <= 0:
-            warn(f"VIX history update: VIX unavailable for {today_str} — skipping")
-            telegram(
-                f"⚠️ VIX history: daily update FAILED for {today_str}\n"
-                f"IVR/IVP data will be 1 day stale tomorrow.\n"
-                f"Check OpenAlgo / NSE connectivity."
-            )
-            return
-
-        rows.append((today_str, vix))
-        if len(rows) > 300:
-            rows = rows[-300:]
-
-        try:
-            hist_dir = os.path.dirname(os.path.abspath(cfg.VIX_HISTORY_FILE)) or "."
-            fd, tmp_path = tempfile.mkstemp(dir=hist_dir, suffix=".tmp")
-            try:
-                with os.fdopen(fd, "w") as f:
-                    f.write("date,vix_close\n")
-                    for d, v in rows:
-                        f.write(f"{d},{v:.2f}\n")
-                os.replace(tmp_path, cfg.VIX_HISTORY_FILE)
-            except Exception:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
-            info(
-                f"VIX history updated: {today_str} → VIX {vix:.2f}  "
-                f"({len(rows)} rows in {cfg.VIX_HISTORY_FILE})"
-            )
-        except Exception as exc:
-            warn(f"VIX history write failed: {exc}")
-            telegram(f"⚠️ VIX history write FAILED: {exc}")
+        """Delegate to VIXManager — appends today's closing VIX to history CSV."""
+        self._vix_manager.update_history()
 
     # ── Production run ────────────────────────────────────────────────────────
 

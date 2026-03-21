@@ -11,6 +11,7 @@ Exports:
   MonitorState, _monitor_state                         — monitor thread vars
   _monitor_lock                                        — monitor RLock (alias)
   now_ist(), qty(), parse_hhmm(), active_legs()        — stateless helpers
+  fetch_ltp()                                          — broker quote helper
   sl_level(), _dynamic_sl_percent()                    — SL helpers
   telegram                                             — notify alias
 ═══════════════════════════════════════════════════════════════════════
@@ -21,7 +22,6 @@ from __future__ import annotations
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import threading
 from datetime import datetime
-from typing import Optional
 
 # ── third-party ───────────────────────────────────────────────────────────────
 import pytz
@@ -43,7 +43,7 @@ telegram = notify
 #  Change user-facing settings in config.toml only.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VERSION     = "7.0.0"
+VERSION     = "7.1.0"
 IST         = pytz.timezone("Asia/Kolkata")
 OPTION_EXCH = "NFO"        # All F&O option contracts (quotes / positions)
 INDEX_EXCH  = "NSE_INDEX"  # Underlying index + VIX (order entry)
@@ -78,7 +78,7 @@ class BrokerClient:
     """
 
     def __init__(self) -> None:
-        self._instance: Optional[OpenAlgoClient] = None
+        self._instance: OpenAlgoClient | None = None
         self._lock = threading.Lock()
 
     def get_client(self) -> OpenAlgoClient:
@@ -133,8 +133,8 @@ class MonitorState:
     """
 
     def __init__(self) -> None:
-        self.last_vix_spike_check_time: Optional[datetime] = None
-        self.last_spot_check_time:      Optional[datetime] = None
+        self.last_vix_spike_check_time: datetime | None = None
+        self.last_spot_check_time:      datetime | None = None
         self.first_tick_fired:          bool = False
         self.consecutive_quote_fail_ticks: int  = 0
         self.quote_fail_alerted:        bool = False
@@ -153,13 +153,6 @@ _monitor_state = MonitorState()
 # RLock exposed as a module-level variable for backward-compatible direct import.
 # Reentrant so close_all() → close_one_leg() is safe.
 _monitor_lock: threading.RLock = threading.RLock()
-
-# ── Backward-compatible aliases for code that accesses _shared.xxx directly ──
-# These are properties bridged to the MonitorState singleton so that existing
-# code like `_shared._last_vix_spike_check_time = now` continues to work.
-# We use module-level attribute access via __getattr__/__setattr__ overrides
-# defined at the bottom of this file.
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MODULE-LEVEL UTILITY HELPERS
@@ -253,6 +246,25 @@ def parse_ist_datetime(raw: str | datetime | None) -> datetime | None:
         return None
 
 
+def fetch_ltp(symbol: str, exchange: str) -> float:
+    """
+    Fetch the last traded price for a symbol via OpenAlgo quotes API.
+
+    Returns the LTP as a float, or 0.0 if the call fails or the response
+    is invalid. Exceptions are caught and logged — callers never need to
+    wrap this in try/except.
+    """
+    try:
+        resp = _get_client().quotes(symbol=symbol, exchange=exchange)
+        if is_api_success(resp):
+            ltp = float(resp.get("data", {}).get("ltp", 0) or 0)
+            return ltp if ltp > 0 else 0.0
+        debug(f"fetch_ltp({symbol}): API error — {get_api_error(resp)}")
+    except Exception as exc:
+        debug(f"fetch_ltp({symbol}): exception — {exc}")
+    return 0.0
+
+
 def is_api_success(resp: object) -> bool:
     """Check if an OpenAlgo API response indicates success."""
     return isinstance(resp, dict) and resp.get("status") == "success"
@@ -329,31 +341,3 @@ def sl_level(leg: str) -> float:
     return fixed_sl
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Module __getattr__ / __setattr__ — backward-compatible attribute bridging
-#
-#  Other modules access monitor state via:
-#    _shared._last_vix_spike_check_time = now
-#    _shared._first_tick_fired = True
-#    _shared._consecutive_quote_fail_ticks += 1
-#    etc.
-#
-#  These are bridged to _monitor_state attributes so the MonitorState class
-#  owns the data while existing code works without modification.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_MONITOR_STATE_ALIASES = {
-    "_last_vix_spike_check_time":    "last_vix_spike_check_time",
-    "_last_spot_check_time":         "last_spot_check_time",
-    "_first_tick_fired":             "first_tick_fired",
-    "_consecutive_quote_fail_ticks": "consecutive_quote_fail_ticks",
-    "_quote_fail_alerted":           "quote_fail_alerted",
-    "_consecutive_monitor_skips":    "consecutive_monitor_skips",
-}
-
-
-def __getattr__(name: str):
-    """Module-level __getattr__ for backward-compatible monitor state access."""
-    if name in _MONITOR_STATE_ALIASES:
-        return getattr(_monitor_state, _MONITOR_STATE_ALIASES[name])
-    raise AttributeError(f"module 'src._shared' has no attribute {name!r}")

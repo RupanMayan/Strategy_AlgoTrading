@@ -1,6 +1,6 @@
 # NIFTY Short Straddle — Partial Square Off Strategy
 
-**Version 7.0.0** | OpenAlgo + Dhan API | Restart-Safe | Production Grade | Backtest-Optimised
+**Version 7.1.0** | OpenAlgo + Dhan API | Restart-Safe | Production Grade | Backtest-Optimised
 
 ---
 
@@ -96,7 +96,9 @@ main.py                     ← Entry point: creates StrategyCore and calls .run
 │   ├── notifier.py          ← Telegram notifications (background daemon thread)
 │   └── state.py             ← Atomic JSON state persistence (crash-safe)
 │
-└── config.toml              ← All user-configurable parameters
+├── config.toml              ← All user-configurable parameters
+├── .env                     ← Secrets: API keys, Telegram tokens (git-ignored)
+└── .env.example             ← Template for .env (safe to commit)
 ```
 
 ### Dependency Flow
@@ -1346,7 +1348,7 @@ metadata for post-session analysis and parameter tuning.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `host` | `http://127.0.0.1:5000` | OpenAlgo server URL |
-| `api_key` | (required) | OpenAlgo API key (or env `OPENALGO_APIKEY`) |
+| `api_key` | `""` (from `.env`) | OpenAlgo API key — loaded from `OPENALGO_APIKEY` in `.env` |
 
 ### Section 2 — Instrument
 
@@ -1522,7 +1524,7 @@ The strategy sends alerts for every significant event:
 
 | Event | Emoji | Sample Message |
 |-------|-------|----------------|
-| Strategy started | 🚀 | Strategy STARTED v7.0.0 [PARTIAL] |
+| Strategy started | 🚀 | Strategy STARTED v7.1.0 [PARTIAL] |
 | Entry placed | ✅ | ENTRY PLACED [ANALYZE] CE Rs.255 PE Rs.230 |
 | Partial exit (SL hit) | ⚡ | PARTIAL EXIT — PE LEG CLOSED, CE still active |
 | Full close (profit) | 🟢 | POSITION FULLY CLOSED, P&L Rs.+5200 |
@@ -1538,6 +1540,20 @@ The strategy sends alerts for every significant event:
 | Emergency close fail | 🚨 | EMERGENCY CLOSE FAILED — MANUAL ACTION REQUIRED |
 | Strategy stopped | - | Strategy STOPPED by operator |
 | Strategy crashed | 🚨 | Strategy CRASHED — check logs |
+
+---
+
+## Changelog: v7.0.0 → v7.1.0 (Code Quality + Security Hardening)
+
+| Change | Description |
+|--------|-------------|
+| Secrets to `.env` | Moved OpenAlgo API key and Telegram credentials from `config.toml` to `.env` (git-ignored). Added `.env.example` template and `python-dotenv` loader. |
+| Validation hardening | Replaced all `assert` statements with proper `if not: raise ValueError` + specific `except` clauses across `strategy_core.py` and `config_util.py`. |
+| Mutable default fix | `state.py` `reset()` now uses `copy.deepcopy(INITIAL_STATE)` — prevents `sl_events: []` and `filters_passed: []` from leaking across resets. |
+| Notifier flush fix | Fixed `flush(timeout)` — replaced blocking `queue.join()` with deadline-based polling loop that respects the timeout parameter. |
+| Shared LTP helper | Extracted `fetch_ltp(symbol, exchange)` to `_shared.py` — eliminates 6-line quote+check pattern duplicated in `filters.py`, available for all modules. |
+| Modern typing | Replaced `Optional[X]` → `X \| None` and `List`/`Tuple` → `list`/`tuple` across all modules. Removed `typing` imports where no longer needed. |
+| Dead code removal | Removed unused `__getattr__` backward-compatibility alias in `_shared.py` and stale `import tempfile` in `strategy_core.py`. |
 
 ---
 

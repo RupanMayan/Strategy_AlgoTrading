@@ -1,7 +1,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 #  NIFTY SHORT STRADDLE — PARTIAL SQUARE OFF  |  Configuration File
 #  Strategy : Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS
-#  Version  : 7.0.0  (backtest-optimised — see docs/2026-03-21-optimization-results.md)
+#  Version  : 7.1.0  (code quality + security hardening — secrets to .env, validation fixes)
 #
 #  Sections:
 #    1.  OpenAlgo Connection
@@ -57,7 +57,7 @@ data_dir = "data"    # Data files — state, trade log, VIX history
 
 [connection]
 host    = "http://127.0.0.1:5000"   # OpenAlgo server URL
-api_key = "4b0043f2ff0eb98694d1b9925b43bcc4254d1655f038a4f2b3d735c062d17fc5"    # Leave blank → loaded from env OPENALGO_APIKEY
+api_key = ""    # Leave blank → loaded from env OPENALGO_APIKEY (see .env)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -879,8 +879,8 @@ name = "Short Straddle"
 
 [telegram]
 enabled   = true
-bot_token = "8744018927:AAF3-Mx6DRvINDYRlLawQ94H8vhhC9MqxJc"   # Leave blank → loaded from env TELEGRAM_BOT_TOKEN
-chat_id   = "724474340"   # Leave blank → loaded from env TELEGRAM_CHAT_ID
+bot_token = ""   # Leave blank → loaded from env TELEGRAM_BOT_TOKEN (see .env)
+chat_id   = ""   # Leave blank → loaded from env TELEGRAM_CHAT_ID (see .env)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -67,12 +67,13 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import pytz
 
@@ -191,7 +192,7 @@ class StateManager:
     """
 
     def __init__(self, initial: dict[str, Any] | None = None) -> None:
-        self._state: dict[str, Any] = dict(initial or INITIAL_STATE)
+        self._state: dict[str, Any] = copy.deepcopy(initial or INITIAL_STATE)
 
     @property
     def data(self) -> dict[str, Any]:
@@ -207,14 +208,14 @@ class StateManager:
         reset values.
         """
         self._state.clear()
-        self._state.update(INITIAL_STATE)
+        self._state.update(copy.deepcopy(INITIAL_STATE))
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  Path resolution
     # ═══════════════════════════════════════════════════════════════════════════
 
     @staticmethod
-    def _resolve_path(state_path: Optional[str | Path]) -> Path:
+    def _resolve_path(state_path: str | Path | None) -> Path:
         """
         Resolve the state file path.
         - If state_path is given, use it (useful for tests with a custom tmp path).
@@ -238,7 +239,7 @@ class StateManager:
     #  save() — atomic crash-safe write
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def save(self, state_path: Optional[str | Path] = None) -> None:
+    def save(self, state_path: str | Path | None = None) -> None:
         """
         Atomically write the current in-memory state dict to a JSON file.
 
@@ -292,7 +293,7 @@ class StateManager:
     #  load() — read + type restoration
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def load(self, state_path: Optional[str | Path] = None) -> dict[str, Any]:
+    def load(self, state_path: str | Path | None = None) -> dict[str, Any]:
         """
         Load the persisted state dict from a JSON file.
 
@@ -347,7 +348,7 @@ class StateManager:
     #  clear_file() — remove the persisted state file
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def clear_file(self, state_path: Optional[str | Path] = None) -> None:
+    def clear_file(self, state_path: str | Path | None = None) -> None:
         """
         Delete the state file from disk.
 
@@ -388,17 +389,17 @@ def reset_state() -> None:
     _state_manager.reset()
 
 
-def save_state(state_path: Optional[str | Path] = None) -> None:
+def save_state(state_path: str | Path | None = None) -> None:
     """Backward-compatible wrapper — delegates to the singleton."""
     _state_manager.save(state_path)
 
 
-def load_state(state_path: Optional[str | Path] = None) -> dict[str, Any]:
+def load_state(state_path: str | Path | None = None) -> dict[str, Any]:
     """Backward-compatible wrapper — delegates to the singleton."""
     return _state_manager.load(state_path)
 
 
-def clear_state_file(state_path: Optional[str | Path] = None) -> None:
+def clear_state_file(state_path: str | Path | None = None) -> None:
     """Backward-compatible wrapper — delegates to the singleton."""
     _state_manager.clear_file(state_path)
 

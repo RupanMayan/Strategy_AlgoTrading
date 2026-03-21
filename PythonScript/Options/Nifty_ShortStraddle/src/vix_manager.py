@@ -17,7 +17,6 @@ import os
 import tempfile
 import time
 from datetime import datetime, date, timedelta
-from typing import Optional
 
 import requests
 
@@ -56,7 +55,7 @@ class VIXManager:
 
     def __init__(self) -> None:
         # Persistent session for NSE fallback — avoids creating a new session per call
-        self._nse_session: Optional[requests.Session] = None
+        self._nse_session: requests.Session | None = None
 
     def _get_nse_session(self) -> requests.Session:
         """Return a reusable NSE session with cookies pre-initialized."""
@@ -152,7 +151,7 @@ class VIXManager:
             warn(f"VIX history raw load failed: {exc}")
             return []
 
-    def load_history(self) -> Optional[list[float]]:
+    def load_history(self) -> list[float] | None:
         """
         Load the last 252 VIX closing values for IVR/IVP calculation.
 

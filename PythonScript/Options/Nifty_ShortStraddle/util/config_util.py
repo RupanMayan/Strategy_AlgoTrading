@@ -44,7 +44,18 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+
+# ── .env loader ──────────────────────────────────────────────────────────────
+# Load .env file BEFORE any os.getenv() calls so environment variable
+# overrides for secrets (OPENALGO_APIKEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+# are available without requiring the user to export them in the shell.
+try:
+    from dotenv import load_dotenv
+    # Look for .env in the strategy directory (parent of util/)
+    _ENV_FILE = Path(__file__).parent.parent / ".env"
+    load_dotenv(_ENV_FILE, override=False)  # override=False: shell env takes precedence
+except ImportError:
+    pass  # python-dotenv is optional — env vars can be set in shell or systemd
 
 # ── TOML parser ───────────────────────────────────────────────────────────────
 # tomllib is built-in from Python 3.11+.
@@ -111,10 +122,10 @@ class Config:
     DTE_ENTRY_TIME_MAP: dict             # {int → "HH:MM"} keys converted str → int
 
     # ── Section 4 — DTE Filter ────────────────────────────────────────────────
-    TRADE_DTE: List[int]
+    TRADE_DTE: list[int]
 
     # ── Section 5 — Month Filter ──────────────────────────────────────────────
-    SKIP_MONTHS: List[int]
+    SKIP_MONTHS: list[int]
 
     # ── Section 6 — VIX Filter ───────────────────────────────────────────────
     VIX_FILTER_ENABLED: bool
@@ -163,7 +174,7 @@ class Config:
 
     # ── Section 7D — Dynamic SL Tightening ───────────────────────────────────
     DYNAMIC_SL_ENABLED:  bool
-    DYNAMIC_SL_SCHEDULE: List[Tuple[str, float]]  # [("HH:MM", sl_pct), ...]
+    DYNAMIC_SL_SCHEDULE: list[tuple[str, float]]  # [("HH:MM", sl_pct), ...]
 
     # ── Section 7E — Combined Premium Decay Exit ─────────────────────────────
     COMBINED_DECAY_EXIT_ENABLED: bool
@@ -258,9 +269,10 @@ class Config:
         """
         try:
             h, m = value.split(":")
-            assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+            if not (0 <= int(h) <= 23 and 0 <= int(m) <= 59):
+                raise ValueError(f"hour/minute out of range: {h}:{m}")
             return True
-        except Exception:
+        except (ValueError, TypeError):
             errors.append(f"{field_name} must be HH:MM (24-hour), got '{value}'")
             return False
 
