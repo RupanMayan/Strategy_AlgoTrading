@@ -26,9 +26,7 @@ daily_profit_target_per_lot = 10000    # Higher target — capture full theta
 daily_loss_limit_per_lot    = -6000    # Wider limit — fewer premature stops
 
 [risk.dte_sl_override]
-"2" = 25.0
-"3" = 28.0
-"4" = 30.0
+# No overrides — base 30% handles all DTEs
 
 [risk.dynamic_sl]
 enabled = false    # DISABLED — time-of-day tightening hurts more than helps
@@ -46,7 +44,7 @@ enabled          = true
 decay_target_pct = 60.0
 
 [risk.combined_decay_exit.dte_override]
-"0" = 60.0
+"0" = 60.0    # Optimised: 60% (was 70%)
 "1" = 65.0
 "2" = 60.0
 "3" = 50.0

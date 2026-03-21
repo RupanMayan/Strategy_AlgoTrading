@@ -515,7 +515,9 @@ decay_target_pct = 60.0   # Default target — used when DTE has no override
 # decays faster — a lower target exits too early, leaving theta on the table.
 # On DTE3/DTE4 premium is thinner — exiting at 50% is safer.
 [risk.combined_decay_exit.dte_override]
-"0" = 70.0   # DTE0 = Tuesday   (expiry day) — peak theta, hold longer
+"0" = 60.0   # DTE0 = Tuesday   (expiry day) — backtest-optimised: 60% (was 70%)
+             # Phase 3 grid search found 60% exits slightly earlier on expiry day,
+             # avoiding late gamma risk while still capturing most theta.
 "1" = 65.0   # DTE1 = Monday    — strong theta, slightly lower target
 "2" = 60.0   # DTE2 = Friday    — moderate theta, standard target
 "3" = 50.0   # DTE3 = Thursday  — lower premium, exit earlier
