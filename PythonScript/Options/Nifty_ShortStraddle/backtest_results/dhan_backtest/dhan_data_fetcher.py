@@ -12,9 +12,8 @@ Usage:
 import os
 import sys
 import time
-import json
 import logging
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd

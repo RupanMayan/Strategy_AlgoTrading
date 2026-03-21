@@ -308,8 +308,7 @@ def run_backtest(config: dict) -> pd.DataFrame:
 
 # ── VectorBT Analytics ─────────────────────────────────────────────────
 def generate_analytics(trades_df: pd.DataFrame, config: dict):
-    """Generate VectorBT analytics and save results."""
-    import vectorbt as vbt
+    """Generate analytics and save results."""
     import matplotlib
     matplotlib.use("Agg")  # Non-interactive backend
     import matplotlib.pyplot as plt
@@ -370,6 +369,10 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
         else 0
     )
 
+    # Calmar ratio (annualized return / max drawdown)
+    total_pnl = trades_df["total_pnl"].sum()
+    calmar = abs(total_pnl / max_drawdown) if max_drawdown != 0 else 0
+
     # SL hit analysis
     ce_sl_hits = trades_df["ce_sl_hit"].sum()
     pe_sl_hits = trades_df["pe_sl_hit"].sum()
@@ -395,6 +398,7 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
         "max_drawdown_pct": round(max_drawdown_pct, 2),
         "sharpe_ratio": round(sharpe, 4),
         "sortino_ratio": round(sortino, 4),
+        "calmar_ratio": round(calmar, 4),
         "ce_sl_hits": int(ce_sl_hits),
         "pe_sl_hits": int(pe_sl_hits),
         "both_sl_hits": int(both_sl_hits),
@@ -498,6 +502,7 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
     print(f"  Max Drawdown:   ₹{max_drawdown:,.2f}")
     print(f"  Sharpe Ratio:   {sharpe:.2f}")
     print(f"  Sortino Ratio:  {sortino:.2f}")
+    print(f"  Calmar Ratio:   {calmar:.2f}")
     print(f"{'─'*60}")
     print(f"  CE SL Hits:     {ce_sl_hits} ({ce_sl_hits/num_trades*100:.1f}%)")
     print(f"  PE SL Hits:     {pe_sl_hits} ({pe_sl_hits/num_trades*100:.1f}%)")
