@@ -50,16 +50,14 @@ class FilterEngine:
       nearest_expiry(), get_expiry(), _get_expiry_date_silent(), get_dte()
     """
 
-    def __init__(self, vix_manager: "VIXManager") -> None:
-        self._vix = vix_manager
-
-    # ── Expiry helpers ────────────────────────────────────────────────────────
-
-    # Cache: stores (resolved_date, timestamp) to avoid repeated API calls
+    # Cache TTL for expiry API lookups
     _CACHE_TTL_SECONDS: int = 300  # 5-minute cache
 
-    def __init__(self) -> None:
+    def __init__(self, vix_manager: "VIXManager") -> None:
+        self._vix = vix_manager
         self._expiry_cache: tuple[date, datetime] | None = None
+
+    # ── Expiry helpers ────────────────────────────────────────────────────────
 
     def _fetch_expiry_from_api(self) -> date | None:
         """
