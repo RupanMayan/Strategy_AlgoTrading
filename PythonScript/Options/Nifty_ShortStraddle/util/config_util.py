@@ -236,10 +236,11 @@ class Config:
     WEBSOCKET_STALENESS_S:       float  # cache staleness threshold (seconds)
     WEBSOCKET_RECONNECT_MAX_S:   float  # max backoff between reconnects
 
-    # ── Section 10 — Telegram ────────────────────────────────────────────────
+    # ── Section 10 — Telegram (via OpenAlgo + direct Bot API fallback) ────
     TELEGRAM_ENABLED:   bool
-    TELEGRAM_BOT_TOKEN: str
-    TELEGRAM_CHAT_ID:   str
+    TELEGRAM_USERNAME:  str   # OpenAlgo login username — primary channel
+    TELEGRAM_BOT_TOKEN: str   # Direct Bot API fallback (when OpenAlgo is down)
+    TELEGRAM_CHAT_ID:   str   # Direct Bot API fallback (when OpenAlgo is down)
 
     # ── Section 11 — State & Log Files ───────────────────────────────────────
     STATE_FILE:                 str
@@ -485,15 +486,20 @@ class Config:
 
         # ── Section 10 — Telegram ────────────────────────────────────────────
         if self.TELEGRAM_ENABLED:
-            if not self.TELEGRAM_BOT_TOKEN:
+            if not self.TELEGRAM_USERNAME:
                 errors.append(
-                    "[telegram] bot_token is required when enabled = true — "
-                    "set in config.toml or export TELEGRAM_BOT_TOKEN"
+                    "[telegram] username is required when enabled = true — "
+                    "set in config.toml or export OPENALGO_USERNAME "
+                    "(this is your OpenAlgo login username)"
                 )
-            if not self.TELEGRAM_CHAT_ID:
+            # bot_token + chat_id are optional (fallback only when OpenAlgo is down)
+            # but warn if only one is set
+            has_token = bool(self.TELEGRAM_BOT_TOKEN)
+            has_chat  = bool(self.TELEGRAM_CHAT_ID)
+            if has_token != has_chat:
                 errors.append(
-                    "[telegram] chat_id is required when enabled = true — "
-                    "set in config.toml or export TELEGRAM_CHAT_ID"
+                    "[telegram] bot_token and chat_id must both be set for the "
+                    "direct Bot API fallback — currently only one is configured"
                 )
 
         # ── Section 11 — Files ───────────────────────────────────────────────
@@ -643,9 +649,10 @@ class Config:
         os.makedirs(data_dir, exist_ok=True)
 
         # ── Environment variable overrides ────────────────────────────────────
-        api_key   = os.getenv("OPENALGO_APIKEY")    or conn.get("api_key",   "")
-        tg_token  = os.getenv("TELEGRAM_BOT_TOKEN") or tg.get("bot_token",   "")
-        tg_chatid = os.getenv("TELEGRAM_CHAT_ID")   or tg.get("chat_id",     "")
+        api_key     = os.getenv("OPENALGO_APIKEY")    or conn.get("api_key",    "")
+        tg_username = os.getenv("OPENALGO_USERNAME")  or tg.get("username",     "")
+        tg_token    = os.getenv("TELEGRAM_BOT_TOKEN") or tg.get("bot_token",    "")
+        tg_chatid   = os.getenv("TELEGRAM_CHAT_ID")   or tg.get("chat_id",      "")
 
         # ── Derived values ────────────────────────────────────────────────────
         number_of_lots = int(inst.get("number_of_lots", 1))
@@ -838,10 +845,11 @@ class Config:
             WEBSOCKET_STALENESS_S     = float(wscfg.get("staleness_timeout_s",  60)),
             WEBSOCKET_RECONNECT_MAX_S = float(wscfg.get("reconnect_max_delay_s", 30)),
 
-            # Section 10 — Telegram
+            # Section 10 — Telegram (via OpenAlgo + direct Bot API fallback)
             TELEGRAM_ENABLED   = bool(tg.get("enabled", True)),
+            TELEGRAM_USERNAME  = tg_username,
             TELEGRAM_BOT_TOKEN = tg_token,
-            TELEGRAM_CHAT_ID   = tg_chatid,
+            TELEGRAM_CHAT_ID   = str(tg_chatid),
 
             # Section 11 — State & Log Files
             STATE_FILE                 = resolved_state_file,

@@ -95,11 +95,11 @@ main.py                     ← Entry point: creates StrategyCore and calls .run
 │   ├── __init__.py          ← Package init
 │   ├── config_util.py       ← TOML config loader + validation + Config dataclass
 │   ├── logger.py            ← IST-aware structured logging with rotation
-│   ├── notifier.py          ← Telegram notifications (background daemon thread)
+│   ├── notifier.py          ← Telegram via OpenAlgo API (fallback: direct Bot API)
 │   └── state.py             ← Atomic JSON state persistence (crash-safe)
 │
 ├── config.toml              ← All user-configurable parameters
-├── .env                     ← Secrets: API keys, Telegram tokens (git-ignored)
+├── .env                     ← Secrets: API keys, OpenAlgo username, Telegram fallback tokens (git-ignored)
 └── .env.example             ← Template for .env (safe to commit)
 ```
 
@@ -1560,11 +1560,27 @@ API polling (existing behaviour preserved).
 
 ## 18. Telegram Notifications
 
-The strategy sends alerts for every significant event:
+### Dual-Path Delivery
+
+Notifications use a two-tier delivery system:
+
+| Priority | Channel | When Used |
+|----------|---------|-----------|
+| **Primary** | OpenAlgo Telegram API (`client.telegram()`) | All notifications — uses your OpenAlgo login username |
+| **Fallback** | Direct Telegram Bot API (`/bot{token}/sendMessage`) | Only when OpenAlgo is unreachable — to notify operator that OpenAlgo is down |
+
+**Configuration** (`.env`):
+- `OPENALGO_USERNAME` — your OpenAlgo login username (required, primary channel)
+- `TELEGRAM_BOT_TOKEN` — direct Bot API token (optional, fallback only)
+- `TELEGRAM_CHAT_ID` — direct Bot API chat ID (optional, fallback only)
+
+**Delivery flow**: `notify("msg")` → background daemon thread → try OpenAlgo API → if fails → try direct Bot API with retry + exponential backoff → if both fail → log warning + drop message.
+
+### Alert Events
 
 | Event | Emoji | Sample Message |
 |-------|-------|----------------|
-| Strategy started | 🚀 | Strategy STARTED v7.1.0 [PARTIAL] |
+| Strategy started | 🚀 | Strategy STARTED v7.2.0 [PARTIAL] |
 | Entry placed | ✅ | ENTRY PLACED [ANALYZE] CE Rs.255 PE Rs.230 |
 | Partial exit (SL hit) | ⚡ | PARTIAL EXIT — PE LEG CLOSED, CE still active |
 | Full close (profit) | 🟢 | POSITION FULLY CLOSED, P&L Rs.+5200 |
@@ -1584,7 +1600,7 @@ The strategy sends alerts for every significant event:
 
 ---
 
-## Changelog: v7.1.0 → v7.2.0 (WebSocket Live Feed + Expiry API)
+## Changelog: v7.1.0 → v7.2.0 (WebSocket + Expiry API + Holidays + Telegram via OpenAlgo)
 
 | Change | Description |
 |--------|-------------|
@@ -1593,6 +1609,8 @@ The strategy sends alerts for every significant event:
 | Auto-reconnect | Exponential backoff (1s → 30s cap) on disconnect. Telegram alert after 3 consecutive failures. All subscriptions automatically restored on reconnect. |
 | Graceful shutdown | `ws_feed.stop()` unsubscribes all symbols and closes the WebSocket connection cleanly on Ctrl+C, SIGTERM, or crash. |
 | Expiry API | `auto_expiry` now fetches actual expiry dates from OpenAlgo `/api/v1/expiry` endpoint instead of hardcoding next Tuesday. Handles holidays correctly. Falls back to Tuesday calculation if API is unavailable. 5-minute cache. |
+| Market holiday guard | New `util/market_calendar.py` — fetches NFO holidays from OpenAlgo `/api/v1/market/holidays` API at startup. If market is closed (weekend or holiday), sends Telegram alert and exits. Static 2025-2026 holiday list as fallback when API is unavailable. |
+| Telegram via OpenAlgo | Rewrote `util/notifier.py` — primary delivery via `OpenAlgoClient.telegram(username, message)`. Direct Telegram Bot API retained as fallback ONLY when OpenAlgo is unreachable (to alert operator). New env var: `OPENALGO_USERNAME`. |
 | `[websocket]` config | New config section: `enabled`, `staleness_timeout_s`, `reconnect_max_delay_s`. |
 | Monitor interval | With WebSocket feeding cached LTP, `monitor_interval_s` can be reduced to 2-5s for faster SL execution without API rate limit concerns. |
 

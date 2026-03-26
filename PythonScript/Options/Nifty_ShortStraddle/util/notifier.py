@@ -1,72 +1,32 @@
 """
-util/notifier.py  —  Telegram alert delivery for Nifty Short Straddle (Partial)
+util/notifier.py  —  Telegram alert delivery for Nifty Short Straddle
 ═══════════════════════════════════════════════════════════════════════════════════
-Responsibilities:
-  1. Send strategy alerts to a Telegram chat via the Bot API
-  2. Prefix every message with "[{STRATEGY_NAME} v{VERSION}]" (matches original)
-  3. Never block the calling thread — delivery runs in a background daemon thread
-     so monitor ticks, SL checks, and order placement are never delayed by a
-     slow or unreachable Telegram API
-  4. Retry transiently-failed sends (network error, 429, 5xx) up to MAX_RETRIES
-     times with exponential back-off; permanent failures (400 bad request) are
-     logged once and discarded
-  5. Silently skip when Telegram is disabled or credentials are missing
-  6. Never raise — failures are logged as warnings, never propagate to callers
+Dual-path notification system:
 
-Production design:
+  PRIMARY  : OpenAlgo Telegram API  — client.telegram(username, message)
+  FALLBACK : Direct Telegram Bot API — POST /bot{token}/sendMessage
+             Used ONLY when OpenAlgo itself is unreachable, to notify
+             the operator that OpenAlgo is down.
+
+Design:
   ┌─────────────────────┐     queue      ┌──────────────────────────────────┐
   │  notify("msg")      │ ─────────────► │  background daemon thread        │
-  │  (returns instantly)│                │  _worker_loop()                  │
-  └─────────────────────┘                │    → _send_once() with retry     │
-                                         │    → exponential back-off        │
-                                         │    → Retry-After for 429         │
+  │  (returns instantly) │               │  _worker_loop()                  │
+  └─────────────────────┘                │    → _send_via_openalgo()        │
+                                         │    → if OpenAlgo fails:          │
+                                         │        _send_via_bot_api()       │
                                          └──────────────────────────────────┘
-
-WHY background thread instead of synchronous:
-  The original telegram() uses timeout=6s. With retries that could block the
-  calling thread for 6+1+6+2+6 = 21s. At monitor_interval_s=15s this would
-  cause consecutive tick skips and SL misses during a network hiccup.
-  A queue + daemon thread decouples delivery latency from strategy execution.
-  The trade-off (messages may be lost on hard crash) is acceptable — a crash
-  triggers an emergency close first, then the crash alert is best-effort.
-
-Session reuse:
-  A single persistent requests.Session is created lazily on the first send.
-  Session reuse enables TCP connection pooling, reducing per-message latency
-  from ~300ms (new TLS handshake) to ~30ms (reused connection).
 
 Message limits:
   Telegram hard limit: 4096 characters per message.
-  Messages exceeding this are truncated with a "…[truncated]" suffix so the
-  critical first ~4000 characters are always delivered.
-
-HTML parse mode:
-  parse_mode="HTML" is preserved from the original to support existing message
-  formatting (bold <b>text</b>, monospace <code>x</code>). Callers that embed
-  raw `<` / `>` / `&` in plain-text messages must escape them manually:
-    &lt;  →  <      &gt;  →  >      &amp;  →  &
-  Helper: html_escape(text) auto-escapes those three characters.
+  Messages exceeding this are truncated with a "[…truncated]" suffix.
 
 Usage:
-    # Drop-in replacement for the original telegram() call:
-    from util.notifier import telegram
-    telegram("Entry placed: CE NIFTY25MAR2623000CE @ Rs.123.50")
-
-    # Same function, alternative import name:
     from util.notifier import notify
-    notify("Daily target hit — closing all legs")
+    notify("Entry placed: CE NIFTY25MAR2623000CE @ Rs.123.50")
 
-    # For plain-text content that may contain < > & characters:
-    from util.notifier import notify, html_escape
-    notify(f"Exception: {html_escape(str(exc))}")
-
-    # Wait for all queued messages to be delivered (e.g. before graceful exit):
     from util.notifier import flush
     flush(timeout=10)
-
-VERSION:
-    Matches the strategy version constant from the reference script (5.9.0).
-    Update this when the strategy version changes.
 ═══════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -89,38 +49,37 @@ def _get_version() -> str:
         from src._shared import VERSION
         return VERSION
     except ImportError:
-        return "7.1.0"
+        return "7.2.0"
 
-# ── Telegram API base URL ─────────────────────────────────────────────────────
+# ── Telegram API base URL (direct Bot API fallback) ─────────────────────────
 _TELEGRAM_API_BASE = "https://api.telegram.org"
 
-# ── Message constraints ───────────────────────────────────────────────────────
+# ── Message constraints ─────────────────────────────────────────────────────
 _MAX_MSG_LEN   = 4096        # Telegram hard limit (characters per sendMessage)
 _TRUNCATE_TAIL = "[…truncated]"
 
-# ── Retry policy ──────────────────────────────────────────────────────────────
+# ── Retry policy ────────────────────────────────────────────────────────────
 _MAX_ATTEMPTS    = 3
 _BACKOFF_DELAYS  = (1, 3)    # seconds before attempt 2, attempt 3
 
-# ── HTTP timeouts (seconds) ───────────────────────────────────────────────────
+# ── HTTP timeouts (seconds) — for direct Bot API fallback ───────────────────
 _CONNECT_TIMEOUT = 5
 _READ_TIMEOUT    = 8
 
-# ── Queue sentinel value ──────────────────────────────────────────────────────
+# ── Queue sentinel value ────────────────────────────────────────────────────
 _SENTINEL = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TelegramNotifier — encapsulates queue, worker thread, and HTTP session
+#  TelegramNotifier — encapsulates queue, worker thread, and delivery logic
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TelegramNotifier:
     """
     Asynchronous Telegram message delivery via a background daemon thread.
 
-    All state (queue, HTTP session, worker thread) is encapsulated in this class.
-    The module-level singleton (_notifier_instance) provides the default instance
-    used by the backward-compatible function API.
+    Primary path  : OpenAlgo SDK client.telegram()
+    Fallback path : Direct Telegram Bot API (only when OpenAlgo is unreachable)
     """
 
     def __init__(self) -> None:
@@ -129,57 +88,74 @@ class TelegramNotifier:
         self._session_lock = threading.Lock()
         self._worker_thread: threading.Thread | None = None
         self._worker_lock = threading.Lock()
+        self._openalgo_client = None
+        self._openalgo_client_lock = threading.Lock()
 
-    # ── Config access ─────────────────────────────────────────────────────────
+    # ── Config access ───────────────────────────────────────────────────────
 
     @staticmethod
     def _get_config():
-        """
-        Lazily fetch the Config singleton. Returns None if not yet loaded.
-        Import is deferred to avoid circular imports at module load time.
-        """
+        """Lazily fetch the Config singleton. Returns None if not yet loaded."""
         try:
-            from util.config_util import cfg  # noqa: PLC0415
+            from util.config_util import cfg
             return cfg
         except Exception:
             return None
 
-    # ── HTTP session management ───────────────────────────────────────────────
+    # ── OpenAlgo client (lazy singleton) ────────────────────────────────────
+
+    def _get_openalgo_client(self):
+        """Return a cached OpenAlgo client for Telegram API calls."""
+        if self._openalgo_client is None:
+            with self._openalgo_client_lock:
+                if self._openalgo_client is None:
+                    cfg = self._get_config()
+                    if cfg is None:
+                        return None
+                    try:
+                        from openalgo import api as OpenAlgoClient
+                        self._openalgo_client = OpenAlgoClient(
+                            api_key=cfg.OPENALGO_API_KEY,
+                            host=cfg.OPENALGO_HOST,
+                        )
+                    except Exception as exc:
+                        warn(f"Failed to create OpenAlgo client for Telegram: {exc}")
+                        return None
+        return self._openalgo_client
+
+    # ── HTTP session (for direct Bot API fallback) ──────────────────────────
 
     def _get_session(self) -> requests.Session:
-        """Return the shared HTTP session, creating it if necessary."""
+        """Return the shared HTTP session for direct Bot API calls."""
         with self._session_lock:
             if self._http_session is None:
                 self._http_session = requests.Session()
                 self._http_session.headers.update({
-                    "Content-Type" : "application/json",
-                    "User-Agent"   : f"NiftyShortStraddle/{_get_version()}",
+                    "Content-Type": "application/json",
+                    "User-Agent": f"NiftyShortStraddle/{_get_version()}",
                 })
             return self._http_session
 
-    # ── Enabled check ─────────────────────────────────────────────────────────
+    # ── Enabled check ───────────────────────────────────────────────────────
 
     def _is_enabled(self) -> bool:
-        """Return True if Telegram notifications are enabled and credentials present."""
+        """Return True if Telegram notifications are enabled."""
         cfg = self._get_config()
         if cfg is None:
             return False
-        return bool(
-            cfg.TELEGRAM_ENABLED
-            and cfg.TELEGRAM_BOT_TOKEN
-            and cfg.TELEGRAM_CHAT_ID
-        )
+        return bool(cfg.TELEGRAM_ENABLED and cfg.TELEGRAM_USERNAME)
 
-    # ── Message formatting ────────────────────────────────────────────────────
+    def _has_bot_api_fallback(self) -> bool:
+        """Return True if direct Bot API credentials are configured."""
+        cfg = self._get_config()
+        if cfg is None:
+            return False
+        return bool(cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID)
+
+    # ── Message formatting ──────────────────────────────────────────────────
 
     def _build_text(self, msg: str) -> str:
-        """
-        Prepend the strategy name + version header and enforce the 4096-char limit.
-
-        Format (matches original script exactly):
-            [Short Straddle v6.4.0]
-            <message body>
-        """
+        """Prepend the strategy name + version header and enforce 4096-char limit."""
         cfg = self._get_config()
         strategy_name = cfg.STRATEGY_NAME if cfg else "Short Straddle"
         header = f"[{strategy_name} v{_get_version()}]\n"
@@ -194,99 +170,131 @@ class TelegramNotifier:
 
         return header + msg
 
-    # ── Single send attempt ───────────────────────────────────────────────────
+    # ── PRIMARY: OpenAlgo Telegram API ──────────────────────────────────────
 
-    def _send_once(self, text: str) -> bool:
+    def _send_via_openalgo(self, text: str) -> bool:
         """
-        Attempt a single HTTP POST to the Telegram sendMessage endpoint.
+        Send via OpenAlgo's Telegram API.
 
-        Returns True on success (HTTP 200 + status OK from Telegram).
-        Returns False on transient error (network, 429, 5xx) — caller should retry.
-        Logs and returns True (do not retry) on permanent error (400 bad request).
+        Returns True on success, False on failure (caller should try fallback).
         """
         cfg = self._get_config()
-        if cfg is None:
-            return True   # Config gone mid-session — skip silently
+        if cfg is None or not cfg.TELEGRAM_USERNAME:
+            return False
 
-        url  = f"{_TELEGRAM_API_BASE}/bot{cfg.TELEGRAM_BOT_TOKEN}/sendMessage"
+        client = self._get_openalgo_client()
+        if client is None:
+            return False
+
+        try:
+            resp = client.telegram(
+                username=cfg.TELEGRAM_USERNAME,
+                message=text,
+            )
+            if isinstance(resp, dict) and resp.get("status") == "success":
+                debug("Telegram delivered via OpenAlgo API")
+                return True
+            warn(f"OpenAlgo Telegram API non-success response: {resp}")
+            return False
+        except Exception as exc:
+            warn(f"OpenAlgo Telegram API failed: {exc}")
+            return False
+
+    # ── FALLBACK: Direct Telegram Bot API ───────────────────────────────────
+
+    def _send_via_bot_api(self, text: str) -> bool:
+        """
+        Send via direct Telegram Bot API (fallback).
+
+        Used ONLY when OpenAlgo is unreachable, to notify the operator.
+        Returns True on success or permanent failure (stop retrying).
+        Returns False on transient failure (caller should retry).
+        """
+        cfg = self._get_config()
+        if cfg is None or not cfg.TELEGRAM_BOT_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+            return True  # No fallback credentials — skip silently
+
+        url = f"{_TELEGRAM_API_BASE}/bot{cfg.TELEGRAM_BOT_TOKEN}/sendMessage"
         data = {
-            "chat_id"    : cfg.TELEGRAM_CHAT_ID,
-            "text"       : text,
-            "parse_mode" : "HTML",
+            "chat_id": cfg.TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
         }
 
         try:
             resp = self._get_session().post(
                 url,
-                json    = data,
-                timeout = (_CONNECT_TIMEOUT, _READ_TIMEOUT),
+                json=data,
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
             )
 
             if resp.status_code == 200:
-                debug("Telegram delivered OK")
+                debug("Telegram delivered via direct Bot API (fallback)")
                 return True
 
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", _BACKOFF_DELAYS[0]))
-                warn(
-                    f"Telegram 429 rate-limited — waiting {retry_after}s "
-                    f"(Retry-After header: {resp.headers.get('Retry-After', 'absent')})"
-                )
+                warn(f"Telegram Bot API 429 rate-limited — waiting {retry_after}s")
                 time.sleep(retry_after)
-                return False   # Signal: retry
+                return False
 
             if 500 <= resp.status_code < 600:
-                warn(f"Telegram server error {resp.status_code} — will retry")
-                return False   # Signal: retry (transient server issue)
+                warn(f"Telegram Bot API server error {resp.status_code} — will retry")
+                return False
 
-            # 400 or other 4xx — permanent client-side error, do not retry
-            error(
-                f"Telegram permanent error {resp.status_code}: "
-                f"{resp.text[:200]}"
-            )
-            return True   # Stop retrying (won't improve)
+            error(f"Telegram Bot API permanent error {resp.status_code}: {resp.text[:200]}")
+            return True  # Stop retrying
 
         except requests.exceptions.Timeout:
-            warn(
-                f"Telegram timed out (connect={_CONNECT_TIMEOUT}s read={_READ_TIMEOUT}s) "
-                "— will retry"
-            )
+            warn("Telegram Bot API timed out — will retry")
             return False
 
         except requests.exceptions.ConnectionError as exc:
-            warn(f"Telegram connection error: {exc} — will retry")
+            warn(f"Telegram Bot API connection error: {exc} — will retry")
             return False
 
         except Exception as exc:
-            warn(f"Telegram unexpected error: {exc}")
-            return True   # Unknown error — don't loop forever, stop retrying
+            warn(f"Telegram Bot API unexpected error: {exc}")
+            return True  # Unknown — don't loop forever
 
-    # ── Retry wrapper ─────────────────────────────────────────────────────────
+    # ── Send with retry (dual-path) ─────────────────────────────────────────
 
     def _send_with_retry(self, text: str) -> None:
-        """Attempt delivery up to _MAX_ATTEMPTS times with exponential back-off."""
+        """
+        Attempt delivery: OpenAlgo first, direct Bot API fallback on failure.
+
+        The fallback is retried up to _MAX_ATTEMPTS times with exponential backoff.
+        """
+        if not self._is_enabled():
+            debug("Telegram disabled — skipping")
+            return
+
+        # Primary: try OpenAlgo API (single attempt — it's fast or down)
+        if self._send_via_openalgo(text):
+            return
+
+        # OpenAlgo failed — try direct Bot API as fallback
+        if not self._has_bot_api_fallback():
+            warn("OpenAlgo Telegram API failed and no Bot API fallback configured — message dropped")
+            return
+
+        warn("OpenAlgo Telegram API unreachable — falling back to direct Bot API")
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            if not self._is_enabled():
-                debug("Telegram disabled mid-send — skipping")
+            success = self._send_via_bot_api(text)
+            if success:
                 return
 
-            success = self._send_once(text)
-
-            if success:
-                return   # Delivered (or permanently failed — stop either way)
-
-            # Transient failure — sleep before next attempt
             if attempt < _MAX_ATTEMPTS:
                 delay = _BACKOFF_DELAYS[min(attempt - 1, len(_BACKOFF_DELAYS) - 1)]
-                debug(f"Telegram attempt {attempt} failed — retrying in {delay}s")
+                debug(f"Bot API fallback attempt {attempt} failed — retrying in {delay}s")
                 time.sleep(delay)
 
         warn(
-            f"Telegram delivery failed after {_MAX_ATTEMPTS} attempts — "
-            "message dropped. Check network and Telegram credentials."
+            f"Telegram delivery failed after OpenAlgo + {_MAX_ATTEMPTS} Bot API attempts — "
+            "message dropped"
         )
 
-    # ── Worker thread ─────────────────────────────────────────────────────────
+    # ── Worker thread ───────────────────────────────────────────────────────
 
     def _worker_loop(self) -> None:
         """Background daemon thread: drain the send queue and deliver each message."""
@@ -296,13 +304,12 @@ class TelegramNotifier:
 
                 if text is _SENTINEL:
                     self._send_queue.task_done()
-                    return   # Graceful shutdown
+                    return
 
                 self._send_with_retry(text)
                 self._send_queue.task_done()
 
             except Exception as exc:
-                # Safety net — should never reach here.
                 warn(f"Telegram worker unexpected error: {exc}")
                 try:
                     self._send_queue.task_done()
@@ -314,9 +321,9 @@ class TelegramNotifier:
         with self._worker_lock:
             if self._worker_thread is None or not self._worker_thread.is_alive():
                 self._worker_thread = threading.Thread(
-                    target = self._worker_loop,
-                    name   = "telegram-sender",
-                    daemon = True,
+                    target=self._worker_loop,
+                    name="telegram-sender",
+                    daemon=True,
                 )
                 self._worker_thread.start()
                 debug("Telegram worker thread started")
@@ -327,14 +334,7 @@ class TelegramNotifier:
 
     @staticmethod
     def html_escape(text: str) -> str:
-        """
-        Escape the three characters that have special meaning in Telegram HTML mode.
-
-        Escaping table:
-            &  →  &amp;   (must be escaped first — otherwise &lt; → &amp;lt;)
-            <  →  &lt;
-            >  →  &gt;
-        """
+        """Escape characters that have special meaning in Telegram HTML mode."""
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def notify(self, msg: str) -> None:
@@ -342,16 +342,7 @@ class TelegramNotifier:
         Enqueue a Telegram message for background delivery.
 
         Returns immediately — delivery is handled by a background daemon thread.
-        Never raises. Silently skips if Telegram is disabled or credentials are
-        missing (controlled by [telegram] enabled = false in config.toml).
-
-        Parameters
-        ----------
-        msg : str
-            The message body. Supports Telegram HTML markup:
-              <b>bold</b>  <i>italic</i>  <code>monospace</code>
-            Characters &, <, > in plain text must be escaped — see html_escape().
-            Messages longer than 4096 characters are automatically truncated.
+        Never raises. Silently skips if Telegram is disabled.
         """
         if not self._is_enabled():
             return
@@ -361,23 +352,13 @@ class TelegramNotifier:
             self._ensure_worker_running()
             self._send_queue.put(text)
         except Exception as exc:
-            # Protect the caller — notify() must NEVER raise
             warn(f"Telegram enqueue failed: {exc}")
 
     def flush(self, timeout: float = 10.0) -> bool:
         """
-        Block until all queued Telegram messages have been delivered (or time out).
+        Block until all queued messages have been delivered (or time out).
 
-        Parameters
-        ----------
-        timeout : float
-            Maximum seconds to wait. Default: 10s.
-
-        Returns
-        -------
-        bool
-            True  — all queued messages were delivered within the timeout.
-            False — timeout expired; some messages may still be queued.
+        Returns True if all delivered, False if timeout expired.
         """
         if self._send_queue.empty():
             return True
@@ -417,12 +398,12 @@ def flush(timeout: float = 10.0) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CLI self-test — smoke-test the full delivery pipeline
+#  CLI self-test
 #
 #  Usage (from the strategy directory, using the algo_trading venv):
 #
-#    OPENALGO_APIKEY=x TELEGRAM_BOT_TOKEN=<real_token> TELEGRAM_CHAT_ID=<real_id> \
-#    python -m util.notifier
+#    OPENALGO_APIKEY=x OPENALGO_USERNAME=your_user TELEGRAM_BOT_TOKEN=<token> \
+#    TELEGRAM_CHAT_ID=<id> python -m util.notifier
 #
 #    # Dry-run (disabled mode — verifies skip logic):
 #    python -m util.notifier --dry-run
@@ -481,14 +462,15 @@ if __name__ == "__main__":
             sys.exit(1)
 
     else:
-        print(f"  Bot token  : ***{cfg.TELEGRAM_BOT_TOKEN[-6:]}")
-        print(f"  Chat ID    : {cfg.TELEGRAM_CHAT_ID}")
+        print(f"  Username   : {cfg.TELEGRAM_USERNAME}")
+        print(f"  Bot token  : {'***' + cfg.TELEGRAM_BOT_TOKEN[-6:] if cfg.TELEGRAM_BOT_TOKEN else '(not set — no fallback)'}")
+        print(f"  Chat ID    : {cfg.TELEGRAM_CHAT_ID or '(not set — no fallback)'}")
         print(f"  Strategy   : {cfg.STRATEGY_NAME}  v{_get_version()}")
         print()
         print("  Sending test messages — check your Telegram chat...")
         print()
 
-        notify("🧪 <b>Notifier self-test</b>\nDelivery pipeline: queue → background thread → retry.")
+        notify("🧪 <b>Notifier self-test</b>\nDelivery: OpenAlgo API (primary) → Bot API (fallback)")
         notify(f"html_escape test: VIX {html_escape('14.5 < 18.0 & > 12.0')}")
         notify("This is the final test message. If you see all 3, delivery is working ✓")
 
