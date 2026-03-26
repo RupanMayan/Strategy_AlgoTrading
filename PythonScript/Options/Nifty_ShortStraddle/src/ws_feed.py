@@ -114,8 +114,8 @@ class WebSocketFeed:
             fut = asyncio.run_coroutine_threadsafe(self._graceful_close(), self._loop)
             try:
                 fut.result(timeout=5)
-            except Exception:
-                pass  # Best-effort — thread join will follow
+            except Exception as exc:
+                warn(f"WebSocket: graceful close error (best-effort): {exc}")
 
         self._thread.join(timeout=10)
         if self._thread.is_alive():
@@ -211,7 +211,7 @@ class WebSocketFeed:
         import websockets
 
         delay = self._RECONNECT_BASE_DELAY
-        max_delay = getattr(cfg, "WEBSOCKET_RECONNECT_MAX_S", self._RECONNECT_MAX_DELAY)
+        max_delay = cfg.WEBSOCKET_RECONNECT_MAX_S
 
         while not self._stop_event.is_set():
             ws_url = self._build_ws_url()
@@ -286,8 +286,10 @@ class WebSocketFeed:
                     break
 
                 try:
+                    if isinstance(raw_msg, bytes):
+                        raw_msg = raw_msg.decode("utf-8")
                     msg = json.loads(raw_msg) if isinstance(raw_msg, str) else raw_msg
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
                     debug(f"WebSocket: non-JSON message: {raw_msg!r:.200}")
                     continue
 
@@ -489,7 +491,7 @@ class WebSocketFeed:
 
     async def _backoff_delay(self, delay: float) -> None:
         """Sleep with stop_event awareness (check every 0.5s)."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + delay
         while not self._stop_event.is_set():
             remaining = deadline - loop.time()

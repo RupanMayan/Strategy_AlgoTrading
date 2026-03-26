@@ -80,7 +80,7 @@ class TelegramNotifier:
     # ── Config access ───────────────────────────────────────────────────────
 
     @staticmethod
-    def _get_config():
+    def _get_config() -> object | None:
         """Lazily fetch the Config singleton. Returns None if not yet loaded."""
         try:
             from util.config_util import cfg
@@ -90,7 +90,7 @@ class TelegramNotifier:
 
     # ── OpenAlgo client (lazy singleton) ────────────────────────────────────
 
-    def _get_openalgo_client(self):
+    def _get_openalgo_client(self) -> object | None:
         """Return a cached OpenAlgo client for Telegram API calls.
 
         Uses a sentinel to avoid retrying construction on every message
@@ -271,9 +271,6 @@ class TelegramNotifier:
 
         Returns True if all delivered, False if timeout expired.
         """
-        if self._send_queue.empty():
-            return True
-
         joiner = threading.Thread(target=self._send_queue.join, daemon=True)
         joiner.start()
         joiner.join(timeout=timeout)

@@ -348,10 +348,11 @@ class Config:
             errors.append("[month_filter] skip_months values must be 1–12")
 
         # ── Section 6 — VIX Filter ───────────────────────────────────────────
-        if self.VIX_MIN < 0:
-            errors.append("[vix_filter] vix_min must be >= 0")
-        if self.VIX_MIN >= self.VIX_MAX:
-            errors.append("[vix_filter] vix_min must be strictly less than vix_max")
+        if self.VIX_FILTER_ENABLED:
+            if self.VIX_MIN < 0:
+                errors.append("[vix_filter] vix_min must be >= 0")
+            if self.VIX_MIN >= self.VIX_MAX:
+                errors.append("[vix_filter] vix_min must be strictly less than vix_max")
 
         # ── Section 6A — IVR / IVP ───────────────────────────────────────────
         if not (0 <= self.IVR_MIN <= 100):

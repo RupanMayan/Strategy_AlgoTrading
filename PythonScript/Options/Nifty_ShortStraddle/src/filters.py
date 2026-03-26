@@ -56,8 +56,10 @@ class FilterEngine:
     # ── Expiry helpers ────────────────────────────────────────────────────────
 
     # Cache: stores (resolved_date, timestamp) to avoid repeated API calls
-    _expiry_cache: tuple[date, datetime] | None = None
     _CACHE_TTL_SECONDS: int = 300  # 5-minute cache
+
+    def __init__(self) -> None:
+        self._expiry_cache: tuple[date, datetime] | None = None
 
     def _fetch_expiry_from_api(self) -> date | None:
         """
@@ -83,9 +85,12 @@ class FilterEngine:
             today = now.date()
             past_cutoff = (now.hour, now.minute) >= (15, 30)
 
-            # API returns dates as "DD-MMM-YY" sorted chronologically
+            # API may return "DD-MMM-YYYY" or "DD-MMM-YY" — try both formats
             for date_str in resp["data"]:
-                expiry_date = datetime.strptime(date_str, "%d-%b-%Y").date()
+                try:
+                    expiry_date = datetime.strptime(date_str, "%d-%b-%Y").date()
+                except ValueError:
+                    expiry_date = datetime.strptime(date_str, "%d-%b-%y").date()
                 if expiry_date > today:
                     return expiry_date
                 if expiry_date == today and not past_cutoff:
@@ -133,7 +138,7 @@ class FilterEngine:
         # Try API first
         api_date = self._fetch_expiry_from_api()
         if api_date is not None:
-            FilterEngine._expiry_cache = (api_date, now)
+            self._expiry_cache = (api_date, now)
             if not silent:
                 info(
                     f"Expiry from API: {api_date.strftime('%d%b%y').upper()}  "
@@ -176,7 +181,8 @@ class FilterEngine:
             return self._resolve_expiry_date(silent=True)
         try:
             return datetime.strptime(cfg.MANUAL_EXPIRY, "%d%b%y").date()
-        except Exception:
+        except (ValueError, TypeError) as exc:
+            debug(f"Manual expiry parse failed ({cfg.MANUAL_EXPIRY!r}): {exc} — using API fallback")
             return self._resolve_expiry_date(silent=True)
 
     def get_dte(self) -> int:
