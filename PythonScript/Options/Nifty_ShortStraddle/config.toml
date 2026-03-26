@@ -56,7 +56,7 @@ data_dir = "data"    # Data files — state, trade log, VIX history
 # ──────────────────────────────────────────────────────────────────────────────
 
 [connection]
-host    = "https://algotradings.in"   # OpenAlgo server URL
+host    = "https://myalgo.algotradings.in"   # OpenAlgo server URL
 api_key = ""    # Leave blank → loaded from env OPENALGO_APIKEY (see .env)
 
 
