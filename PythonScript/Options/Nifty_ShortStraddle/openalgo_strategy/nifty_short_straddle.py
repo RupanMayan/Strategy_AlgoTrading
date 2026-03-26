@@ -1349,15 +1349,23 @@ class NiftyShortStraddle:
 
     def _handle_signal(self, signum, _frame):
         plog(f"Signal {signum} received — shutting down")
-        self._stop_event.set()
+        if state["in_position"]:
+            plog("Shutdown with open position — closing all")
+            self.engine.close_all("Script Shutdown")
+        telegram.flush()
+        telegram.send_sync("Strategy Stopped — Nifty Short Straddle")
+        plog("Shutdown complete")
+        ws_feed.stop()
+        telegram.stop()
+        os._exit(0)
 
     def _shutdown(self):
         if state["in_position"]:
             plog("Shutdown with open position — closing all")
             self.engine.close_all("Script Shutdown")
-        plog("Shutdown complete")
         telegram.flush()
         telegram.send_sync("Strategy Stopped — Nifty Short Straddle")
+        plog("Shutdown complete")
         ws_feed.stop()
         telegram.stop()
 
