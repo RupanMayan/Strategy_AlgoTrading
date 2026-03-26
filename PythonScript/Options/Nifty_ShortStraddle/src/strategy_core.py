@@ -42,6 +42,7 @@ from src.risk import MarginGuard, TrailingSLEngine
 from src.order_engine import OrderEngine
 from src.monitor import Monitor
 from src.reconciler import StartupReconciler
+from src.ws_feed import WebSocketFeed
 from util.notifier import flush as _flush_telegram
 
 
@@ -65,6 +66,7 @@ class StrategyCore:
             vix_manager=self._vix_manager,
         )
         self._reconciler   = StartupReconciler(order_engine=self._order_engine)
+        self._ws_feed: WebSocketFeed | None = None
 
     # ── Config validation ─────────────────────────────────────────────────────
 
@@ -905,6 +907,12 @@ class StrategyCore:
                 # Track re-entry count
                 state["reentry_count_today"] = reentry_count + 1
                 info(f"Re-entry #{state['reentry_count_today']} placed successfully")
+            # Subscribe option leg symbols to WebSocket for real-time LTP
+            if self._ws_feed is not None:
+                self._ws_feed.subscribe_position_symbols(
+                    state.get("symbol_ce", ""),
+                    state.get("symbol_pe", ""),
+                )
         if not success:
             error("Entry FAILED — no position opened today")
             telegram("Entry FAILED — no position opened. Check logs.")
@@ -921,6 +929,12 @@ class StrategyCore:
 
         active = active_legs()
         info(f"Hard exit — active legs: {active}")
+        # Unsubscribe option symbols before closing (best-effort)
+        if self._ws_feed is not None:
+            self._ws_feed.unsubscribe_position_symbols(
+                state.get("symbol_ce", ""),
+                state.get("symbol_pe", ""),
+            )
         self._order_engine.close_all(reason=f"Scheduled Hard Exit at {cfg.EXIT_TIME}")
 
     def _job_monitor(self) -> None:
@@ -952,6 +966,26 @@ class StrategyCore:
         self.check_connection()
         self._reconciler.reconcile()
         self._check_vix_history_on_startup()
+
+        # ── WebSocket live feed ──────────────────────────────────────────────
+        if cfg.WEBSOCKET_ENABLED:
+            self._ws_feed = WebSocketFeed()
+            self._ws_feed.start()
+            self._ws_feed.subscribe_market_symbols()
+            # If resuming with an open position, subscribe leg symbols
+            if state["in_position"]:
+                sym_ce = state.get("symbol_ce", "")
+                sym_pe = state.get("symbol_pe", "")
+                if sym_ce or sym_pe:
+                    self._ws_feed.subscribe_position_symbols(sym_ce, sym_pe)
+                    info("WebSocket: re-subscribed position symbols after restart")
+            info(
+                f"WebSocket live feed: ENABLED "
+                f"(staleness={cfg.WEBSOCKET_STALENESS_S}s, "
+                f"reconnect_max={cfg.WEBSOCKET_RECONNECT_MAX_S}s)"
+            )
+        else:
+            info("WebSocket live feed: DISABLED — using REST polling only")
 
         exit_h,    exit_m    = parse_hhmm(cfg.EXIT_TIME)
         vix_upd_h, vix_upd_m = parse_hhmm(cfg.VIX_UPDATE_TIME)
@@ -1076,6 +1110,10 @@ class StrategyCore:
             if cfg.TRAILING_SL_ENABLED else "Trailing SL: off"
         )
         trade_log_tg = cfg.TRADE_LOG_FILE if cfg.TRADE_LOG_FILE else "off"
+        ws_tg = (
+            f"WebSocket feed: ENABLED (staleness={cfg.WEBSOCKET_STALENESS_S}s)"
+            if cfg.WEBSOCKET_ENABLED else "WebSocket feed: off (REST polling)"
+        )
         telegram(
             f"🚀 Strategy STARTED v{VERSION} [PARTIAL]\n"
             f"Entry: {entry_display}  Hard Exit: {cfg.EXIT_TIME}\n"
@@ -1090,6 +1128,7 @@ class StrategyCore:
             f"Limit: Rs.{cfg.DAILY_LOSS_LIMIT_PER_LOT}/lot = Rs.{cfg.DAILY_LOSS_LIMIT}\n"
             f"Trade log: {trade_log_tg}  |  "
             f"Quote fail alert: {cfg.QUOTE_FAIL_ALERT_THRESHOLD} ticks\n"
+            f"{ws_tg}\n"
             f"{guard_status}"
         )
 
@@ -1101,6 +1140,9 @@ class StrategyCore:
             if state["in_position"]:
                 warn(f"Open legs on shutdown: {active_legs()} — closing for safety")
                 self._order_engine.close_all(reason="Emergency: Script Stopped by Operator")
+            # Gracefully stop WebSocket feed
+            if self._ws_feed is not None:
+                self._ws_feed.stop()
             telegram("Strategy STOPPED by operator")
             _flush_telegram(timeout=10)
 
@@ -1109,6 +1151,9 @@ class StrategyCore:
             if state["in_position"]:
                 error(f"Open legs: {active_legs()} — attempting emergency close")
                 self._order_engine.close_all(reason="Emergency: Scheduler Crash")
+            # Gracefully stop WebSocket feed
+            if self._ws_feed is not None:
+                self._ws_feed.stop()
             telegram(f"🚨 Strategy CRASHED\n{exc}\nCheck logs immediately.")
             _flush_telegram(timeout=10)
             raise

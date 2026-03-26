@@ -27,6 +27,7 @@
 #    7H-E. Combined Profit Trailing
 #    8.  Expiry
 #    9.  Strategy Name
+#    9A. WebSocket Live Feed
 #    10. Telegram Alerts
 #    11. State & Log Files
 #    12. Logger
@@ -871,6 +872,25 @@ manual_expiry = "25MAR26"     # Used only when auto_expiry = false  (must be a T
 
 [strategy]
 name = "Short Straddle"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SECTION 9A — WEBSOCKET LIVE FEED
+#  Replaces 15-second REST polling with sub-second WebSocket LTP updates.
+#  When enabled, the strategy subscribes to option leg symbols + NIFTY spot + VIX
+#  via OpenAlgo's WebSocket API for real-time price streaming.
+#
+#  If the WebSocket disconnects, the strategy seamlessly falls back to REST API
+#  polling (existing behavior). Telegram alerts fire after persistent failures.
+#
+#  staleness_timeout_s : cache entries older than this trigger REST fallback.
+#  reconnect_max_delay_s : max backoff delay between reconnect attempts.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[websocket]
+enabled               = true    # true = use WebSocket for real-time LTP (recommended)
+staleness_timeout_s   = 60      # Cache staleness threshold (seconds) before REST fallback
+reconnect_max_delay_s = 30      # Max backoff between reconnection attempts
 
 
 # ──────────────────────────────────────────────────────────────────────────────

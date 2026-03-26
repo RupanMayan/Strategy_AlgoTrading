@@ -11,7 +11,7 @@ Exports:
   MonitorState, _monitor_state                         — monitor thread vars
   _monitor_lock                                        — monitor RLock (alias)
   now_ist(), qty(), parse_hhmm(), active_legs()        — stateless helpers
-  fetch_ltp()                                          — broker quote helper
+  fetch_ltp(), update_ltp_cache(), get_ltp_cache()     — LTP helpers (WS + REST)
   sl_level(), _dynamic_sl_percent()                    — SL helpers
   telegram                                             — notify alias
 ═══════════════════════════════════════════════════════════════════════
@@ -100,6 +100,56 @@ _broker_client = BrokerClient()
 def _get_client() -> OpenAlgoClient:
     """Backward-compatible wrapper — delegates to the BrokerClient singleton."""
     return _broker_client.get_client()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LTP Cache — populated by WebSocket feed, consumed by fetch_ltp()
+#
+#  Thread-safe dict: key = "SYMBOL.EXCHANGE" → value = (ltp, timestamp)
+#  WebSocketFeed calls update_ltp_cache() on every market_data message.
+#  fetch_ltp() checks the cache first; if fresh, returns instantly.
+#  If stale or missing, falls back to the REST API (existing behavior).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ltp_cache: dict[str, tuple[float, datetime]] = {}
+_ltp_cache_lock = threading.Lock()
+
+# Staleness threshold in seconds — cache entries older than this
+# are treated as stale and trigger a REST fallback.
+_LTP_CACHE_STALENESS_S: float = 60.0
+
+
+def update_ltp_cache(symbol: str, exchange: str, ltp: float) -> None:
+    """
+    Update the LTP cache with a fresh price from the WebSocket feed.
+
+    Called by ws_feed.py on every market_data message.
+    Thread-safe via _ltp_cache_lock.
+    """
+    key = f"{symbol}.{exchange}"
+    now = datetime.now(IST)
+    with _ltp_cache_lock:
+        _ltp_cache[key] = (ltp, now)
+
+
+def get_ltp_cache(symbol: str, exchange: str) -> float:
+    """
+    Read a cached LTP if it exists and is fresh (within staleness threshold).
+
+    Returns the LTP float if cache hit and fresh, or 0.0 if stale/missing.
+    Uses cfg.WEBSOCKET_STALENESS_S if available, else the module default.
+    """
+    key = f"{symbol}.{exchange}"
+    with _ltp_cache_lock:
+        entry = _ltp_cache.get(key)
+    if entry is None:
+        return 0.0
+    ltp, ts = entry
+    staleness = getattr(cfg, "WEBSOCKET_STALENESS_S", _LTP_CACHE_STALENESS_S)
+    age = (datetime.now(IST) - ts).total_seconds()
+    if age > staleness:
+        return 0.0
+    return ltp
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -248,12 +298,21 @@ def parse_ist_datetime(raw: str | datetime | None) -> datetime | None:
 
 def fetch_ltp(symbol: str, exchange: str) -> float:
     """
-    Fetch the last traded price for a symbol via OpenAlgo quotes API.
+    Fetch the last traded price for a symbol.
 
-    Returns the LTP as a float, or 0.0 if the call fails or the response
-    is invalid. Exceptions are caught and logged — callers never need to
-    wrap this in try/except.
+    Priority:
+      1. WebSocket LTP cache — sub-second updates, zero API calls
+      2. REST API fallback   — when cache is stale or WS is disconnected
+
+    Returns the LTP as a float, or 0.0 if both sources fail.
+    Exceptions are caught and logged — callers never need try/except.
     """
+    # 1. Try WebSocket cache first (instant, no network call)
+    cached = get_ltp_cache(symbol, exchange)
+    if cached > 0:
+        return cached
+
+    # 2. Fallback to REST API
     try:
         resp = _get_client().quotes(symbol=symbol, exchange=exchange)
         if is_api_success(resp):

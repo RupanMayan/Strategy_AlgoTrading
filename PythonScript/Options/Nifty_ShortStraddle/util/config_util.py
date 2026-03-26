@@ -231,6 +231,11 @@ class Config:
     # ── Section 9 — Strategy Name ─────────────────────────────────────────────
     STRATEGY_NAME: str
 
+    # ── Section 9A — WebSocket Live Feed ─────────────────────────────────────
+    WEBSOCKET_ENABLED:           bool
+    WEBSOCKET_STALENESS_S:       float  # cache staleness threshold (seconds)
+    WEBSOCKET_RECONNECT_MAX_S:   float  # max backoff between reconnects
+
     # ── Section 10 — Telegram ────────────────────────────────────────────────
     TELEGRAM_ENABLED:   bool
     TELEGRAM_BOT_TOKEN: str
@@ -622,6 +627,7 @@ class Config:
         dte_sl = risk.get("dte_sl_override",    {})
         expiry = raw.get("expiry",              {})
         strat  = raw.get("strategy",            {})
+        wscfg  = raw.get("websocket",           {})
         tg     = raw.get("telegram",            {})
         files  = raw.get("files",               {})
         logcfg = raw.get("logging",             {})
@@ -826,6 +832,11 @@ class Config:
 
             # Section 9 — Strategy Name
             STRATEGY_NAME = strat.get("name", "Short Straddle"),
+
+            # Section 9A — WebSocket Live Feed
+            WEBSOCKET_ENABLED         = bool(wscfg.get("enabled",               True)),
+            WEBSOCKET_STALENESS_S     = float(wscfg.get("staleness_timeout_s",  60)),
+            WEBSOCKET_RECONNECT_MAX_S = float(wscfg.get("reconnect_max_delay_s", 30)),
 
             # Section 10 — Telegram
             TELEGRAM_ENABLED   = bool(tg.get("enabled", True)),
