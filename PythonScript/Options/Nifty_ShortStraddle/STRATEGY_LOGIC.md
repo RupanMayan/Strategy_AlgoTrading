@@ -1,6 +1,6 @@
 # NIFTY Short Straddle — Partial Square Off Strategy
 
-**Version 7.1.0** | OpenAlgo + Dhan API | Restart-Safe | Production Grade | Backtest-Optimised
+**Version 7.2.0** | OpenAlgo + Dhan API | Restart-Safe | Production Grade | Backtest-Optimised
 
 ---
 
@@ -65,11 +65,12 @@ Partial square off:    PE SL hit → close PE only → CE continues with its own
 | Lot size | 65 | Contracts per lot |
 | Product | MIS | Intraday (auto square-off by exchange) |
 | Strike | ATM | At-the-money nearest to NIFTY spot |
-| Expiry | Weekly Tuesday | Auto-resolved each day |
+| Expiry | Weekly Tuesday | Auto-resolved via OpenAlgo expiry API (holiday-aware) |
 | Base SL | 30% | Per-leg stop-loss (entry × 1.30) |
 | Daily target | Rs.10,000/lot | Close all when combined P&L reaches this |
 | Daily limit | Rs.-6,000/lot | Close all when combined loss exceeds this |
 | Monitor interval | 15 seconds | How often SL/P&L is checked |
+| WebSocket feed | Enabled | Real-time LTP via OpenAlgo WebSocket (REST fallback) |
 
 ---
 
@@ -80,14 +81,15 @@ main.py                     ← Entry point: creates StrategyCore and calls .run
 │
 ├── src/
 │   ├── __init__.py          ← Package init (exports BrokerClient, MonitorState)
-│   ├── _shared.py           ← Shared constants, lazy broker client, SL helpers
+│   ├── _shared.py           ← Shared constants, lazy broker client, LTP cache, SL helpers
 │   ├── strategy_core.py     ← Top-level orchestrator (scheduler, jobs, banner)
 │   ├── filters.py           ← Entry filter chain (DTE, VIX, IVR/IVP, ORB)
 │   ├── risk.py              ← MarginGuard + TrailingSLEngine
 │   ├── order_engine.py      ← All broker order operations (entry, close, P&L)
-│   ├── monitor.py           ← Intraday SL/P&L monitor (runs every 15s)
+│   ├── monitor.py           ← Intraday SL/P&L monitor (runs every tick)
 │   ├── reconciler.py        ← Startup state vs broker reconciliation
-│   └── vix_manager.py       ← VIX fetch, IVR/IVP computation, history mgmt
+│   ├── vix_manager.py       ← VIX fetch, IVR/IVP computation, history mgmt
+│   └── ws_feed.py           ← WebSocket live feed (real-time LTP streaming)
 │
 ├── util/
 │   ├── __init__.py          ← Package init
@@ -111,6 +113,7 @@ StrategyCore
 ├── TrailingSLEngine   (per-leg trailing SL state machine)
 ├── OrderEngine        (broker operations) ← uses TrailingSLEngine
 ├── Monitor            (intraday SL/P&L) ← uses OrderEngine, TrailingSLEngine, VIXManager
+├── WebSocketFeed      (real-time LTP streaming) ← feeds LTP cache in _shared.py
 └── StartupReconciler  (state recovery) ← uses OrderEngine
 ```
 
@@ -123,6 +126,7 @@ StrategyCore
 ```
 09:00  Strategy starts → validate config → print banner → test connection
        → reconcile state with broker → check VIX history
+       → start WebSocket feed (subscribe NIFTY spot + INDIAVIX)
 
 09:17  ORB CAPTURE: Fetch NIFTY spot price as opening reference
        Store in state["orb_price"]
@@ -136,10 +140,12 @@ StrategyCore
        ┌─ Filter chain runs (7 gates)
        ├─ If ALL pass → place_entry() → SELL CE + SELL PE
        ├─ Fill capture in background thread
-       └─ Monitor starts on next 15s tick
+       ├─ Subscribe CE + PE symbols to WebSocket for real-time LTP
+       └─ Monitor starts on next tick
 
-09:35+ MONITOR LOOP (every 15 seconds):
-       ┌─ Fetch LTP for each active leg
+09:35+ MONITOR LOOP (every MONITOR_INTERVAL_S seconds):
+       ┌─ Read LTP from WebSocket cache (instant, no API call)
+       │  └─ Falls back to REST API if cache is stale or WS disconnected
        ├─ Update trailing SL (if applicable)
        ├─ Check per-leg SL (fixed/dynamic/trailing/breakeven)
        ├─ Check combined premium decay exit
@@ -1516,6 +1522,40 @@ schedule = [
 | `max_loss_per_lot` | `2000` | Per-lot Rs. threshold (effective = per_lot × number_of_lots) |
 | `max_reentries_per_day` | `2` | Max re-entries per day (v7.0.0: was 1) |
 
+### Section 8 — Expiry
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `auto_expiry` | `true` | Fetch next expiry from OpenAlgo expiry API (with Tuesday fallback) |
+| `manual_expiry` | `"25MAR26"` | Used only when `auto_expiry = false` (must be a Tuesday, DDMMMYY format) |
+
+### Section 9A — WebSocket Live Feed [v7.2.0]
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Enable real-time LTP via OpenAlgo WebSocket |
+| `staleness_timeout_s` | `60` | Cache entries older than this (seconds) trigger REST fallback |
+| `reconnect_max_delay_s` | `30` | Maximum backoff delay between reconnect attempts |
+
+**How it works:**
+
+```
+WebSocket daemon thread (single connection)
+    ↓
+Subscribes: CE symbol, PE symbol, NIFTY spot, INDIAVIX
+    ↓
+Server pushes LTP updates → stored in thread-safe cache (_shared._ltp_cache)
+    ↓
+fetch_ltp() reads cache first (instant) → REST API fallback if stale
+    ↓
+Monitor loop reads fresh prices every tick with zero API calls
+```
+
+**Fallback behaviour:** If WebSocket disconnects, auto-reconnect with exponential
+backoff (1s → 2s → 4s → ... → 30s cap). After 3 consecutive failures, a Telegram
+alert is sent. During disconnection, `fetch_ltp()` seamlessly falls back to REST
+API polling (existing behaviour preserved).
+
 ---
 
 ## 18. Telegram Notifications
@@ -1536,10 +1576,25 @@ The strategy sends alerts for every significant event:
 | Breakeven breach | ⚠️ | BREAKEVEN BREACH EXIT — NIFTY moved 500pts |
 | Margin insufficient | ⚠️ | MARGIN INSUFFICIENT — trade SKIPPED |
 | Broker quotes lost | ⚠️ | BROKER QUOTES UNREACHABLE for 45s |
+| WebSocket feed down | ⚠️ | WebSocket feed DOWN — falling back to REST polling |
 | Monitor blocked | 🚨 | MONITOR BLOCKED — SL checks PAUSED |
 | Emergency close fail | 🚨 | EMERGENCY CLOSE FAILED — MANUAL ACTION REQUIRED |
 | Strategy stopped | - | Strategy STOPPED by operator |
 | Strategy crashed | 🚨 | Strategy CRASHED — check logs |
+
+---
+
+## Changelog: v7.1.0 → v7.2.0 (WebSocket Live Feed + Expiry API)
+
+| Change | Description |
+|--------|-------------|
+| WebSocket live feed | New `src/ws_feed.py` — production WebSocket client streams real-time LTP from OpenAlgo, replacing 15s REST polling with sub-second price updates. Single daemon thread, single connection for all symbols (CE, PE, spot, VIX). |
+| LTP cache in `_shared.py` | Thread-safe `_ltp_cache` dict populated by WebSocket. `fetch_ltp()` reads cache first (instant), falls back to REST API if stale or disconnected. |
+| Auto-reconnect | Exponential backoff (1s → 30s cap) on disconnect. Telegram alert after 3 consecutive failures. All subscriptions automatically restored on reconnect. |
+| Graceful shutdown | `ws_feed.stop()` unsubscribes all symbols and closes the WebSocket connection cleanly on Ctrl+C, SIGTERM, or crash. |
+| Expiry API | `auto_expiry` now fetches actual expiry dates from OpenAlgo `/api/v1/expiry` endpoint instead of hardcoding next Tuesday. Handles holidays correctly. Falls back to Tuesday calculation if API is unavailable. 5-minute cache. |
+| `[websocket]` config | New config section: `enabled`, `staleness_timeout_s`, `reconnect_max_delay_s`. |
+| Monitor interval | With WebSocket feeding cached LTP, `monitor_interval_s` can be reduced to 2-5s for faster SL execution without API rate limit concerns. |
 
 ---
 

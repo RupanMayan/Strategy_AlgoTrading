@@ -1,7 +1,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 #  NIFTY SHORT STRADDLE — PARTIAL SQUARE OFF  |  Configuration File
 #  Strategy : Short ATM Straddle  |  Weekly Expiry  |  Intraday MIS
-#  Version  : 7.1.0  (code quality + security hardening — secrets to .env, validation fixes)
+#  Version  : 7.2.0  (WebSocket live feed + OpenAlgo expiry API)
 #
 #  Sections:
 #    1.  OpenAlgo Connection
@@ -99,7 +99,7 @@ strike_offset  = "ATM"         # ATM | OTM1..OTM5 | ITM1..ITM5
 [timing]
 entry_time         = "09:30"   # Fallback entry time when use_dte_entry_map = false
 exit_time          = "15:15"   # Hard square-off — closes ALL remaining open legs
-monitor_interval_s = 15        # Seconds between P&L / SL checks
+monitor_interval_s = 5         # Seconds between P&L / SL checks (reduced from 15s — WebSocket feeds LTP cache)
 use_dte_entry_map  = true      # true = use map below | false = use entry_time for all
 
 [timing.dte_entry_time_map]  # DTE → entry time (used when use_dte_entry_map = true)
@@ -918,7 +918,7 @@ chat_id   = ""   # Leave blank → loaded from env TELEGRAM_CHAT_ID (see .env)
 #
 #  quote_fail_alert_threshold: consecutive monitor ticks where ALL active legs
 #    fail LTP fetch before a Telegram alert is sent (broker quotes unreachable).
-#    At monitor_interval_s=15s, threshold=3 means alert fires after ~45s of blackout.
+#    At monitor_interval_s=5s, threshold=3 means alert fires after ~15s of blackout.
 # ──────────────────────────────────────────────────────────────────────────────
 
 [files]
