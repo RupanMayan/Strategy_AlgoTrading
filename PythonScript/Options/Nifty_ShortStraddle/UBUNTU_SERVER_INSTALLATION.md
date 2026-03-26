@@ -118,9 +118,10 @@ journalctl -u nifty-straddle -n 100
 ## Updating the Strategy
 
 ```bash
-# Pull latest code
-cd ~/algo_trading/Strategy_AlgoTrading
-git pull origin main
+cd ~/algo_trading/Strategy_AlgoTrading/PythonScript/Options/Nifty_ShortStraddle
+
+# Pull latest code and install/upgrade dependencies in one step
+./update.sh
 
 # Restart the service
 sudo systemctl restart nifty-straddle
@@ -161,3 +162,4 @@ source venv/bin/activate
 | `.env.example` | Template for `.env` |
 | `requirements.txt` | Python dependencies |
 | `setup_service.sh` | Automated service installer |
+| `update.sh` | Pull code + install/upgrade dependencies |
