@@ -33,7 +33,7 @@ from util.logger import info, warn, debug
 #  Populated by _load_holidays() on first call to is_market_open().
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_holidays_cache: dict[date, str] | None = None
+_holidays_cache: dict[int, dict[date, str]] = {}
 
 
 def _fetch_holidays_from_api(year: int) -> dict[date, str] | None:
@@ -44,7 +44,9 @@ def _fetch_holidays_from_api(year: int) -> dict[date, str] | None:
     Filters for holidays where "NFO" is in closed_exchanges
     (since we trade F&O options).
 
-    Returns dict of {date: description} or None on failure.
+    Returns dict of {date: description}, or None on failure.
+    Returns None (not empty dict) when API returns zero NFO holidays,
+    so the caller falls back to the static list.
     """
     from openalgo import api as OpenAlgoClient
 
@@ -74,6 +76,10 @@ def _fetch_holidays_from_api(year: int) -> dict[date, str] | None:
             except (ValueError, TypeError):
                 debug(f"Holidays API: skipping unparseable date: {date_str}")
 
+        if not holidays:
+            warn(f"Holidays API: returned 0 NFO holidays for {year} — treating as failure")
+            return None
+
         info(f"Holidays API: loaded {len(holidays)} NFO holidays for {year}")
         return holidays
 
@@ -85,9 +91,7 @@ def _fetch_holidays_from_api(year: int) -> dict[date, str] | None:
 def _load_holidays(year: int) -> dict[date, str]:
     """
     Load holidays for the given year. Tries API first, falls back to static list.
-    Result is cached for the session — called only once.
     """
-    # Try API
     api_holidays = _fetch_holidays_from_api(year)
     if api_holidays is not None:
         return api_holidays
@@ -98,11 +102,10 @@ def _load_holidays(year: int) -> dict[date, str]:
 
 
 def _get_holidays(year: int) -> dict[date, str]:
-    """Return cached holidays, loading on first call."""
-    global _holidays_cache
-    if _holidays_cache is None:
-        _holidays_cache = _load_holidays(year)
-    return _holidays_cache
+    """Return cached holidays for the given year, loading on first call per year."""
+    if year not in _holidays_cache:
+        _holidays_cache[year] = _load_holidays(year)
+    return _holidays_cache[year]
 
 
 def is_market_open(d: date) -> bool:
@@ -163,14 +166,17 @@ _STATIC_HOLIDAYS: dict[date, str] = {
     date(2026, 2, 17):  "Mahashivratri",
     date(2026, 3, 4):   "Holi",
     date(2026, 3, 20):  "Id-Ul-Fitr (Eid)",
-    date(2026, 3, 30):  "Idul Fitr",
+    date(2026, 3, 26):  "Shri Ram Navami",
     date(2026, 4, 3):   "Good Friday",
     date(2026, 4, 14):  "Dr. Baba Saheb Ambedkar Jayanti",
     date(2026, 5, 1):   "Maharashtra Day",
     date(2026, 5, 28):  "Bakrid / Eid-Ul-Adha",
+    date(2026, 8, 6):   "Parsi New Year",
     date(2026, 8, 15):  "Independence Day",
+    date(2026, 8, 18):  "Ganesh Chaturthi",
     date(2026, 10, 2):  "Mahatma Gandhi Jayanti",
     date(2026, 10, 9):  "Diwali Laxmi Pujan",
+    date(2026, 10, 12): "Diwali Balipratipada",
     date(2026, 11, 24): "Prakash Gurpurab Sri Guru Nanak Dev",
     date(2026, 12, 25): "Christmas",
 }

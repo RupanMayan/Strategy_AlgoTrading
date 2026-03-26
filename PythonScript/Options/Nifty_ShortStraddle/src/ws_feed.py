@@ -109,9 +109,13 @@ class WebSocketFeed:
         info("WebSocket feed: shutting down...")
         self._stop_event.set()
 
-        # Schedule graceful close in the event loop
+        # Schedule graceful close and await completion before joining
         if self._loop is not None and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._graceful_close(), self._loop)
+            fut = asyncio.run_coroutine_threadsafe(self._graceful_close(), self._loop)
+            try:
+                fut.result(timeout=5)
+            except Exception:
+                pass  # Best-effort — thread join will follow
 
         self._thread.join(timeout=10)
         if self._thread.is_alive():
@@ -207,6 +211,7 @@ class WebSocketFeed:
         import websockets
 
         delay = self._RECONNECT_BASE_DELAY
+        max_delay = getattr(cfg, "WEBSOCKET_RECONNECT_MAX_S", self._RECONNECT_MAX_DELAY)
 
         while not self._stop_event.is_set():
             ws_url = self._build_ws_url()
@@ -225,9 +230,9 @@ class WebSocketFeed:
                     if not await self._authenticate():
                         warn("WebSocket: authentication failed — will retry")
                         self._connected = False
+                        self._ws = None
                         await self._backoff_delay(delay)
-                        delay = min(delay * self._RECONNECT_BACKOFF_FACTOR,
-                                    self._RECONNECT_MAX_DELAY)
+                        delay = min(delay * self._RECONNECT_BACKOFF_FACTOR, max_delay)
                         continue
 
                     self._authenticated = True
@@ -271,8 +276,7 @@ class WebSocketFeed:
                     self._alert_sent = True
 
                 await self._backoff_delay(delay)
-                delay = min(delay * self._RECONNECT_BACKOFF_FACTOR,
-                            self._RECONNECT_MAX_DELAY)
+                delay = min(delay * self._RECONNECT_BACKOFF_FACTOR, max_delay)
 
         self._connected = False
         self._authenticated = False
@@ -371,11 +375,11 @@ class WebSocketFeed:
                 resp_raw = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
                 resp = json.loads(resp_raw) if isinstance(resp_raw, str) else resp_raw
                 status = resp.get("status", "")
-                if status == "error":
-                    warn(f"WebSocket auth rejected: {resp.get('message', resp)}")
-                    return False
-                debug(f"WebSocket: auth response: {resp}")
-                return True
+                if status in ("success", "ok", "authenticated"):
+                    debug(f"WebSocket: auth success: {resp}")
+                    return True
+                warn(f"WebSocket auth failed (status='{status}'): {resp}")
+                return False
             except asyncio.TimeoutError:
                 warn("WebSocket: auth response timeout (10s)")
                 return False

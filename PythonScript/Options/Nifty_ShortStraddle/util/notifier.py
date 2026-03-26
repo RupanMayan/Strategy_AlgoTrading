@@ -82,13 +82,15 @@ class TelegramNotifier:
     Fallback path : Direct Telegram Bot API (only when OpenAlgo is unreachable)
     """
 
+    _CLIENT_FAILED = object()  # sentinel: client construction was attempted and failed
+
     def __init__(self) -> None:
         self._send_queue: queue.Queue[str | None] = queue.Queue()
         self._http_session: requests.Session | None = None
         self._session_lock = threading.Lock()
         self._worker_thread: threading.Thread | None = None
         self._worker_lock = threading.Lock()
-        self._openalgo_client = None
+        self._openalgo_client: object | None = None  # None=not tried, _CLIENT_FAILED=failed
         self._openalgo_client_lock = threading.Lock()
 
     # ── Config access ───────────────────────────────────────────────────────
@@ -105,7 +107,13 @@ class TelegramNotifier:
     # ── OpenAlgo client (lazy singleton) ────────────────────────────────────
 
     def _get_openalgo_client(self):
-        """Return a cached OpenAlgo client for Telegram API calls."""
+        """Return a cached OpenAlgo client for Telegram API calls.
+
+        Uses a sentinel to avoid retrying construction on every message
+        when it has already failed once.
+        """
+        if self._openalgo_client is self._CLIENT_FAILED:
+            return None
         if self._openalgo_client is None:
             with self._openalgo_client_lock:
                 if self._openalgo_client is None:
@@ -120,6 +128,7 @@ class TelegramNotifier:
                         )
                     except Exception as exc:
                         warn(f"Failed to create OpenAlgo client for Telegram: {exc}")
+                        self._openalgo_client = self._CLIENT_FAILED
                         return None
         return self._openalgo_client
 
@@ -139,11 +148,24 @@ class TelegramNotifier:
     # ── Enabled check ───────────────────────────────────────────────────────
 
     def _is_enabled(self) -> bool:
-        """Return True if Telegram notifications are enabled."""
+        """Return True if Telegram notifications are enabled.
+
+        Enabled when TELEGRAM_ENABLED=True AND at least one delivery
+        path is configured (OpenAlgo username OR direct Bot API credentials).
+        """
         cfg = self._get_config()
         if cfg is None:
             return False
-        return bool(cfg.TELEGRAM_ENABLED and cfg.TELEGRAM_USERNAME)
+        if not cfg.TELEGRAM_ENABLED:
+            return False
+        return bool(cfg.TELEGRAM_USERNAME) or self._has_bot_api_fallback()
+
+    def _has_primary_channel(self) -> bool:
+        """Return True if OpenAlgo username is configured (primary path)."""
+        cfg = self._get_config()
+        if cfg is None:
+            return False
+        return bool(cfg.TELEGRAM_USERNAME)
 
     def _has_bot_api_fallback(self) -> bool:
         """Return True if direct Bot API credentials are configured."""
@@ -236,7 +258,7 @@ class TelegramNotifier:
                 retry_after = int(resp.headers.get("Retry-After", _BACKOFF_DELAYS[0]))
                 warn(f"Telegram Bot API 429 rate-limited — waiting {retry_after}s")
                 time.sleep(retry_after)
-                return False
+                return False  # Signal retry; sleep already served — caller should skip its backoff
 
             if 500 <= resp.status_code < 600:
                 warn(f"Telegram Bot API server error {resp.status_code} — will retry")
@@ -263,34 +285,42 @@ class TelegramNotifier:
         """
         Attempt delivery: OpenAlgo first, direct Bot API fallback on failure.
 
-        The fallback is retried up to _MAX_ATTEMPTS times with exponential backoff.
+        If only Bot API credentials are configured (no OpenAlgo username),
+        sends directly via Bot API without trying OpenAlgo first.
         """
         if not self._is_enabled():
             debug("Telegram disabled — skipping")
             return
 
-        # Primary: try OpenAlgo API (single attempt — it's fast or down)
-        if self._send_via_openalgo(text):
-            return
+        # Primary: try OpenAlgo API if username is configured
+        if self._has_primary_channel():
+            if self._send_via_openalgo(text):
+                return
+            # OpenAlgo failed — fall through to Bot API
+            if not self._has_bot_api_fallback():
+                warn("OpenAlgo Telegram API failed and no Bot API fallback configured — message dropped")
+                return
+            warn("OpenAlgo Telegram API unreachable — falling back to direct Bot API")
 
-        # OpenAlgo failed — try direct Bot API as fallback
+        # Bot API delivery (fallback, or sole channel if no username)
         if not self._has_bot_api_fallback():
-            warn("OpenAlgo Telegram API failed and no Bot API fallback configured — message dropped")
+            warn("No Telegram delivery channel available — message dropped")
             return
 
-        warn("OpenAlgo Telegram API unreachable — falling back to direct Bot API")
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             success = self._send_via_bot_api(text)
             if success:
                 return
 
+            # _send_via_bot_api already sleeps on 429, so only add
+            # extra backoff for non-429 transient failures
             if attempt < _MAX_ATTEMPTS:
                 delay = _BACKOFF_DELAYS[min(attempt - 1, len(_BACKOFF_DELAYS) - 1)]
-                debug(f"Bot API fallback attempt {attempt} failed — retrying in {delay}s")
+                debug(f"Bot API attempt {attempt} failed — retrying in {delay}s")
                 time.sleep(delay)
 
         warn(
-            f"Telegram delivery failed after OpenAlgo + {_MAX_ATTEMPTS} Bot API attempts — "
+            f"Telegram delivery failed after {_MAX_ATTEMPTS} Bot API attempts — "
             "message dropped"
         )
 

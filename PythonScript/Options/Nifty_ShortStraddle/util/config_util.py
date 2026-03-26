@@ -486,16 +486,18 @@ class Config:
 
         # ── Section 10 — Telegram ────────────────────────────────────────────
         if self.TELEGRAM_ENABLED:
-            if not self.TELEGRAM_USERNAME:
+            has_username = bool(self.TELEGRAM_USERNAME)
+            has_token    = bool(self.TELEGRAM_BOT_TOKEN)
+            has_chat     = bool(self.TELEGRAM_CHAT_ID)
+            has_bot_api  = has_token and has_chat
+            # At least one delivery channel must be configured
+            if not has_username and not has_bot_api:
                 errors.append(
-                    "[telegram] username is required when enabled = true — "
-                    "set in config.toml or export OPENALGO_USERNAME "
-                    "(this is your OpenAlgo login username)"
+                    "[telegram] at least one delivery channel required when enabled = true:\n"
+                    "    • Primary: set username (OPENALGO_USERNAME env var)\n"
+                    "    • Fallback: set both bot_token and chat_id"
                 )
-            # bot_token + chat_id are optional (fallback only when OpenAlgo is down)
-            # but warn if only one is set
-            has_token = bool(self.TELEGRAM_BOT_TOKEN)
-            has_chat  = bool(self.TELEGRAM_CHAT_ID)
+            # bot_token + chat_id must both be set or both empty
             if has_token != has_chat:
                 errors.append(
                     "[telegram] bot_token and chat_id must both be set for the "
