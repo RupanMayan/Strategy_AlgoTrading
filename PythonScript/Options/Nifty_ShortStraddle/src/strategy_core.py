@@ -43,6 +43,7 @@ from src.order_engine import OrderEngine
 from src.monitor import Monitor
 from src.reconciler import StartupReconciler
 from src.ws_feed import WebSocketFeed
+from util.market_calendar import is_market_open, get_holiday_name
 from util.notifier import flush as _flush_telegram
 
 
@@ -951,6 +952,7 @@ class StrategyCore:
     def run(self) -> None:
         """
         Production startup:
+          0. Market-open guard (exit immediately on weekends/holidays)
           1. Validate configuration (raises on misconfiguration)
           2. Print banner
           3. Test connection + show funds
@@ -960,6 +962,19 @@ class StrategyCore:
           7. Graceful shutdown on Ctrl+C, SIGTERM, or crash
         """
         from apscheduler.schedulers.blocking import BlockingScheduler
+
+        # ── 0. Market-open guard ─────────────────────────────────────────
+        today = now_ist().date()
+        if not is_market_open(today):
+            reason = get_holiday_name(today)
+            msg = (
+                f"Market CLOSED today ({today.strftime('%A %d-%b-%Y')}): {reason}\n"
+                f"Strategy will not run. Exiting."
+            )
+            info(msg)
+            telegram(msg)
+            _flush_telegram(timeout=10)
+            return
 
         self._validate_config()
         self._print_banner()
