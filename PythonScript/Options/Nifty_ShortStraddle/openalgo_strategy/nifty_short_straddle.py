@@ -14,9 +14,9 @@ from openalgo import api as OpenAlgo
 #  CONFIGURATION — All backtest-optimised parameters
 # ─────────────────────────────────────────────────────────────────────────────
 
-OPENALGO_HOST    = os.environ.get("OPENALGO_HOST", "http://127.0.0.1:5000")
-OPENALGO_API_KEY = os.environ.get("OPENALGO_APIKEY", "")
-TELEGRAM_USER    = os.environ.get("OPENALGO_USERNAME", "")
+OPENALGO_HOST    = os.environ.get("OPENALGO_HOST", "https://myalgo.algotradings.in/")
+OPENALGO_API_KEY = os.environ.get("OPENALGO_APIKEY", "2e8cc05401595296ec2bd91d3f79ff378909ff4978b00b13bedc80c56fc97a2f")
+TELEGRAM_USER    = os.environ.get("OPENALGO_USERNAME", "rupanmayan")
 
 UNDERLYING       = "NIFTY"
 EXCHANGE         = "NSE_INDEX"
@@ -1237,6 +1237,9 @@ class NiftyShortStraddle:
         plog_sep()
 
         telegram.start()
+        telegram.send("Strategy Started — Nifty Short Straddle v8.0\n"
+                       f"Entry: {ENTRY_TIME} | Exit: {EXIT_TIME} | SL: {LEG_SL_PERCENT}%\n"
+                       f"Lots: {NUMBER_OF_LOTS} × {LOT_SIZE} = {qty()}")
         ws_feed.subscribe_market_symbols()
         ws_feed.start()
         self.reconciler.reconcile()
@@ -1244,6 +1247,8 @@ class NiftyShortStraddle:
         if state["in_position"]:
             self._entry_done_today = True
             plog("Resumed with open position — monitoring")
+        else:
+            plog(f"Waiting for entry at {ENTRY_TIME}")
 
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -1345,10 +1350,11 @@ class NiftyShortStraddle:
         if state["in_position"]:
             plog("Shutdown with open position — closing all")
             self.engine.close_all("Script Shutdown")
+        plog("Shutdown complete")
+        telegram.send("Strategy Stopped — Nifty Short Straddle")
         ws_feed.stop()
         telegram.flush()
         telegram.stop()
-        plog("Shutdown complete")
 
     # ── Manual utilities ──
 
