@@ -94,26 +94,32 @@ class TelegramNotifier:
         """Return a cached OpenAlgo client for Telegram API calls.
 
         Uses a sentinel to avoid retrying construction on every message
-        when it has already failed once.
+        when it has already failed once. Double-checked locking covers
+        both the None and _CLIENT_FAILED states.
         """
         if self._openalgo_client is self._CLIENT_FAILED:
             return None
-        if self._openalgo_client is None:
-            with self._openalgo_client_lock:
-                if self._openalgo_client is None:
-                    cfg = self._get_config()
-                    if cfg is None:
-                        return None
-                    try:
-                        from openalgo import api as OpenAlgoClient
-                        self._openalgo_client = OpenAlgoClient(
-                            api_key=cfg.OPENALGO_API_KEY,
-                            host=cfg.OPENALGO_HOST,
-                        )
-                    except Exception as exc:
-                        warn(f"Failed to create OpenAlgo client for Telegram: {exc}")
-                        self._openalgo_client = self._CLIENT_FAILED
-                        return None
+        if self._openalgo_client is not None:
+            return self._openalgo_client
+        with self._openalgo_client_lock:
+            # Re-check both sentinels under the lock
+            if self._openalgo_client is self._CLIENT_FAILED:
+                return None
+            if self._openalgo_client is not None:
+                return self._openalgo_client
+            cfg = self._get_config()
+            if cfg is None:
+                return None
+            try:
+                from openalgo import api as OpenAlgoClient
+                self._openalgo_client = OpenAlgoClient(
+                    api_key=cfg.OPENALGO_API_KEY,
+                    host=cfg.OPENALGO_HOST,
+                )
+            except Exception as exc:
+                warn(f"Failed to create OpenAlgo client for Telegram: {exc}")
+                self._openalgo_client = self._CLIENT_FAILED
+                return None
         return self._openalgo_client
 
     # ── Enabled check ───────────────────────────────────────────────────────
@@ -258,19 +264,20 @@ class TelegramNotifier:
 
     def flush(self, timeout: float = 10.0) -> bool:
         """
-        Block until all queued messages have been delivered (or time out).
+        Block until all queued messages have been fully delivered (or time out).
+
+        Uses queue.join() via a helper thread to correctly wait for task_done()
+        on every in-flight message, not just queue emptiness.
 
         Returns True if all delivered, False if timeout expired.
         """
         if self._send_queue.empty():
             return True
 
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self._send_queue.empty():
-                return True
-            time.sleep(0.1)
-        return False
+        joiner = threading.Thread(target=self._send_queue.join, daemon=True)
+        joiner.start()
+        joiner.join(timeout=timeout)
+        return not joiner.is_alive()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

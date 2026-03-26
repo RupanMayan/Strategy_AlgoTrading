@@ -231,6 +231,8 @@ class WebSocketFeed:
                         warn("WebSocket: authentication failed — will retry")
                         self._connected = False
                         self._ws = None
+                        self._consecutive_failures += 1
+                        await self._alert_if_persistent("authentication failed")
                         await self._backoff_delay(delay)
                         delay = min(delay * self._RECONNECT_BACKOFF_FACTOR, max_delay)
                         continue
@@ -247,6 +249,11 @@ class WebSocketFeed:
                     # Receive loop
                     await self._receive_loop(ws)
 
+                # Clean exit from async-with: reset state before next iteration
+                self._connected = False
+                self._authenticated = False
+                self._ws = None
+
             except asyncio.CancelledError:
                 break
 
@@ -261,19 +268,7 @@ class WebSocketFeed:
                     f"reconnecting in {delay:.1f}s "
                     f"(failure #{self._consecutive_failures})"
                 )
-
-                # Alert via Telegram after persistent failures
-                if (
-                    self._consecutive_failures >= self._ALERT_AFTER_FAILURES
-                    and not self._alert_sent
-                ):
-                    telegram(
-                        f"⚠️ WebSocket feed DOWN\n"
-                        f"Failed {self._consecutive_failures} consecutive reconnects\n"
-                        f"Last error: {exc}\n"
-                        f"Falling back to REST polling for LTP"
-                    )
-                    self._alert_sent = True
+                await self._alert_if_persistent(str(exc))
 
                 await self._backoff_delay(delay)
                 delay = min(delay * self._RECONNECT_BACKOFF_FACTOR, max_delay)
@@ -478,9 +473,26 @@ class WebSocketFeed:
             return host.replace("http://", "ws://", 1) + "/ws"
         return f"ws://{host}/ws"
 
+    async def _alert_if_persistent(self, reason: str) -> None:
+        """Send Telegram alert after _ALERT_AFTER_FAILURES consecutive failures."""
+        if (
+            self._consecutive_failures >= self._ALERT_AFTER_FAILURES
+            and not self._alert_sent
+        ):
+            telegram(
+                f"⚠️ WebSocket feed DOWN\n"
+                f"Failed {self._consecutive_failures} consecutive reconnects\n"
+                f"Last error: {reason}\n"
+                f"Falling back to REST polling for LTP"
+            )
+            self._alert_sent = True
+
     async def _backoff_delay(self, delay: float) -> None:
         """Sleep with stop_event awareness (check every 0.5s)."""
-        elapsed = 0.0
-        while elapsed < delay and not self._stop_event.is_set():
-            await asyncio.sleep(min(0.5, delay - elapsed))
-            elapsed += 0.5
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + delay
+        while not self._stop_event.is_set():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.5, remaining))
