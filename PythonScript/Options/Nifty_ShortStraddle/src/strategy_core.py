@@ -440,22 +440,11 @@ class StrategyCore:
             )
 
         # ── Telegram ──────────────────────────────────────────────────────────
-        if cfg.TELEGRAM_ENABLED:
-            if not cfg.TELEGRAM_USERNAME and not (cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID):
-                warn(
-                    "CONFIG: TELEGRAM_ENABLED=True but no delivery channel configured — "
-                    "alerts will be silent"
-                )
-            if not cfg.TELEGRAM_USERNAME:
-                warn(
-                    "CONFIG: OpenAlgo username not set — primary notification channel disabled "
-                    "(set OPENALGO_USERNAME env var)"
-                )
-            if not (cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID):
-                warn(
-                    "CONFIG: Bot API fallback not configured (bot_token/chat_id empty) — "
-                    "if OpenAlgo goes down, alerts will be lost"
-                )
+        if cfg.TELEGRAM_ENABLED and not cfg.TELEGRAM_USERNAME:
+            warn(
+                "CONFIG: TELEGRAM_ENABLED=True but USERNAME is empty — "
+                "alerts will be silent (set OPENALGO_USERNAME env var)"
+            )
 
         # ── Report ────────────────────────────────────────────────────────────
         if errors:

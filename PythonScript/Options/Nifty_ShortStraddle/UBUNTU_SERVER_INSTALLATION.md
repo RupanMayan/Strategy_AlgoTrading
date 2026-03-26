@@ -48,8 +48,7 @@ nano .env
 Set the following values in `.env`:
 ```
 OPENALGO_APIKEY=your_openalgo_api_key
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-TELEGRAM_CHAT_ID=your_telegram_chat_id
+OPENALGO_USERNAME=your_openalgo_login_username
 ```
 
 ```bash

@@ -1,20 +1,16 @@
 """
 util/notifier.py  —  Telegram alert delivery for Nifty Short Straddle
 ═══════════════════════════════════════════════════════════════════════════════════
-Dual-path notification system:
+Sends Telegram notifications via the OpenAlgo Telegram API.
 
-  PRIMARY  : OpenAlgo Telegram API  — client.telegram(username, message)
-  FALLBACK : Direct Telegram Bot API — POST /bot{token}/sendMessage
-             Used ONLY when OpenAlgo itself is unreachable, to notify
-             the operator that OpenAlgo is down.
+  OpenAlgo API  — client.telegram(username, message)
 
 Design:
   ┌─────────────────────┐     queue      ┌──────────────────────────────────┐
   │  notify("msg")      │ ─────────────► │  background daemon thread        │
   │  (returns instantly) │               │  _worker_loop()                  │
-  └─────────────────────┘                │    → _send_via_openalgo()        │
-                                         │    → if OpenAlgo fails:          │
-                                         │        _send_via_bot_api()       │
+  └─────────────────────┘                │    → _send_with_retry()          │
+                                         │    → OpenAlgo client.telegram()  │
                                          └──────────────────────────────────┘
 
 Message limits:
@@ -36,8 +32,6 @@ import queue
 import threading
 import time
 
-import requests
-
 from util.logger import debug, error, info, warn
 
 __all__ = ["TelegramNotifier", "notify", "telegram", "html_escape", "flush"]
@@ -51,9 +45,6 @@ def _get_version() -> str:
     except ImportError:
         return "7.2.0"
 
-# ── Telegram API base URL (direct Bot API fallback) ─────────────────────────
-_TELEGRAM_API_BASE = "https://api.telegram.org"
-
 # ── Message constraints ─────────────────────────────────────────────────────
 _MAX_MSG_LEN   = 4096        # Telegram hard limit (characters per sendMessage)
 _TRUNCATE_TAIL = "[…truncated]"
@@ -61,10 +52,6 @@ _TRUNCATE_TAIL = "[…truncated]"
 # ── Retry policy ────────────────────────────────────────────────────────────
 _MAX_ATTEMPTS    = 3
 _BACKOFF_DELAYS  = (1, 3)    # seconds before attempt 2, attempt 3
-
-# ── HTTP timeouts (seconds) — for direct Bot API fallback ───────────────────
-_CONNECT_TIMEOUT = 5
-_READ_TIMEOUT    = 8
 
 # ── Queue sentinel value ────────────────────────────────────────────────────
 _SENTINEL = None
@@ -78,16 +65,13 @@ class TelegramNotifier:
     """
     Asynchronous Telegram message delivery via a background daemon thread.
 
-    Primary path  : OpenAlgo SDK client.telegram()
-    Fallback path : Direct Telegram Bot API (only when OpenAlgo is unreachable)
+    Delivery channel: OpenAlgo SDK client.telegram(username, message)
     """
 
     _CLIENT_FAILED = object()  # sentinel: client construction was attempted and failed
 
     def __init__(self) -> None:
         self._send_queue: queue.Queue[str | None] = queue.Queue()
-        self._http_session: requests.Session | None = None
-        self._session_lock = threading.Lock()
         self._worker_thread: threading.Thread | None = None
         self._worker_lock = threading.Lock()
         self._openalgo_client: object | None = None  # None=not tried, _CLIENT_FAILED=failed
@@ -132,47 +116,14 @@ class TelegramNotifier:
                         return None
         return self._openalgo_client
 
-    # ── HTTP session (for direct Bot API fallback) ──────────────────────────
-
-    def _get_session(self) -> requests.Session:
-        """Return the shared HTTP session for direct Bot API calls."""
-        with self._session_lock:
-            if self._http_session is None:
-                self._http_session = requests.Session()
-                self._http_session.headers.update({
-                    "Content-Type": "application/json",
-                    "User-Agent": f"NiftyShortStraddle/{_get_version()}",
-                })
-            return self._http_session
-
     # ── Enabled check ───────────────────────────────────────────────────────
 
     def _is_enabled(self) -> bool:
-        """Return True if Telegram notifications are enabled.
-
-        Enabled when TELEGRAM_ENABLED=True AND at least one delivery
-        path is configured (OpenAlgo username OR direct Bot API credentials).
-        """
+        """Return True if Telegram notifications are enabled and username is set."""
         cfg = self._get_config()
         if cfg is None:
             return False
-        if not cfg.TELEGRAM_ENABLED:
-            return False
-        return bool(cfg.TELEGRAM_USERNAME) or self._has_bot_api_fallback()
-
-    def _has_primary_channel(self) -> bool:
-        """Return True if OpenAlgo username is configured (primary path)."""
-        cfg = self._get_config()
-        if cfg is None:
-            return False
-        return bool(cfg.TELEGRAM_USERNAME)
-
-    def _has_bot_api_fallback(self) -> bool:
-        """Return True if direct Bot API credentials are configured."""
-        cfg = self._get_config()
-        if cfg is None:
-            return False
-        return bool(cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID)
+        return bool(cfg.TELEGRAM_ENABLED and cfg.TELEGRAM_USERNAME)
 
     # ── Message formatting ──────────────────────────────────────────────────
 
@@ -182,7 +133,7 @@ class TelegramNotifier:
         strategy_name = cfg.STRATEGY_NAME if cfg else "Short Straddle"
         header = f"[{strategy_name} v{_get_version()}]\n"
 
-        available = _MAX_MSG_LEN - len(header) - len(_TRUNCATE_TAIL)
+        available = max(0, _MAX_MSG_LEN - len(header) - len(_TRUNCATE_TAIL))
         if len(msg) > available:
             warn(
                 f"Telegram message truncated from {len(msg)} to {available} chars "
@@ -192,21 +143,22 @@ class TelegramNotifier:
 
         return header + msg
 
-    # ── PRIMARY: OpenAlgo Telegram API ──────────────────────────────────────
+    # ── Send via OpenAlgo Telegram API ──────────────────────────────────────
 
-    def _send_via_openalgo(self, text: str) -> bool:
+    def _send_once(self, text: str) -> bool:
         """
-        Send via OpenAlgo's Telegram API.
+        Attempt a single send via OpenAlgo's Telegram API.
 
-        Returns True on success, False on failure (caller should try fallback).
+        Returns True on success or permanent failure (stop retrying).
+        Returns False on transient failure (caller should retry).
         """
         cfg = self._get_config()
         if cfg is None or not cfg.TELEGRAM_USERNAME:
-            return False
+            return True  # Config gone — skip silently
 
         client = self._get_openalgo_client()
         if client is None:
-            return False
+            return True  # Client construction failed permanently — skip
 
         try:
             resp = client.telegram(
@@ -222,106 +174,26 @@ class TelegramNotifier:
             warn(f"OpenAlgo Telegram API failed: {exc}")
             return False
 
-    # ── FALLBACK: Direct Telegram Bot API ───────────────────────────────────
-
-    def _send_via_bot_api(self, text: str) -> bool:
-        """
-        Send via direct Telegram Bot API (fallback).
-
-        Used ONLY when OpenAlgo is unreachable, to notify the operator.
-        Returns True on success or permanent failure (stop retrying).
-        Returns False on transient failure (caller should retry).
-        """
-        cfg = self._get_config()
-        if cfg is None or not cfg.TELEGRAM_BOT_TOKEN or not cfg.TELEGRAM_CHAT_ID:
-            return True  # No fallback credentials — skip silently
-
-        url = f"{_TELEGRAM_API_BASE}/bot{cfg.TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            "chat_id": cfg.TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-        }
-
-        try:
-            resp = self._get_session().post(
-                url,
-                json=data,
-                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
-            )
-
-            if resp.status_code == 200:
-                debug("Telegram delivered via direct Bot API (fallback)")
-                return True
-
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", _BACKOFF_DELAYS[0]))
-                warn(f"Telegram Bot API 429 rate-limited — waiting {retry_after}s")
-                time.sleep(retry_after)
-                return False  # Signal retry; sleep already served — caller should skip its backoff
-
-            if 500 <= resp.status_code < 600:
-                warn(f"Telegram Bot API server error {resp.status_code} — will retry")
-                return False
-
-            error(f"Telegram Bot API permanent error {resp.status_code}: {resp.text[:200]}")
-            return True  # Stop retrying
-
-        except requests.exceptions.Timeout:
-            warn("Telegram Bot API timed out — will retry")
-            return False
-
-        except requests.exceptions.ConnectionError as exc:
-            warn(f"Telegram Bot API connection error: {exc} — will retry")
-            return False
-
-        except Exception as exc:
-            warn(f"Telegram Bot API unexpected error: {exc}")
-            return True  # Unknown — don't loop forever
-
-    # ── Send with retry (dual-path) ─────────────────────────────────────────
+    # ── Send with retry ───────────────────────────────────────────────────
 
     def _send_with_retry(self, text: str) -> None:
-        """
-        Attempt delivery: OpenAlgo first, direct Bot API fallback on failure.
-
-        If only Bot API credentials are configured (no OpenAlgo username),
-        sends directly via Bot API without trying OpenAlgo first.
-        """
+        """Attempt delivery up to _MAX_ATTEMPTS times with exponential backoff."""
         if not self._is_enabled():
             debug("Telegram disabled — skipping")
             return
 
-        # Primary: try OpenAlgo API if username is configured
-        if self._has_primary_channel():
-            if self._send_via_openalgo(text):
-                return
-            # OpenAlgo failed — fall through to Bot API
-            if not self._has_bot_api_fallback():
-                warn("OpenAlgo Telegram API failed and no Bot API fallback configured — message dropped")
-                return
-            warn("OpenAlgo Telegram API unreachable — falling back to direct Bot API")
-
-        # Bot API delivery (fallback, or sole channel if no username)
-        if not self._has_bot_api_fallback():
-            warn("No Telegram delivery channel available — message dropped")
-            return
-
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            success = self._send_via_bot_api(text)
-            if success:
+            if self._send_once(text):
                 return
 
-            # _send_via_bot_api already sleeps on 429, so only add
-            # extra backoff for non-429 transient failures
             if attempt < _MAX_ATTEMPTS:
                 delay = _BACKOFF_DELAYS[min(attempt - 1, len(_BACKOFF_DELAYS) - 1)]
-                debug(f"Bot API attempt {attempt} failed — retrying in {delay}s")
+                debug(f"Telegram attempt {attempt} failed — retrying in {delay}s")
                 time.sleep(delay)
 
         warn(
-            f"Telegram delivery failed after {_MAX_ATTEMPTS} Bot API attempts — "
-            "message dropped"
+            f"Telegram delivery failed after {_MAX_ATTEMPTS} attempts — "
+            "message dropped. Check OpenAlgo connection."
         )
 
     # ── Worker thread ───────────────────────────────────────────────────────
@@ -432,8 +304,7 @@ def flush(timeout: float = 10.0) -> bool:
 #
 #  Usage (from the strategy directory, using the algo_trading venv):
 #
-#    OPENALGO_APIKEY=x OPENALGO_USERNAME=your_user TELEGRAM_BOT_TOKEN=<token> \
-#    TELEGRAM_CHAT_ID=<id> python -m util.notifier
+#    OPENALGO_APIKEY=x OPENALGO_USERNAME=your_user python -m util.notifier
 #
 #    # Dry-run (disabled mode — verifies skip logic):
 #    python -m util.notifier --dry-run
@@ -493,14 +364,12 @@ if __name__ == "__main__":
 
     else:
         print(f"  Username   : {cfg.TELEGRAM_USERNAME}")
-        print(f"  Bot token  : {'***' + cfg.TELEGRAM_BOT_TOKEN[-6:] if cfg.TELEGRAM_BOT_TOKEN else '(not set — no fallback)'}")
-        print(f"  Chat ID    : {cfg.TELEGRAM_CHAT_ID or '(not set — no fallback)'}")
         print(f"  Strategy   : {cfg.STRATEGY_NAME}  v{_get_version()}")
         print()
-        print("  Sending test messages — check your Telegram chat...")
+        print("  Sending test messages via OpenAlgo — check your Telegram chat...")
         print()
 
-        notify("🧪 <b>Notifier self-test</b>\nDelivery: OpenAlgo API (primary) → Bot API (fallback)")
+        notify("🧪 <b>Notifier self-test</b>\nDelivery via OpenAlgo Telegram API")
         notify(f"html_escape test: VIX {html_escape('14.5 < 18.0 & > 12.0')}")
         notify("This is the final test message. If you see all 3, delivery is working ✓")
 
@@ -511,7 +380,7 @@ if __name__ == "__main__":
         if delivered:
             print("  Flush completed — all messages delivered ✓")
         else:
-            print("  Flush TIMED OUT — check network / credentials")
+            print("  Flush TIMED OUT — check OpenAlgo connection / credentials")
             sys.exit(1)
 
     print("─" * 72)

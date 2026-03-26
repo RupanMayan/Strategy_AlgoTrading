@@ -27,8 +27,7 @@ Usage:
 
 Environment variable overrides (take precedence over config.toml values):
     OPENALGO_APIKEY      → connection.api_key
-    TELEGRAM_BOT_TOKEN   → telegram.bot_token
-    TELEGRAM_CHAT_ID     → telegram.chat_id
+    OPENALGO_USERNAME    → telegram.username
 
 Config file location:
     Resolved relative to this file's parent directory (one level up from util/).
@@ -47,7 +46,7 @@ from pathlib import Path
 
 # ── .env loader ──────────────────────────────────────────────────────────────
 # Load .env file BEFORE any os.getenv() calls so environment variable
-# overrides for secrets (OPENALGO_APIKEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+# overrides for secrets (OPENALGO_APIKEY, OPENALGO_USERNAME)
 # are available without requiring the user to export them in the shell.
 try:
     from dotenv import load_dotenv
@@ -236,11 +235,9 @@ class Config:
     WEBSOCKET_STALENESS_S:       float  # cache staleness threshold (seconds)
     WEBSOCKET_RECONNECT_MAX_S:   float  # max backoff between reconnects
 
-    # ── Section 10 — Telegram (via OpenAlgo + direct Bot API fallback) ────
+    # ── Section 10 — Telegram (via OpenAlgo) ────────────────────────────────
     TELEGRAM_ENABLED:   bool
-    TELEGRAM_USERNAME:  str   # OpenAlgo login username — primary channel
-    TELEGRAM_BOT_TOKEN: str   # Direct Bot API fallback (when OpenAlgo is down)
-    TELEGRAM_CHAT_ID:   str   # Direct Bot API fallback (when OpenAlgo is down)
+    TELEGRAM_USERNAME:  str   # OpenAlgo login username
 
     # ── Section 11 — State & Log Files ───────────────────────────────────────
     STATE_FILE:                 str
@@ -485,24 +482,12 @@ class Config:
             )
 
         # ── Section 10 — Telegram ────────────────────────────────────────────
-        if self.TELEGRAM_ENABLED:
-            has_username = bool(self.TELEGRAM_USERNAME)
-            has_token    = bool(self.TELEGRAM_BOT_TOKEN)
-            has_chat     = bool(self.TELEGRAM_CHAT_ID)
-            has_bot_api  = has_token and has_chat
-            # At least one delivery channel must be configured
-            if not has_username and not has_bot_api:
-                errors.append(
-                    "[telegram] at least one delivery channel required when enabled = true:\n"
-                    "    • Primary: set username (OPENALGO_USERNAME env var)\n"
-                    "    • Fallback: set both bot_token and chat_id"
-                )
-            # bot_token + chat_id must both be set or both empty
-            if has_token != has_chat:
-                errors.append(
-                    "[telegram] bot_token and chat_id must both be set for the "
-                    "direct Bot API fallback — currently only one is configured"
-                )
+        if self.TELEGRAM_ENABLED and not self.TELEGRAM_USERNAME:
+            errors.append(
+                "[telegram] username is required when enabled = true — "
+                "set in config.toml or export OPENALGO_USERNAME "
+                "(this is your OpenAlgo login username)"
+            )
 
         # ── Section 11 — Files ───────────────────────────────────────────────
         if not self.STATE_FILE:
@@ -653,8 +638,6 @@ class Config:
         # ── Environment variable overrides ────────────────────────────────────
         api_key     = os.getenv("OPENALGO_APIKEY")    or conn.get("api_key",    "")
         tg_username = os.getenv("OPENALGO_USERNAME")  or tg.get("username",     "")
-        tg_token    = os.getenv("TELEGRAM_BOT_TOKEN") or tg.get("bot_token",    "")
-        tg_chatid   = os.getenv("TELEGRAM_CHAT_ID")   or tg.get("chat_id",      "")
 
         # ── Derived values ────────────────────────────────────────────────────
         number_of_lots = int(inst.get("number_of_lots", 1))
@@ -847,11 +830,9 @@ class Config:
             WEBSOCKET_STALENESS_S     = float(wscfg.get("staleness_timeout_s",  60)),
             WEBSOCKET_RECONNECT_MAX_S = float(wscfg.get("reconnect_max_delay_s", 30)),
 
-            # Section 10 — Telegram (via OpenAlgo + direct Bot API fallback)
+            # Section 10 — Telegram (via OpenAlgo)
             TELEGRAM_ENABLED   = bool(tg.get("enabled", True)),
             TELEGRAM_USERNAME  = tg_username,
-            TELEGRAM_BOT_TOKEN = tg_token,
-            TELEGRAM_CHAT_ID   = str(tg_chatid),
 
             # Section 11 — State & Log Files
             STATE_FILE                 = resolved_state_file,
@@ -943,7 +924,7 @@ if __name__ == "__main__":
     print("═" * 72)
 
     all_values = dataclasses.asdict(loaded)
-    for sensitive in ("OPENALGO_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+    for sensitive in ("OPENALGO_API_KEY",):
         if all_values.get(sensitive):
             all_values[sensitive] = "***"
 

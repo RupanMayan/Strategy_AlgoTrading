@@ -894,20 +894,16 @@ reconnect_max_delay_s = 30      # Max backoff between reconnection attempts
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  SECTION 10 — TELEGRAM ALERTS
-#  Primary:  OpenAlgo's Telegram API (/api/v1/telegram/notify)
-#            Requires: bot running in OpenAlgo + user linked via /link command
-#            username = your OpenAlgo login username (NOT Telegram username)
-#  Fallback: Direct Telegram Bot API (used only if OpenAlgo is unreachable)
-#            Requires: bot_token from @BotFather + chat_id from @userinfobot
-#  Leave fields blank → loaded from env vars (see .env)
+#  SECTION 10 — TELEGRAM ALERTS (via OpenAlgo)
+#  Uses OpenAlgo's Telegram API (/api/v1/telegram/notify)
+#  Requires: bot running in OpenAlgo + user linked via /link command
+#  username = your OpenAlgo login username (NOT Telegram username)
+#  Leave blank → loaded from env var OPENALGO_USERNAME (see .env)
 # ──────────────────────────────────────────────────────────────────────────────
 
 [telegram]
 enabled   = true
 username  = ""   # OpenAlgo login username → loaded from env OPENALGO_USERNAME
-bot_token = ""   # Fallback only → loaded from env TELEGRAM_BOT_TOKEN (see .env)
-chat_id   = ""   # Fallback only → loaded from env TELEGRAM_CHAT_ID (see .env)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
