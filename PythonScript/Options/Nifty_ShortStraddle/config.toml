@@ -853,12 +853,14 @@ trail_pct    = 40.0   # Exit if combined decay retraces 40 points from peak
 # ──────────────────────────────────────────────────────────────────────────────
 #  SECTION 8 — EXPIRY
 #  Format : DDMMMYY uppercase  e.g. "25MAR26"
-#  auto_expiry = true → resolves the nearest Tuesday automatically every day.
+#  auto_expiry = true → fetches the next expiry from OpenAlgo expiry API.
+#    Falls back to nearest Tuesday calculation if the API is unavailable.
+#    Handles holidays automatically (API returns actual trading expiry dates).
 #  manual_expiry is used only when auto_expiry = false (must be a Tuesday).
 # ──────────────────────────────────────────────────────────────────────────────
 
 [expiry]
-auto_expiry   = true          # true = auto nearest Tuesday (NIFTY weekly expiry day)
+auto_expiry   = true          # true = fetch next expiry via OpenAlgo API (with Tuesday fallback)
 manual_expiry = "25MAR26"     # Used only when auto_expiry = false  (must be a Tuesday)
 
 

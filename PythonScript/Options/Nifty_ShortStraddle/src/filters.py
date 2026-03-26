@@ -10,8 +10,8 @@ Gates (short-circuit order, cheapest first):
   4. Opening Range (ORB) filter    (orb_filter_ok)
 
 Expiry helpers (used by job_entry and StrategyCore):
-  _nearest_tuesday_date(), nearest_tuesday_expiry(),
-  get_expiry(), _get_expiry_date_silent(), get_dte()
+  _fetch_expiry_from_api(), _nearest_tuesday_date(),
+  nearest_expiry(), get_expiry(), _get_expiry_date_silent(), get_dte()
 ═══════════════════════════════════════════════════════════════════════
 """
 
@@ -22,10 +22,11 @@ from typing import TYPE_CHECKING
 
 from src._shared import (
     cfg, state,
-    info, warn, debug,
+    info, warn, error, debug,
     telegram,
     fetch_ltp,
-    INDEX_EXCH,
+    _get_client,
+    INDEX_EXCH, OPTION_EXCH,
     DAY_NAMES, MONTH_NAMES,
     now_ist,
 )
@@ -45,8 +46,8 @@ class FilterEngine:
       4. Opening Range (ORB) filter    (orb_filter_ok)
 
     Expiry helpers (used by job_entry and StrategyCore) also live here:
-      _nearest_tuesday_date(), nearest_tuesday_expiry(),
-      get_expiry(), _get_expiry_date_silent(), get_dte()
+      _fetch_expiry_from_api(), _nearest_tuesday_date(),
+      nearest_expiry(), get_expiry(), _get_expiry_date_silent(), get_dte()
     """
 
     def __init__(self, vix_manager: "VIXManager") -> None:
@@ -54,17 +55,56 @@ class FilterEngine:
 
     # ── Expiry helpers ────────────────────────────────────────────────────────
 
+    # Cache: stores (resolved_date, timestamp) to avoid repeated API calls
+    _expiry_cache: tuple[date, datetime] | None = None
+    _CACHE_TTL_SECONDS: int = 300  # 5-minute cache
+
+    def _fetch_expiry_from_api(self) -> date | None:
+        """
+        Fetch the nearest expiry date from OpenAlgo's expiry API.
+
+        Calls: POST /api/v1/expiry with symbol=NIFTY, exchange=NFO,
+        instrumenttype=options.  Returns the first (nearest) expiry date
+        that is >= today (or today if time < 15:30 IST on expiry day).
+
+        Returns None on any failure so the caller can fall back.
+        """
+        try:
+            resp = _get_client().expiry(
+                symbol=cfg.UNDERLYING,
+                exchange=OPTION_EXCH,
+                instrumenttype="options",
+            )
+            if resp.get("status") != "success" or not resp.get("data"):
+                warn(f"Expiry API returned unexpected response: {resp}")
+                return None
+
+            now   = now_ist()
+            today = now.date()
+            past_cutoff = (now.hour, now.minute) >= (15, 30)
+
+            # API returns dates as "DD-MMM-YY" sorted chronologically
+            for date_str in resp["data"]:
+                expiry_date = datetime.strptime(date_str, "%d-%b-%Y").date()
+                if expiry_date > today:
+                    return expiry_date
+                if expiry_date == today and not past_cutoff:
+                    return expiry_date
+
+            warn("Expiry API: no valid future expiry found in response")
+            return None
+        except Exception as exc:
+            warn(f"Expiry API call failed: {exc}")
+            return None
+
     def _nearest_tuesday_date(self) -> date:
         """
-        Compute nearest NIFTY weekly expiry date (Tuesday) silently — no logging.
+        Fallback: compute nearest NIFTY weekly expiry date (Tuesday).
+
+        Used only when the OpenAlgo expiry API is unreachable.
 
         NSE EXPIRY: NIFTY 50 weekly options expire every TUESDAY
         (effective September 2, 2025 per SEBI F&O restructuring).
-
-        Logic:
-          • Today IS Tuesday AND time < 15:30 IST  → use today
-          • Today IS Tuesday AND time >= 15:30 IST → use next Tuesday
-          • Any other weekday                       → next upcoming Tuesday
         """
         now        = now_ist()
         today      = now.date()
@@ -75,20 +115,55 @@ class FilterEngine:
 
         return today + timedelta(days=days_ahead)
 
-    def nearest_tuesday_expiry(self) -> str:
+    def _resolve_expiry_date(self, silent: bool = False) -> date:
         """
-        Return nearest NIFTY weekly expiry (TUESDAY) as DDMMMYY string, with logging.
+        Resolve the next expiry date using API with fallback.
+
+        Uses a 5-minute cache to avoid hammering the API on every monitor tick.
+        Falls back to Tuesday calculation if the API is unavailable.
+        """
+        now = now_ist()
+
+        # Return cached value if still fresh
+        if self._expiry_cache is not None:
+            cached_date, cached_at = self._expiry_cache
+            if (now - cached_at).total_seconds() < self._CACHE_TTL_SECONDS:
+                return cached_date
+
+        # Try API first
+        api_date = self._fetch_expiry_from_api()
+        if api_date is not None:
+            FilterEngine._expiry_cache = (api_date, now)
+            if not silent:
+                info(
+                    f"Expiry from API: {api_date.strftime('%d%b%y').upper()}  "
+                    f"(date: {api_date}, {api_date.strftime('%A')})"
+                )
+            return api_date
+
+        # Fallback to Tuesday calculation
+        fallback = self._nearest_tuesday_date()
+        FilterEngine._expiry_cache = (fallback, now)
+        if not silent:
+            warn(
+                f"Expiry API unavailable — fallback to Tuesday: "
+                f"{fallback.strftime('%d%b%y').upper()}  "
+                f"(date: {fallback}, {fallback.strftime('%A')})"
+            )
+        return fallback
+
+    def nearest_expiry(self) -> str:
+        """
+        Return nearest NIFTY weekly expiry as DDMMMYY string, with logging.
         Called only in get_expiry() — once per entry flow.
         """
-        expiry = self._nearest_tuesday_date()
-        result = expiry.strftime("%d%b%y").upper()
-        info(f"Auto expiry: {result}  (date: {expiry}, {expiry.strftime('%A')})")
-        return result
+        expiry = self._resolve_expiry_date(silent=False)
+        return expiry.strftime("%d%b%y").upper()
 
     def get_expiry(self) -> str:
         """Return the active expiry string based on cfg.AUTO_EXPIRY setting."""
         if cfg.AUTO_EXPIRY:
-            return self.nearest_tuesday_expiry()
+            return self.nearest_expiry()
         info(f"Manual expiry: {cfg.MANUAL_EXPIRY}")
         return cfg.MANUAL_EXPIRY
 
@@ -98,11 +173,11 @@ class FilterEngine:
         Used by get_dte() and _print_banner() to avoid log noise on every tick.
         """
         if cfg.AUTO_EXPIRY:
-            return self._nearest_tuesday_date()
+            return self._resolve_expiry_date(silent=True)
         try:
             return datetime.strptime(cfg.MANUAL_EXPIRY, "%d%b%y").date()
         except Exception:
-            return self._nearest_tuesday_date()
+            return self._resolve_expiry_date(silent=True)
 
     def get_dte(self) -> int:
         """
