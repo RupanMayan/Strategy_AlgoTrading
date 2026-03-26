@@ -4,7 +4,7 @@ SELL ATM CE + PE | Weekly Expiry | Intraday MIS | Independent Per-Leg SL
 """
 
 from __future__ import annotations
-import os, json, threading, time, signal
+import os, sys, json, threading, time, signal
 from datetime import datetime, timedelta
 
 import pytz
@@ -1233,6 +1233,7 @@ class NiftyShortStraddle:
         self._stop_event = threading.Event()
         self._entry_done_today = False
         self._daily_reset_done = False
+        self._shutdown_done = False
 
     def run(self):
         plog_sep()
@@ -1349,25 +1350,21 @@ class NiftyShortStraddle:
 
     def _handle_signal(self, signum, _frame):
         plog(f"Signal {signum} received — shutting down")
-        if state["in_position"]:
-            plog("Shutdown with open position — closing all")
-            self.engine.close_all("Script Shutdown")
-        telegram.flush()
-        telegram.send_sync("Strategy Stopped — Nifty Short Straddle")
-        plog("Shutdown complete")
-        ws_feed.stop()
-        telegram.stop()
-        os._exit(0)
+        self._shutdown()
+        sys.exit(0)
 
     def _shutdown(self):
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         if state["in_position"]:
             plog("Shutdown with open position — closing all")
             self.engine.close_all("Script Shutdown")
         telegram.flush()
         telegram.send_sync("Strategy Stopped — Nifty Short Straddle")
-        plog("Shutdown complete")
         ws_feed.stop()
         telegram.stop()
+        plog("Shutdown complete")
 
     # ── Manual utilities ──
 
