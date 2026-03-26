@@ -221,6 +221,11 @@ class TelegramNotifier:
                 plog(f"Telegram attempt {attempt+1}: {exc}", "WARNING")
             time.sleep(1 * (attempt + 1))
 
+    def send_sync(self, msg: str):
+        if not TELEGRAM_ENABLED or not TELEGRAM_USER:
+            return
+        self._send(msg)
+
     def flush(self):
         for _ in range(50):
             with self._lock:
@@ -1351,9 +1356,9 @@ class NiftyShortStraddle:
             plog("Shutdown with open position — closing all")
             self.engine.close_all("Script Shutdown")
         plog("Shutdown complete")
-        telegram.notify("Strategy Stopped — Nifty Short Straddle")
-        ws_feed.stop()
         telegram.flush()
+        telegram.send_sync("Strategy Stopped — Nifty Short Straddle")
+        ws_feed.stop()
         telegram.stop()
 
     # ── Manual utilities ──
