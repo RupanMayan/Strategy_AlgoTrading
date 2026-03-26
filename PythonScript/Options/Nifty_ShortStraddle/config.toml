@@ -97,17 +97,24 @@ strike_offset  = "ATM"         # ATM | OTM1..OTM5 | ITM1..ITM5
 # ──────────────────────────────────────────────────────────────────────────────
 
 [timing]
-entry_time         = "09:30"   # Fallback entry time when use_dte_entry_map = false
+entry_time         = "09:17"   # Fixed 09:17 for ALL DTEs — backtest-optimised (was DTE-based)
+                               # Phase 2 backtest: fixed 09:17 beats DTE-based by ₹2.97L (+29%)
+                               # over 5 years with better win rate (69.7% vs 66.0%), better max DD
+                               # (-₹11,516 vs -₹13,135), and best Calmar ratio (114.2 vs 77.5).
+                               # Captures maximum opening IV premium (15-25% inflated in first 2 min).
 exit_time          = "15:15"   # Hard square-off — closes ALL remaining open legs
 monitor_interval_s = 5         # Seconds between P&L / SL checks (reduced from 15s — WebSocket feeds LTP cache)
-use_dte_entry_map  = true      # true = use map below | false = use entry_time for all
+use_dte_entry_map  = false     # Backtest-optimised: DISABLED (was true)
+                               # Fixed 09:17 outperforms DTE-aware entry across all metrics.
+                               # DTE delays (09:35-09:45 for DTE2-4) miss the IV premium window
+                               # without meaningfully reducing false SL hits.
 
-[timing.dte_entry_time_map]  # DTE → entry time (used when use_dte_entry_map = true)
-"0" = "09:30"   # DTE0 = Tuesday   (expiry day)    — gap settled, max theta day
-"1" = "09:30"   # DTE1 = Monday    (1 day out)     — strong theta, same rationale
-"2" = "09:35"   # DTE2 = Friday    (2 days out)    — moderate theta, cleaner fill
-"3" = "09:40"   # DTE3 = Thursday  (3 days out)    — lower premium, avoid open spike
-"4" = "09:45"   # DTE4 = Wednesday (4 days out)    — thin premium, no rush
+[timing.dte_entry_time_map]  # Preserved for reference — not used when use_dte_entry_map = false
+"0" = "09:30"   # DTE0 = Tuesday   (expiry day)
+"1" = "09:30"   # DTE1 = Monday
+"2" = "09:35"   # DTE2 = Friday
+"3" = "09:40"   # DTE3 = Thursday
+"4" = "09:45"   # DTE4 = Wednesday
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -269,7 +276,10 @@ vix_update_time      = "15:30" # IST time to auto-append today's VIX to history 
 # ──────────────────────────────────────────────────────────────────────────────
 
 [orb_filter]
-enabled       = true
+enabled       = false  # Backtest-optimised: DISABLED (was true)
+                       # Phase 2 backtest: ORB filter costs ₹65K over 5 years for only ₹443
+                       # max DD improvement. Daily loss limit (-₹6K) already caps gap-open risk.
+                       # Core logic without ORB delivers best P&L (₹10.18L), Sharpe (16.28).
 capture_time  = "09:17"   # Capture NIFTY reference price 2 min after open
 max_move_pct  = 0.5       # Skip trade if NIFTY moved > 0.5% from ORB price
 
@@ -762,8 +772,12 @@ trail_pct              = 50.0    # Exit if recovery retraces 50% from peak
 # ──────────────────────────────────────────────────────────────────────────────
 
 [filters.momentum]
-enabled       = true
-max_drift_pct = 0.5   # Block re-entry when NIFTY has drifted > 0.5% from ORB reference
+enabled       = false  # Backtest-optimised: DISABLED (was true)
+                       # Phase 2 backtest showed momentum filter is redundant — re-entry is
+                       # already guarded by 45-min cooldown + ₹2K loss cap + 2/day max.
+                       # Enabling costs ~₹32K over 5 years with zero drawdown improvement.
+                       # ORB filter alone provides the same max DD reduction (-₹12,692).
+max_drift_pct = 0.5    # Block re-entry when NIFTY has drifted > 0.5% from ORB reference
 
 
 # ──────────────────────────────────────────────────────────────────────────────

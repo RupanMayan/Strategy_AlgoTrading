@@ -9,11 +9,11 @@ lot_size       = 65
 number_of_lots = 1
 
 [timing]
-entry_time         = "09:30"
+entry_time         = "09:17"   # Fixed 09:17 — best P&L, win rate, max DD, and Calmar across all times tested
 exit_time          = "15:15"
-use_dte_entry_map  = true
+use_dte_entry_map  = false     # DISABLED — fixed 09:17 beats DTE-based by +29%
 
-[timing.dte_entry_time_map]
+[timing.dte_entry_time_map]    # Preserved for reference — not used
 "0" = "09:30"
 "1" = "09:30"
 "2" = "09:35"
@@ -90,6 +90,23 @@ ivr_filter_enabled = false   # DISABLED — skips too many profitable days
 ivr_min            = 30.0
 ivp_filter_enabled = false   # DISABLED
 ivp_min            = 40.0
+
+# ── Phase 2 Filters (matching production config.toml) ──
+[orb_filter]
+enabled      = false  # DISABLED — costs ₹65K/5yr for ₹443 DD improvement. Not worth it.
+capture_time = "09:17"
+max_move_pct = 0.5
+
+[risk.vix_spike_monitor]
+enabled          = false  # DISABLED for backtest — option IV is not a reliable VIX proxy
+                          # (IV spikes on delta/gamma moves, not just volatility expansion)
+                          # Requires real intraday India VIX data for accurate simulation
+threshold_pct    = 15.0   # % rise from entry VIX triggers exit
+abs_floor        = 18.0   # Minimum absolute VIX required to confirm a spike exit
+
+[risk.momentum_filter]
+enabled          = false   # DISABLED — over-filtering, re-entry already guarded by cooldown+loss cap+max/day
+max_drift_pct    = 0.5     # Block re-entry if NIFTY drifted > 0.5% from ORB price
 
 [backtest]
 from_date    = "2021-03-22"

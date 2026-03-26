@@ -305,6 +305,17 @@ def simulate_day(
     day_df = day_df.copy()
     day_df["time"] = day_df["timestamp"].dt.time
 
+    # ── ORB Filter (Phase 2) ──
+    orb_cfg = config.get("orb_filter", {})
+    orb_enabled = orb_cfg.get("enabled", False)
+    orb_price = None
+    if orb_enabled and start_after is None:  # Only for first trade, not re-entry
+        capture_time_str = orb_cfg.get("capture_time", "09:17")
+        capture_time = datetime.strptime(capture_time_str, "%H:%M").time()
+        orb_candles = day_df[day_df["time"] == capture_time]
+        if not orb_candles.empty:
+            orb_price = orb_candles.iloc[0].get("spot")
+
     # For re-entry, find first candle after start_after
     if start_after is not None:
         entry_candles = day_df[
@@ -320,6 +331,13 @@ def simulate_day(
     ce_entry = entry_row.get("ce_close")
     pe_entry = entry_row.get("pe_close")
     spot_at_entry = entry_row.get("spot")
+
+    # ── ORB Filter check: skip if NIFTY moved > max_move_pct from ORB price ──
+    if orb_enabled and orb_price and orb_price > 0 and spot_at_entry and spot_at_entry > 0:
+        if start_after is None:  # Only for first trade
+            move_pct = abs(spot_at_entry - orb_price) / orb_price * 100
+            if move_pct > orb_cfg.get("max_move_pct", 0.5):
+                return None  # ORB filter: skip this day
 
     if pd.isna(ce_entry) or pd.isna(pe_entry) or ce_entry <= 0 or pe_entry <= 0:
         return None
@@ -446,6 +464,19 @@ def simulate_day(
     pe_defer_start = None
 
     entry_timestamp = entry_row["timestamp"]
+
+    # ── VIX Spike Monitor (Phase 2) — use avg(CE_IV, PE_IV) as intraday VIX proxy ──
+    vix_spike_cfg = risk_cfg.get("vix_spike_monitor", {})
+    vix_spike_enabled = vix_spike_cfg.get("enabled", False)
+    vix_spike_threshold_pct = vix_spike_cfg.get("threshold_pct", 15.0)
+    vix_spike_abs_floor = vix_spike_cfg.get("abs_floor", 18.0)
+    entry_iv = None
+    if vix_spike_enabled:
+        ce_iv_entry = entry_row.get("ce_iv")
+        pe_iv_entry = entry_row.get("pe_iv")
+        if ce_iv_entry and pe_iv_entry and not pd.isna(ce_iv_entry) and not pd.isna(pe_iv_entry):
+            if ce_iv_entry > 0 and pe_iv_entry > 0:
+                entry_iv = (ce_iv_entry + pe_iv_entry) / 2.0
 
     for _, row in monitor_df.iterrows():
         current_time = row["time"]
@@ -751,6 +782,28 @@ def simulate_day(
                     break
 
         # ══════════════════════════════════════════════════════════
+        # 8B. VIX SPIKE MONITOR (Phase 2 — IV proxy)
+        # ══════════════════════════════════════════════════════════
+        if vix_spike_enabled and entry_iv and (ce_active or pe_active):
+            curr_ce_iv = row.get("ce_iv", 0)
+            curr_pe_iv = row.get("pe_iv", 0)
+            if (curr_ce_iv and curr_pe_iv and not pd.isna(curr_ce_iv)
+                    and not pd.isna(curr_pe_iv) and curr_ce_iv > 0 and curr_pe_iv > 0):
+                current_iv = (curr_ce_iv + curr_pe_iv) / 2.0
+                iv_change_pct = (current_iv - entry_iv) / entry_iv * 100
+                if iv_change_pct >= vix_spike_threshold_pct and current_iv >= vix_spike_abs_floor:
+                    if ce_active:
+                        ce_exit_price = ce_ltp
+                        ce_exit_time = current_ts
+                        ce_active = False
+                    if pe_active:
+                        pe_exit_price = pe_ltp
+                        pe_exit_time = current_ts
+                        pe_active = False
+                    exit_reason = f"vix_spike_{iv_change_pct:.0f}pct"
+                    break
+
+        # ══════════════════════════════════════════════════════════
         # 9. DAILY LIMITS
         # ══════════════════════════════════════════════════════════
         if running_pnl >= profit_target:
@@ -858,6 +911,7 @@ def simulate_day(
         "pe_exit_time": str(pe_exit_time) if pe_exit_time else None,
         "trade_number": trade_number,
         "_last_exit_ts": last_exit_ts,  # Internal: for re-entry chaining
+        "_orb_price": orb_price,  # Internal: for momentum filter in re-entry
     }
 
 
@@ -889,6 +943,18 @@ def run_backtest(config: dict) -> pd.DataFrame:
     reentry_cooldown_min = reentry_cfg.get("cooldown_min", 30)
     reentry_max_loss = reentry_cfg.get("max_loss_per_lot", 3000) * config["instrument"]["number_of_lots"]
 
+    # Momentum filter config (Phase 2)
+    momentum_cfg = config.get("risk", {}).get("momentum_filter", {})
+    momentum_enabled = momentum_cfg.get("enabled", False)
+    momentum_max_drift_pct = momentum_cfg.get("max_drift_pct", 0.5)
+
+    # ORB filter config for logging
+    orb_cfg = config.get("orb_filter", {})
+    orb_enabled = orb_cfg.get("enabled", False)
+    orb_skipped = 0
+    vix_spike_exits = 0
+    momentum_blocked = 0
+
     trades = []
     for trading_date, day_df in tqdm(grouped, desc="Backtesting"):
         if not is_trading_day(trading_date):
@@ -903,13 +969,26 @@ def run_backtest(config: dict) -> pd.DataFrame:
         # First trade of the day
         result = simulate_day(day_df, trading_date, config)
         if not result:
+            # Could be ORB filter skip — check if it was a valid trading day
+            if orb_enabled:
+                dte = compute_dte(trading_date)
+                bt_cfg = config["backtest"]
+                if (dte in bt_cfg["trade_dte"] and
+                        trading_date.month not in bt_cfg["skip_months"] and
+                        is_trading_day(trading_date)):
+                    orb_skipped += 1
             continue
         trades.append(result)
+
+        # Track VIX spike exits
+        if result.get("exit_reason", "").startswith("vix_spike"):
+            vix_spike_exits += 1
 
         # Re-entry loop
         if reentry_enabled:
             reentry_count = 0
             cumulative_pnl = result["total_pnl"]
+            day_orb_price = result.get("_orb_price")
 
             while reentry_count < reentry_max_per_day:
                 # Only re-enter after early exits (not hard_exit or profit_target)
@@ -919,6 +998,23 @@ def run_backtest(config: dict) -> pd.DataFrame:
                 # Check loss threshold
                 if result["total_pnl"] < 0 and abs(result["total_pnl"]) > reentry_max_loss:
                     break
+
+                # ── Momentum filter (Phase 2): block re-entry if NIFTY drifted too far ──
+                if momentum_enabled and day_orb_price and day_orb_price > 0:
+                    last_exit_spot = result.get("spot_at_entry", 0)  # approx
+                    # Use last exit timestamp to find actual spot
+                    _let = result.get("_last_exit_ts")
+                    if _let is not None:
+                        if not isinstance(_let, pd.Timestamp):
+                            _let = pd.Timestamp(_let)
+                        exit_candles = day_df[day_df["timestamp"] <= _let]
+                        if not exit_candles.empty:
+                            last_exit_spot = exit_candles.iloc[-1].get("spot", last_exit_spot)
+                    if last_exit_spot and last_exit_spot > 0:
+                        drift_pct = abs(last_exit_spot - day_orb_price) / day_orb_price * 100
+                        if drift_pct > momentum_max_drift_pct:
+                            momentum_blocked += 1
+                            break
 
                 # Calculate re-entry time (exit + cooldown)
                 last_exit_ts = result.get("_last_exit_ts")
@@ -943,12 +1039,22 @@ def run_backtest(config: dict) -> pd.DataFrame:
                 trades.append(result)
                 cumulative_pnl += result["total_pnl"]
 
+                # Track VIX spike exits from re-entry
+                if result.get("exit_reason", "").startswith("vix_spike"):
+                    vix_spike_exits += 1
+
     if not trades:
         log.error("No trades generated!")
         sys.exit(1)
 
     if vix_skipped > 0:
         log.info(f"VIX/IVR/IVP filter skipped {vix_skipped} trading days")
+    if orb_skipped > 0:
+        log.info(f"ORB filter skipped {orb_skipped} trading days")
+    if vix_spike_exits > 0:
+        log.info(f"VIX spike monitor triggered {vix_spike_exits} early exits")
+    if momentum_blocked > 0:
+        log.info(f"Momentum filter blocked {momentum_blocked} re-entries")
 
     trades_df = pd.DataFrame(trades)
     log.info(f"Generated {len(trades_df)} trades")
