@@ -4,7 +4,7 @@ SELL ATM CE + PE | Weekly Expiry | Intraday MIS | Independent Per-Leg SL
 """
 
 from __future__ import annotations
-import os, sys, json, threading, time, signal
+import os, json, threading, time, signal
 from datetime import datetime, timedelta
 
 import pytz
@@ -14,9 +14,9 @@ from openalgo import api as OpenAlgo
 #  CONFIGURATION — All backtest-optimised parameters
 # ─────────────────────────────────────────────────────────────────────────────
 
-OPENALGO_HOST    = os.environ.get("OPENALGO_HOST", "https://myalgo.algotradings.in/")
-OPENALGO_API_KEY = os.environ.get("OPENALGO_APIKEY", "2e8cc05401595296ec2bd91d3f79ff378909ff4978b00b13bedc80c56fc97a2f")
-TELEGRAM_USER    = os.environ.get("OPENALGO_USERNAME", "rupanmayan")
+OPENALGO_HOST    = os.environ.get("OPENALGO_HOST", "http://127.0.0.1:5000")
+OPENALGO_API_KEY = os.environ.get("OPENALGO_APIKEY", "")
+TELEGRAM_USER    = os.environ.get("OPENALGO_USERNAME", "")
 
 UNDERLYING       = "NIFTY"
 EXCHANGE         = "NSE_INDEX"
@@ -458,12 +458,13 @@ def resolve_expiry() -> str | None:
         plog(f"Expiry API failed: {exc}", "WARNING")
 
     today = now_ist().date()
-    days_ahead = (1 - today.weekday()) % 7
-    if days_ahead == 0:
+    tue = 1
+    days_ahead = (tue - today.weekday()) % 7
+    if days_ahead == 0 and today.weekday() == tue:
         days_ahead = 0
+    elif days_ahead == 0:
+        days_ahead = 7
     nxt = today + timedelta(days=days_ahead)
-    if nxt < today:
-        nxt += timedelta(days=7)
     return nxt.strftime("%d%b%y").upper()
 
 def compute_dte(expiry_str: str) -> int:
@@ -730,6 +731,7 @@ class OrderEngine:
         plog(f"Closing {leg} ({symbol}): {reason}")
 
         fill_price = 0.0
+        order_sent = False
         for attempt in range(3):
             try:
                 resp = broker.get().placesmartorder({
@@ -739,6 +741,7 @@ class OrderEngine:
                     "position_size": 0,
                 })
                 if api_ok(resp):
+                    order_sent = True
                     time.sleep(2)
                     fill_price = fetch_ltp(symbol, OPTION_EXCH) or current_ltp
                     break
@@ -746,6 +749,11 @@ class OrderEngine:
             except Exception as exc:
                 plog(f"Close {leg} attempt {attempt+1} error: {exc}", "WARNING")
             time.sleep(1)
+
+        if not order_sent:
+            plog(f"CRITICAL: Could not close {leg} after 3 attempts — leg still open", "ERROR")
+            telegram.notify(f"🚨 CRITICAL: Failed to close {leg} ({symbol}) after 3 attempts. Position still open!")
+            return
 
         if fill_price <= 0:
             fill_price = current_ltp if current_ltp > 0 else fetch_ltp(symbol, OPTION_EXCH)
@@ -821,6 +829,7 @@ class OrderEngine:
 
         if len(legs) == 2:
             try:
+                fallback_legs = []
                 for leg in ["CE", "PE"]:
                     sym = state[f"symbol_{leg.lower()}"]
                     resp = broker.get().closeposition(
@@ -829,9 +838,19 @@ class OrderEngine:
                     )
                     if not api_ok(resp):
                         plog(f"closeposition({leg}) failed: {api_err(resp)} — trying smart order", "WARNING")
-                        self.close_one_leg(leg, reason)
-                        continue
+                        fallback_legs.append(leg)
 
+                if fallback_legs:
+                    for leg in fallback_legs:
+                        self.close_one_leg(leg, reason)
+                    remaining = active_legs()
+                    for leg in remaining:
+                        if leg not in fallback_legs:
+                            ltp = fetch_ltp(state[f"symbol_{leg.lower()}"], OPTION_EXCH)
+                            self.close_one_leg(leg, reason, current_ltp=ltp)
+                    return
+
+                time.sleep(2)
                 ltp_ce = fetch_ltp(state["symbol_ce"], OPTION_EXCH)
                 ltp_pe = fetch_ltp(state["symbol_pe"], OPTION_EXCH)
                 entry_ce = state["entry_price_ce"]
@@ -1276,13 +1295,13 @@ class NiftyShortStraddle:
             weekday = now.weekday()
 
             if weekday >= 5:
-                time.sleep(60)
+                self._stop_event.wait(60)
                 continue
 
             if hhmm < "09:15" or hhmm >= "15:30":
                 if hhmm >= "15:30" and not self._daily_reset_done:
                     self._daily_reset()
-                time.sleep(10)
+                self._stop_event.wait(10)
                 continue
 
             if not self._daily_reset_done and hhmm >= "09:15":
@@ -1304,7 +1323,7 @@ class NiftyShortStraddle:
             if state["in_position"]:
                 self.monitor.run_tick()
 
-            time.sleep(MONITOR_INTERVAL)
+            self._stop_event.wait(MONITOR_INTERVAL)
 
     def _try_entry(self):
         expiry = resolve_expiry()
@@ -1324,7 +1343,6 @@ class NiftyShortStraddle:
         if is_reentry:
             if not reentry_ok():
                 return
-            state["cumulative_daily_pnl"] += state.get("last_trade_pnl", 0)
             state["reentry_count_today"] += 1
             plog(f"Re-entry #{state['reentry_count_today']} — cumulative P&L ₹{state['cumulative_daily_pnl']:,.2f}")
 
@@ -1350,8 +1368,7 @@ class NiftyShortStraddle:
 
     def _handle_signal(self, signum, _frame):
         plog(f"Signal {signum} received — shutting down")
-        self._shutdown()
-        sys.exit(0)
+        self._stop_event.set()
 
     def _shutdown(self):
         if self._shutdown_done:
