@@ -1237,7 +1237,7 @@ class NiftyShortStraddle:
         plog_sep()
 
         telegram.start()
-        telegram.send("Strategy Started — Nifty Short Straddle v8.0\n"
+        telegram.notify("Strategy Started — Nifty Short Straddle v8.0\n"
                        f"Entry: {ENTRY_TIME} | Exit: {EXIT_TIME} | SL: {LEG_SL_PERCENT}%\n"
                        f"Lots: {NUMBER_OF_LOTS} × {LOT_SIZE} = {qty()}")
         ws_feed.subscribe_market_symbols()
@@ -1351,7 +1351,7 @@ class NiftyShortStraddle:
             plog("Shutdown with open position — closing all")
             self.engine.close_all("Script Shutdown")
         plog("Shutdown complete")
-        telegram.send("Strategy Stopped — Nifty Short Straddle")
+        telegram.notify("Strategy Stopped — Nifty Short Straddle")
         ws_feed.stop()
         telegram.flush()
         telegram.stop()
