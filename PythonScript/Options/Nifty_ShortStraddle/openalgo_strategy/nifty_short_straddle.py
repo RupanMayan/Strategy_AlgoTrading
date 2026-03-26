@@ -439,13 +439,16 @@ def fetch_vix() -> float:
 #  EXPIRY RESOLUTION
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _normalize_expiry(raw: str) -> str:
+    return raw.replace("-", "").upper()
+
 def resolve_expiry() -> str | None:
     try:
-        resp = broker.get().expiry(symbol=UNDERLYING, exchange=OPTION_EXCH)
+        resp = broker.get().expiry(symbol=UNDERLYING, exchange=OPTION_EXCH, instrumenttype="options")
         if api_ok(resp):
             expiries = resp.get("data", [])
             if expiries:
-                return expiries[0]
+                return _normalize_expiry(expiries[0])
     except Exception as exc:
         plog(f"Expiry API failed: {exc}", "WARNING")
 
@@ -460,7 +463,7 @@ def resolve_expiry() -> str | None:
 
 def compute_dte(expiry_str: str) -> int:
     try:
-        for fmt in ("%d%b%y", "%d%b%Y", "%Y-%m-%d"):
+        for fmt in ("%d-%b-%y", "%d%b%y", "%d-%b-%Y", "%d%b%Y", "%Y-%m-%d"):
             try:
                 exp_date = datetime.strptime(expiry_str.upper(), fmt).date()
                 break
