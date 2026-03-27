@@ -453,11 +453,12 @@ class WebSocketFeed:
                         msg_count += 1
                         if msg_count == 1:
                             plog(f"WS first tick: {sym} ₹{ltp:.2f}")
+                elif msg_type == "subscribe":
+                    pass  # subscription confirmation — expected
                 elif msg_type == "ping":
                     ws.send(json.dumps({"type": "pong"}))
-                else:
-                    if msg_count == 0:
-                        plog(f"WS unexpected message: {str(raw)[:200]}", "DEBUG")
+                elif msg_count == 0:
+                    plog(f"WS unexpected message: {str(raw)[:200]}", "DEBUG")
             except Exception as exc:
                 plog(f"WS receive loop ended: {exc}", "DEBUG")
                 break
