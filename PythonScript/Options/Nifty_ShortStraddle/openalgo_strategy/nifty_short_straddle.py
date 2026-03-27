@@ -21,7 +21,7 @@ TELEGRAM_USER    = os.environ.get("OPENALGO_USERNAME", "")
 UNDERLYING       = "NIFTY"
 EXCHANGE         = "NSE_INDEX"
 OPTION_EXCH      = "NFO"
-LOT_SIZE         = 75
+LOT_SIZE         = 65
 NUMBER_OF_LOTS   = 1
 PRODUCT          = "MIS"
 STRATEGY_NAME    = "Short Straddle"
@@ -467,6 +467,26 @@ def resolve_expiry() -> str | None:
     nxt = today + timedelta(days=days_ahead)
     return nxt.strftime("%d%b%y").upper()
 
+_holiday_cache: dict[int, set[str]] = {}
+
+def _load_holidays(year: int) -> set[str]:
+    if year in _holiday_cache:
+        return _holiday_cache[year]
+    holidays_set: set[str] = set()
+    try:
+        resp = broker.get().holidays(year=year)
+        if api_ok(resp):
+            for h in resp.get("data", []):
+                if h.get("holiday_type") == "TRADING_HOLIDAY":
+                    closed = [e.upper() for e in h.get("closed_exchanges", [])]
+                    if "NSE" in closed or "NFO" in closed:
+                        holidays_set.add(h["date"])
+        _holiday_cache[year] = holidays_set
+    except Exception as exc:
+        plog(f"Holiday API error: {exc}", "WARNING")
+        _holiday_cache[year] = holidays_set
+    return holidays_set
+
 def compute_dte(expiry_str: str) -> int:
     try:
         for fmt in ("%d-%b-%y", "%d%b%y", "%d-%b-%Y", "%d%b%Y", "%Y-%m-%d"):
@@ -478,11 +498,14 @@ def compute_dte(expiry_str: str) -> int:
         else:
             return -1
         today = now_ist().date()
+        holidays = _load_holidays(today.year)
+        if exp_date.year != today.year:
+            holidays = holidays | _load_holidays(exp_date.year)
         trading_days = 0
         d = today
         while d < exp_date:
             d += timedelta(days=1)
-            if d.weekday() < 5:
+            if d.weekday() < 5 and d.strftime("%Y-%m-%d") not in holidays:
                 trading_days += 1
         return trading_days
     except Exception:
@@ -559,7 +582,7 @@ def margin_check(symbol_ce: str, symbol_pe: str) -> bool:
             plog(f"Margin API error: {api_err(margin_resp)}", "WARNING")
             return MARGIN_FAIL_OPEN
 
-        required = float(margin_resp.get("data", {}).get("total_margin", 0) or 0)
+        required = float(margin_resp.get("data", {}).get("total_margin_required", 0) or 0)
         buffered = required * MARGIN_BUFFER
 
         state["margin_required"] = required
@@ -662,6 +685,26 @@ class OrderEngine:
                 spot = resp_spot
 
             plog(f"Multi-order OK: CE={symbol_ce} ({orderid_ce}), PE={symbol_pe} ({orderid_pe})")
+
+            # Verify order status at broker — catch rejections early
+            time.sleep(2)
+            for leg_name, oid in [("CE", orderid_ce), ("PE", orderid_pe)]:
+                if not oid:
+                    continue
+                try:
+                    os_resp = broker.get().orderstatus(order_id=oid, strategy=STRATEGY_NAME)
+                    if api_ok(os_resp):
+                        os_data = os_resp.get("data", {})
+                        os_status = os_data.get("order_status", "")
+                        if os_status in ("rejected", "cancelled"):
+                            plog(f"Entry {leg_name} order {oid} was {os_status} by broker", "ERROR")
+                            telegram.notify(f"❌ Entry {leg_name} order {os_status} by broker\nOrder ID: {oid}")
+                            broker.get().closeposition(strategy=STRATEGY_NAME)
+                            return False
+                        plog(f"Entry {leg_name} order verified: {os_status}")
+                except Exception as vexc:
+                    plog(f"Order verification {leg_name} failed: {vexc}", "WARNING")
+
         except Exception as exc:
             plog(f"Order placement exception: {exc}", "ERROR")
             return False
@@ -723,16 +766,30 @@ class OrderEngine:
 
     def _capture_fills(self):
         time.sleep(3)
-        for leg, sym_key, price_key in [("CE", "symbol_ce", "entry_price_ce"),
-                                          ("PE", "symbol_pe", "entry_price_pe")]:
-            for _ in range(5):
-                ltp = fetch_ltp(state[sym_key], OPTION_EXCH)
-                if ltp > 0:
-                    with _monitor_lock:
-                        if state[price_key] <= 0:
-                            state[price_key] = ltp
-                            plog(f"Fill captured {leg}: ₹{ltp:.2f}")
-                    break
+        for leg, oid_key, price_key in [("CE", "orderid_ce", "entry_price_ce"),
+                                          ("PE", "orderid_pe", "entry_price_pe")]:
+            order_id = state.get(oid_key, "")
+            if not order_id:
+                plog(f"Fill capture {leg}: no order ID — skipping", "WARNING")
+                continue
+            for attempt in range(5):
+                try:
+                    resp = broker.get().orderstatus(order_id=order_id, strategy=STRATEGY_NAME)
+                    if api_ok(resp):
+                        data = resp.get("data", {})
+                        avg_price = float(data.get("average_price", 0) or 0)
+                        order_status = data.get("order_status", "")
+                        if avg_price > 0 and order_status == "complete":
+                            with _monitor_lock:
+                                if state[price_key] <= 0:
+                                    state[price_key] = avg_price
+                                    plog(f"Fill captured {leg}: ₹{avg_price:.2f} (orderstatus)")
+                            break
+                        elif order_status in ("rejected", "cancelled"):
+                            plog(f"Fill capture {leg}: order {order_status}", "ERROR")
+                            break
+                except Exception as exc:
+                    plog(f"Fill capture {leg} attempt {attempt+1} error: {exc}", "WARNING")
                 time.sleep(2)
 
         with _monitor_lock:
@@ -758,6 +815,7 @@ class OrderEngine:
 
         fill_price = 0.0
         order_sent = False
+        exit_order_id = ""
         for attempt in range(3):
             try:
                 resp = broker.get().placesmartorder(
@@ -768,8 +826,17 @@ class OrderEngine:
                 )
                 if api_ok(resp):
                     order_sent = True
+                    exit_order_id = str(resp.get("data", {}).get("orderid", "") or resp.get("orderid", ""))
                     time.sleep(2)
-                    fill_price = fetch_ltp(symbol, OPTION_EXCH) or current_ltp
+                    if exit_order_id:
+                        try:
+                            os_resp = broker.get().orderstatus(order_id=exit_order_id, strategy=STRATEGY_NAME)
+                            if api_ok(os_resp):
+                                fill_price = float(os_resp.get("data", {}).get("average_price", 0) or 0)
+                        except Exception:
+                            pass
+                    if fill_price <= 0:
+                        fill_price = fetch_ltp(symbol, OPTION_EXCH) or current_ltp
                     break
                 plog(f"Close {leg} attempt {attempt+1} failed: {api_err(resp)}", "WARNING")
             except Exception as exc:
@@ -853,58 +920,7 @@ class OrderEngine:
         state["exit_reason"] = reason
         legs = active_legs()
 
-        if len(legs) == 2:
-            try:
-                fallback_legs = []
-                for leg in ["CE", "PE"]:
-                    sym = state[f"symbol_{leg.lower()}"]
-                    resp = broker.get().closeposition(
-                        symbol=sym, exchange=OPTION_EXCH,
-                        product=PRODUCT, strategy=STRATEGY_NAME,
-                    )
-                    if not api_ok(resp):
-                        plog(f"closeposition({leg}) failed: {api_err(resp)} — trying smart order", "WARNING")
-                        fallback_legs.append(leg)
-
-                if fallback_legs:
-                    for leg in fallback_legs:
-                        self.close_one_leg(leg, reason)
-                    remaining = active_legs()
-                    for leg in remaining:
-                        if leg not in fallback_legs:
-                            ltp = fetch_ltp(state[f"symbol_{leg.lower()}"], OPTION_EXCH)
-                            self.close_one_leg(leg, reason, current_ltp=ltp)
-                    return
-
-                time.sleep(2)
-                ltp_ce = fetch_ltp(state["symbol_ce"], OPTION_EXCH)
-                ltp_pe = fetch_ltp(state["symbol_pe"], OPTION_EXCH)
-                entry_ce = state["entry_price_ce"]
-                entry_pe = state["entry_price_pe"]
-
-                state["exit_price_ce"] = ltp_ce
-                state["exit_price_pe"] = ltp_pe
-                state["ce_active"] = False
-                state["pe_active"] = False
-
-                pnl = 0.0
-                if entry_ce > 0 and ltp_ce > 0:
-                    pnl += (entry_ce - ltp_ce) * qty()
-                if entry_pe > 0 and ltp_pe > 0:
-                    pnl += (entry_pe - ltp_pe) * qty()
-                state["closed_pnl"] += pnl
-
-                self._mark_fully_flat(reason)
-                return
-
-            except Exception as exc:
-                plog(f"close_all exception: {exc} — per-leg fallback", "ERROR")
-                for leg in active_legs():
-                    self.close_one_leg(leg, reason)
-                return
-
-        elif len(legs) == 1:
-            leg = legs[0]
+        for leg in legs:
             ltp = fetch_ltp(state[f"symbol_{leg.lower()}"], OPTION_EXCH)
             self.close_one_leg(leg, reason, current_ltp=ltp)
 
@@ -1225,13 +1241,30 @@ class Reconciler:
         return set()
 
     def _refetch_fills(self):
+        pos_map = {}
+        try:
+            resp = broker.get().positionbook()
+            if api_ok(resp):
+                for pos in resp.get("data", []):
+                    pos_map[pos.get("symbol", "")] = pos
+        except Exception as exc:
+            plog(f"Reconciler: positionbook error during refetch: {exc}", "WARNING")
+
         for leg, sym_key, px_key in [("CE", "symbol_ce", "entry_price_ce"),
                                        ("PE", "symbol_pe", "entry_price_pe")]:
             if state[px_key] <= 0 and state[f"{leg.lower()}_active"]:
-                ltp = fetch_ltp(state[sym_key], OPTION_EXCH)
-                if ltp > 0:
-                    state[px_key] = ltp
-                    plog(f"Reconciler: recovered {leg} fill ₹{ltp:.2f}")
+                sym = state[sym_key]
+                avg_price = 0.0
+                if sym in pos_map:
+                    avg_price = float(pos_map[sym].get("average_price", 0) or 0)
+                if avg_price > 0:
+                    state[px_key] = avg_price
+                    plog(f"Reconciler: recovered {leg} fill ₹{avg_price:.2f} (positionbook)")
+                else:
+                    ltp = fetch_ltp(sym, OPTION_EXCH)
+                    if ltp > 0:
+                        state[px_key] = ltp
+                        plog(f"Reconciler: recovered {leg} fill ₹{ltp:.2f} (LTP fallback)", "WARNING")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ENTRY FILTER CHAIN
@@ -1288,6 +1321,20 @@ class NiftyShortStraddle:
         plog_sep()
 
         telegram.start()
+
+        try:
+            az_resp = broker.get().analyzerstatus()
+            if api_ok(az_resp):
+                az_data = az_resp.get("data", {})
+                if az_data.get("analyze_mode", False):
+                    mode_str = "ANALYZER MODE (sandbox — orders will NOT reach broker)"
+                    plog(f"⚠️  {mode_str}", "WARNING")
+                    telegram.notify(f"⚠️ {mode_str}")
+                else:
+                    plog("Broker mode: LIVE")
+        except Exception as exc:
+            plog(f"Analyzer status check failed: {exc}", "WARNING")
+
         telegram.notify("Strategy Started — Nifty Short Straddle v8.0\n"
                        f"Entry: {ENTRY_TIME} | Exit: {EXIT_TIME} | SL: {LEG_SL_PERCENT}%\n"
                        f"Lots: {NUMBER_OF_LOTS} × {LOT_SIZE} = {qty()}")
