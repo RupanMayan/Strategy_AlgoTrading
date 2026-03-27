@@ -111,6 +111,7 @@ to_date      = "2026-03-21"
 skip_months  = [11]
 trade_dte    = [0, 1, 2, 3, 4]
 slippage_pct = 0.0
+margin_pct   = 18.0       # SPAN + Exposure margin as % of notional (spot × qty)
 
 [dhan]
 # Credentials from env: DHAN_ACCESS_TOKEN, DHAN_CLIENT_ID

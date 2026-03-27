@@ -67,6 +67,13 @@
   },
   "lot_size": 65,
   "num_lots": 1,
+  "qty": 65,
+  "margin_pct": 18.0,
+  "avg_premium_per_trade": 11619.76,
+  "avg_margin_per_trade": 239531.88,
+  "total_premium_received": 16616262.0,
+  "total_margin_deployed": 342530584.11,
+  "roi_on_margin_pct": 548.87,
   "backtest_period": "2021-03-22 to 2026-03-21",
   "charges_breakdown": {
     "brokerage": 127020,

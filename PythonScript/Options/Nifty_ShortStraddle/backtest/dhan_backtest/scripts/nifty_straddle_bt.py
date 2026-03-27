@@ -1074,6 +1074,17 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
 
     lot_size = config["instrument"]["lot_size"]
     num_lots = config["instrument"]["number_of_lots"]
+    qty = lot_size * num_lots
+
+    # ── Realistic capital per trade (like live trading) ──
+    margin_pct = config["backtest"].get("margin_pct", 18.0) / 100.0
+    trades_df["premium_received"] = trades_df["combined_premium"] * qty
+    trades_df["margin_required"] = trades_df["spot_at_entry"] * qty * margin_pct
+    trades_df["capital_used"] = trades_df["margin_required"]  # margin blocked by broker
+    avg_premium = trades_df["premium_received"].mean()
+    avg_margin = trades_df["margin_required"].mean()
+    total_premium = trades_df["premium_received"].sum()
+    total_margin = trades_df["margin_required"].sum()
 
     csv_df = trades_df.drop(columns=["charges_detail"], errors="ignore")
     csv_df.to_csv(output_dir / "bt_trades.csv", index=False)
@@ -1211,6 +1222,13 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
         "per_dte": {str(k): {kk: round(vv, 2) for kk, vv in v.items()} for k, v in dte_stats.items()},
         "lot_size": lot_size,
         "num_lots": num_lots,
+        "qty": qty,
+        "margin_pct": round(margin_pct * 100, 1),
+        "avg_premium_per_trade": round(avg_premium, 2),
+        "avg_margin_per_trade": round(avg_margin, 2),
+        "total_premium_received": round(total_premium, 2),
+        "total_margin_deployed": round(total_margin, 2),
+        "roi_on_margin_pct": round(total_net_pnl / avg_margin * 100, 2) if avg_margin > 0 else 0,
         "backtest_period": f"{config['backtest']['from_date']} to {config['backtest']['to_date']}",
         "charges_breakdown": charges_breakdown,
     }
@@ -1320,10 +1338,16 @@ def generate_analytics(trades_df: pd.DataFrame, config: dict):
     print(f"{'='*60}")
     print(f"  Period:         {config['backtest']['from_date']} → {config['backtest']['to_date']}")
     print(f"  Total Trades:   {num_trades}")
+    print(f"  Lot Size:       {lot_size} × {num_lots} lot{'s' if num_lots > 1 else ''} = {qty} qty")
+    print(f"{'─'*60}")
+    print(f"  Per-Trade Capital (like live):")
+    print(f"    Avg Premium (CE+PE):  ₹{avg_premium:,.0f}")
+    print(f"    Avg Margin Blocked:   ₹{avg_margin:,.0f} ({margin_pct*100:.0f}% of notional)")
     print(f"{'─'*60}")
     print(f"  GROSS P&L:      ₹{total_pnl:,.2f}")
     print(f"  Total Charges:  ₹{total_charges:,.2f} ({total_charges/total_pnl*100:.1f}% of gross)" if total_pnl != 0 else f"  Total Charges:  ₹{total_charges:,.2f}")
     print(f"  NET P&L:        ₹{total_net_pnl:,.2f}")
+    print(f"  ROI (on avg margin):  {total_net_pnl / avg_margin * 100:.1f}%")
     print(f"{'─'*60}")
     print(f"  Charges Breakdown:")
     print(f"    Brokerage:    ₹{charges_breakdown['brokerage']:,.2f}")

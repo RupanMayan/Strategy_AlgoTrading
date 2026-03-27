@@ -554,7 +554,7 @@ def margin_check(symbol_ce: str, symbol_pe: str) -> bool:
             {"symbol": symbol_pe, "exchange": OPTION_EXCH, "action": "SELL",
              "quantity": qty(), "pricetype": "MARKET", "product": PRODUCT},
         ]
-        margin_resp = broker.get().margin(basket=basket)
+        margin_resp = broker.get().margin(positions=basket)
         if not api_ok(margin_resp):
             plog(f"Margin API error: {api_err(margin_resp)}", "WARNING")
             return MARGIN_FAIL_OPEN
@@ -601,41 +601,67 @@ class OrderEngine:
             return False
 
         atm_strike = round(spot / STRIKE_ROUNDING) * STRIKE_ROUNDING
+        plog(f"Entry: ATM={atm_strike} | expiry={expiry}")
+
+        # Pre-compute symbols for margin check (still needed for margin API)
         symbol_ce = f"{UNDERLYING}{expiry}{atm_strike}CE"
         symbol_pe = f"{UNDERLYING}{expiry}{atm_strike}PE"
-
-        plog(f"Entry: ATM={atm_strike} | CE={symbol_ce} | PE={symbol_pe}")
 
         if not margin_check(symbol_ce, symbol_pe):
             return False
 
-        orders = [
-            {"symbol": symbol_ce, "exchange": OPTION_EXCH, "action": "SELL",
+        legs = [
+            {"offset": "ATM", "option_type": "CE", "action": "SELL",
              "quantity": qty(), "pricetype": "MARKET", "product": PRODUCT,
-             "position_size": qty()},
-            {"symbol": symbol_pe, "exchange": OPTION_EXCH, "action": "SELL",
+             "expiry_date": expiry},
+            {"offset": "ATM", "option_type": "PE", "action": "SELL",
              "quantity": qty(), "pricetype": "MARKET", "product": PRODUCT,
-             "position_size": qty()},
+             "expiry_date": expiry},
         ]
 
         try:
-            resp = broker.get().placesmartorder(orders[0])
+            resp = broker.get().optionsmultiorder(
+                strategy=STRATEGY_NAME,
+                underlying=UNDERLYING,
+                exchange=EXCHANGE,
+                legs=legs,
+            )
             if not api_ok(resp):
-                plog(f"CE order failed: {api_err(resp)}", "ERROR")
-                telegram.notify(f"❌ CE order failed: {api_err(resp)}")
+                plog(f"Options multi-order failed: {api_err(resp)}", "ERROR")
+                telegram.notify(f"❌ Options multi-order failed: {api_err(resp)}")
                 return False
-            orderid_ce = str(resp.get("data", {}).get("orderid", resp.get("orderid", "")))
 
-            resp2 = broker.get().placesmartorder(orders[1])
-            if not api_ok(resp2):
-                plog(f"PE order failed: {api_err(resp2)}", "ERROR")
-                telegram.notify(f"❌ PE order failed — closing CE")
-                broker.get().closeposition(
-                    symbol=symbol_ce, exchange=OPTION_EXCH, product=PRODUCT,
-                    strategy=STRATEGY_NAME
-                )
+            results = resp.get("results", [])
+            if len(results) < 2:
+                plog(f"Multi-order returned {len(results)} results, expected 2", "ERROR")
                 return False
-            orderid_pe = str(resp2.get("data", {}).get("orderid", resp2.get("orderid", "")))
+
+            # Check both legs succeeded
+            ce_result, pe_result = results[0], results[1]
+            ce_ok = ce_result.get("status") == "success"
+            pe_ok = pe_result.get("status") == "success"
+
+            if not ce_ok or not pe_ok:
+                failed = []
+                if not ce_ok: failed.append(f"CE: {ce_result}")
+                if not pe_ok: failed.append(f"PE: {pe_result}")
+                plog(f"Multi-order partial failure: {', '.join(failed)}", "ERROR")
+                telegram.notify(f"❌ Multi-order partial failure\n{chr(10).join(failed)}")
+                broker.get().closeposition(strategy=STRATEGY_NAME)
+                return False
+
+            # Extract resolved symbols and order IDs from response
+            symbol_ce = ce_result.get("symbol", symbol_ce)
+            symbol_pe = pe_result.get("symbol", symbol_pe)
+            orderid_ce = str(ce_result.get("orderid", ""))
+            orderid_pe = str(pe_result.get("orderid", ""))
+
+            # Use underlying_ltp from response if available
+            resp_spot = resp.get("underlying_ltp", 0)
+            if resp_spot > 0:
+                spot = resp_spot
+
+            plog(f"Multi-order OK: CE={symbol_ce} ({orderid_ce}), PE={symbol_pe} ({orderid_pe})")
         except Exception as exc:
             plog(f"Order placement exception: {exc}", "ERROR")
             return False
@@ -734,12 +760,12 @@ class OrderEngine:
         order_sent = False
         for attempt in range(3):
             try:
-                resp = broker.get().placesmartorder({
-                    "symbol": symbol, "exchange": OPTION_EXCH,
-                    "action": "BUY", "quantity": qty(),
-                    "pricetype": "MARKET", "product": PRODUCT,
-                    "position_size": 0,
-                })
+                resp = broker.get().placesmartorder(
+                    symbol=symbol, exchange=OPTION_EXCH,
+                    action="BUY", quantity=qty(),
+                    price_type="MARKET", product=PRODUCT,
+                    position_size=0,
+                )
                 if api_ok(resp):
                     order_sent = True
                     time.sleep(2)
