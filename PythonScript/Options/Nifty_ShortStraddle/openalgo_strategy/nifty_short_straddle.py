@@ -353,10 +353,26 @@ class WebSocketFeed:
     def subscribe(self, symbol: str, exchange: str):
         key = f"{symbol}.{exchange}"
         self._subscribed.add(key)
+        if self._ws:
+            try:
+                self._ws.send(json.dumps({
+                    "action": "subscribe", "mode": "ltp",
+                    "instruments": [{"exchange": exchange, "symbol": symbol}],
+                }))
+            except Exception:
+                pass
 
     def unsubscribe(self, symbol: str, exchange: str):
         key = f"{symbol}.{exchange}"
         self._subscribed.discard(key)
+        if self._ws:
+            try:
+                self._ws.send(json.dumps({
+                    "action": "unsubscribe", "mode": "ltp",
+                    "instruments": [{"exchange": exchange, "symbol": symbol}],
+                }))
+            except Exception:
+                pass
 
     def subscribe_position_symbols(self):
         if state["ce_active"] and state["symbol_ce"]:
@@ -396,9 +412,12 @@ class WebSocketFeed:
                         time.sleep(delay)
                         continue
                     plog("WebSocket authenticated")
+                    instruments = []
                     for key in list(self._subscribed):
                         sym, exch = key.split(".", 1)
-                        ws.send(json.dumps({"type": "subscribe", "symbol": sym, "exchange": exch}))
+                        instruments.append({"exchange": exch, "symbol": sym})
+                    if instruments:
+                        ws.send(json.dumps({"action": "subscribe", "mode": "ltp", "instruments": instruments}))
                     self._receive_loop(ws)
             except Exception as exc:
                 if not self._stop.is_set():
@@ -411,13 +430,15 @@ class WebSocketFeed:
             try:
                 raw = ws.recv(timeout=30)
                 msg = json.loads(raw)
-                if msg.get("type") == "market_data":
-                    sym = msg.get("symbol", "")
-                    exch = msg.get("exchange", "")
-                    ltp = float(msg.get("ltp", 0))
+                msg_type = msg.get("type", "")
+                if msg_type in ("market_data", "ltp", "quote"):
+                    data = msg.get("data", {})
+                    sym = data.get("symbol", "") or msg.get("symbol", "")
+                    exch = data.get("exchange", "") or msg.get("exchange", "")
+                    ltp = float(data.get("ltp", 0) or msg.get("ltp", 0))
                     if sym and ltp > 0:
                         update_ltp_cache(sym, exch, ltp)
-                elif msg.get("type") == "ping":
+                elif msg_type == "ping":
                     ws.send(json.dumps({"type": "pong"}))
             except Exception:
                 break
