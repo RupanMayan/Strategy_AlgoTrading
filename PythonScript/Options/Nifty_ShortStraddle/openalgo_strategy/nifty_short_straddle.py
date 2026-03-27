@@ -1490,14 +1490,24 @@ class NiftyShortStraddle:
         self._shutdown_done = True
         plog("Shutdown initiated...")
         if state["in_position"]:
-            plog("Shutdown with open position — closing all")
-            self.engine.close_all("Script Shutdown")
-        telegram.flush()
-        # Send stop message synchronously before killing anything
-        try:
-            telegram.send_sync("Strategy Stopped — Nifty Short Straddle")
-        except Exception as exc:
-            plog(f"Telegram stop message failed: {exc}", "WARNING")
+            plog("Positions still open — NOT closing (manual action required)")
+            save_state()
+            try:
+                telegram.send_sync(
+                    "⚠️ Strategy STOPPED with OPEN positions\n"
+                    f"CE: {state['symbol_ce']} (active={state['ce_active']})\n"
+                    f"PE: {state['symbol_pe']} (active={state['pe_active']})\n"
+                    f"P&L so far: ₹{state['closed_pnl']:,.2f}\n"
+                    "⚠️ Take manual action or restart script to resume monitoring"
+                )
+            except Exception as exc:
+                plog(f"Telegram stop message failed: {exc}", "WARNING")
+        else:
+            telegram.flush()
+            try:
+                telegram.send_sync("Strategy Stopped — Nifty Short Straddle (no open positions)")
+            except Exception as exc:
+                plog(f"Telegram stop message failed: {exc}", "WARNING")
         ws_feed.stop()
         telegram.stop()
         plog("Shutdown complete")
