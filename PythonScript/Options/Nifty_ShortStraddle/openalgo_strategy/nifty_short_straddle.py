@@ -14,9 +14,10 @@ from openalgo import api as OpenAlgo
 #  CONFIGURATION — All backtest-optimised parameters
 # ─────────────────────────────────────────────────────────────────────────────
 
-OPENALGO_HOST    = os.environ.get("OPENALGO_HOST", "http://127.0.0.1:5000")
+OPENALGO_HOST    = os.environ.get("OPENALGO_HOST", "https://myalgo.algotradings.in")
+OPENALGO_WS_URL  = os.environ.get("OPENALGO_WS_URL", "wss://myalgo.algotradings.in/ws")
 OPENALGO_API_KEY = os.environ.get("OPENALGO_APIKEY", "")
-TELEGRAM_USER    = os.environ.get("OPENALGO_USERNAME", "")
+TELEGRAM_USER    = os.environ.get("OPENALGO_USERNAME", "rupanmayan")
 
 UNDERLYING       = "NIFTY"
 EXCHANGE         = "NSE_INDEX"
@@ -400,7 +401,8 @@ class WebSocketFeed:
         delay = 1
         while not self._stop.is_set():
             try:
-                ws_url = OPENALGO_HOST.replace("http", "ws") + "/ws/market-data"
+                ws_url = OPENALGO_WS_URL if OPENALGO_WS_URL else (OPENALGO_HOST.replace("http", "ws") + "/ws/market-data")
+                plog(f"WS connecting to {ws_url}")
                 with ws_sync.connect(ws_url, close_timeout=5) as ws:
                     self._ws = ws
                     delay = 1
@@ -426,6 +428,7 @@ class WebSocketFeed:
             delay = min(delay * 2, WS_RECONNECT_MAX_S)
 
     def _receive_loop(self, ws):
+        msg_count = 0
         while not self._stop.is_set():
             try:
                 raw = ws.recv(timeout=30)
@@ -438,9 +441,16 @@ class WebSocketFeed:
                     ltp = float(data.get("ltp", 0) or msg.get("ltp", 0))
                     if sym and ltp > 0:
                         update_ltp_cache(sym, exch, ltp)
+                        msg_count += 1
+                        if msg_count == 1:
+                            plog(f"WS first tick: {sym} ₹{ltp:.2f}")
                 elif msg_type == "ping":
                     ws.send(json.dumps({"type": "pong"}))
-            except Exception:
+                else:
+                    if msg_count == 0:
+                        plog(f"WS unexpected message: {str(raw)[:200]}", "DEBUG")
+            except Exception as exc:
+                plog(f"WS receive loop ended: {exc}", "DEBUG")
                 break
 
 ws_feed = WebSocketFeed()
