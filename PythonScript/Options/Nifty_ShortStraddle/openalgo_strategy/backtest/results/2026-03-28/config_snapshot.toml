@@ -1,0 +1,83 @@
+# Nifty Short Straddle — Backtest Configuration
+# Mirrors production nifty_short_straddle.py constants exactly
+# Last synced: 2026-03-28
+
+[instrument]
+underlying = "NIFTY"
+exchange = "NSE_INDEX"
+option_exchange = "NFO"
+lot_size = 65
+number_of_lots = 1
+product = "MIS"
+strike_rounding = 50
+capital = 250000          # Starting capital in Rs
+dynamic_lot_sizing = true # Use SEBI lot size + capital-based allocation per day
+
+[timing]
+entry_time = "09:17"
+exit_time = "15:15"
+monitor_interval_sec = 5  # Production uses 5s; backtest uses 1-min candles
+
+[filters]
+trade_dte = [0, 1, 2, 3, 4]
+skip_months = [11]  # November — consistent loss month
+
+[risk.per_leg_sl]
+enabled = true
+sl_percent = 30.0  # % above entry premium
+
+[risk.daily_limits]
+profit_target = 10000   # Per lot, Rs
+loss_limit = -6000      # Per lot, Rs (negative)
+
+[risk.net_pnl_guard]
+max_defer_min = 15  # Defer leg SL if net position positive
+
+[risk.combined_decay]
+enabled = true
+default_pct = 60.0
+dte_map = {0 = 60.0, 1 = 65.0, 2 = 60.0, 3 = 50.0, 4 = 50.0}
+
+[risk.winner_booking]
+enabled = true
+decay_pct = 30.0  # Close survivor if decayed to 30% of entry
+
+[risk.asymmetric]
+enabled = true
+winner_decay_pct = 40.0   # Winner leg <= 40% of entry
+loser_intact_pct = 80.0   # Loser leg >= 80% of entry
+
+[risk.combined_trail]
+enabled = true
+activate_pct = 30.0  # Activate trail at 30% combined decay
+trail_pct = 40.0      # Exit on 40% retracement from peak
+
+[risk.breakeven]
+enabled = true
+grace_min = 5
+buffer_pct = 5.0
+
+[risk.reentry]
+enabled = true
+cooldown_min = 45
+max_per_day = 2
+max_loss = 2000  # Per lot, Rs — skip re-entry if cumulative loss exceeds
+
+[risk.vix_spike]
+enabled = true
+threshold_pct = 15.0    # % rise from entry VIX
+abs_floor = 18.0        # Only exit if VIX also above this
+check_interval_sec = 300
+
+[charges]
+brokerage_per_order = 20.0
+stt_sell_pct = 0.0625       # STT on sell side
+exchange_txn_pct = 0.053    # NSE F&O transaction charges
+sebi_pct = 0.0001           # SEBI turnover fee
+gst_pct = 18.0              # GST on brokerage + exchange + SEBI
+stamp_duty_buy_pct = 0.003  # Stamp duty on buy side
+
+[backtest]
+start_date = "2021-04-01"
+end_date = "2026-03-28"
+slippage_points = 1.0  # Per leg, added to entry / subtracted from exit

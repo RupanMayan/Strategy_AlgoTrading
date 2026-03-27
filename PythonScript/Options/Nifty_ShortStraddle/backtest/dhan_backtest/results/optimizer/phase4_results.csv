@@ -1,7 +1,0 @@
-slippage_pct,total_pnl,num_trades,win_rate,avg_win,avg_loss,profit_factor,max_drawdown,sharpe,dte_pnl,exit_reasons
-0.0,120263.31,127,67.7,2129.8,-1534.14,2.91,-9542.2,4.5,"{0: 68314.28, 3: 21594.04, 4: 30354.989999999998}","{'hard_exit': 77, 'winner_booking': 23, 'both_sl_hit': 21, 'loss_limit': 2, 'combined_decay': 2, 'profit_target': 2}"
-0.5,117666.04,127,66.9,2144.15,-1537.79,2.82,-9858.44,4.38,"{0: 67151.31, 3: 20505.53, 4: 30009.199999999997}","{'hard_exit': 77, 'winner_booking': 23, 'both_sl_hit': 21, 'loss_limit': 2, 'combined_decay': 2, 'profit_target': 2}"
-1.0,115070.33,127,66.9,2133.56,-1578.15,2.74,-10174.71,4.25,"{0: 65989.41, 3: 19417.55, 4: 29663.370000000003}","{'hard_exit': 77, 'winner_booking': 23, 'both_sl_hit': 21, 'loss_limit': 2, 'combined_decay': 2, 'profit_target': 2}"
-1.5,112474.52,127,66.9,2122.97,-1618.52,2.65,-10490.96,4.13,"{0: 64827.48, 3: 18329.47, 4: 29317.57}","{'hard_exit': 77, 'winner_booking': 23, 'both_sl_hit': 21, 'loss_limit': 2, 'combined_decay': 2, 'profit_target': 2}"
-2.0,109880.31,127,66.1,2138.02,-1621.23,2.58,-10807.23,4.01,"{0: 63666.02, 3: 17242.57, 4: 28971.72}","{'hard_exit': 77, 'winner_booking': 23, 'both_sl_hit': 21, 'loss_limit': 2, 'combined_decay': 2, 'profit_target': 2}"
-3.0,104696.0,127,66.1,2117.83,-1702.37,2.43,-11439.76,3.77,"{0: 61345.5, 3: 15070.41, 4: 28280.09}","{'hard_exit': 77, 'winner_booking': 23, 'both_sl_hit': 21, 'loss_limit': 2, 'combined_decay': 2, 'profit_target': 2}"

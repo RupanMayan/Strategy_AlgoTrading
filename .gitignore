@@ -32,3 +32,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Backtest data files (too large for git)
+**/backtest/data/*.parquet
