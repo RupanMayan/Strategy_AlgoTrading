@@ -639,6 +639,8 @@ def margin_check(symbol_ce: str, symbol_pe: str) -> bool:
 
     except Exception as exc:
         plog(f"Margin check exception: {exc}", "ERROR")
+        if MARGIN_FAIL_OPEN:
+            telegram.notify(f"⚠️ Margin check failed — proceeding (fail-open)\nError: {exc}")
         return MARGIN_FAIL_OPEN
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -662,6 +664,7 @@ class OrderEngine:
         spot = fetch_ltp(UNDERLYING, EXCHANGE)
         if spot <= 0:
             plog("Cannot fetch NIFTY spot — skipping entry", "ERROR")
+            telegram.notify("❌ Entry skipped — cannot fetch NIFTY spot price")
             return False
 
         atm_strike = round(spot / STRIKE_ROUNDING) * STRIKE_ROUNDING
@@ -748,6 +751,7 @@ class OrderEngine:
 
         except Exception as exc:
             plog(f"Order placement exception: {exc}", "ERROR")
+            telegram.notify(f"❌ Order placement exception: {exc}")
             return False
 
         now_dt = now_ist()
@@ -1336,14 +1340,20 @@ def reentry_ok() -> bool:
     cum_pnl = state.get("cumulative_daily_pnl", 0)
     effective_target = DAILY_TARGET * NUMBER_OF_LOTS
     if effective_target > 0 and cum_pnl >= effective_target:
-        plog(f"Re-entry blocked: daily target already hit (₹{cum_pnl:,.2f})")
+        reason = f"daily target already hit (₹{cum_pnl:,.2f})"
+        plog(f"Re-entry blocked: {reason}")
+        telegram.notify(f"🚫 Re-entry blocked — {reason}")
         return False
     effective_limit = DAILY_LOSS_LIMIT * NUMBER_OF_LOTS
     if effective_limit < 0 and cum_pnl <= effective_limit:
-        plog(f"Re-entry blocked: daily loss limit already hit (₹{cum_pnl:,.2f})")
+        reason = f"daily loss limit already hit (₹{cum_pnl:,.2f})"
+        plog(f"Re-entry blocked: {reason}")
+        telegram.notify(f"🚫 Re-entry blocked — {reason}")
         return False
     if state["reentry_count_today"] >= REENTRY_MAX_PER_DAY:
-        plog(f"Re-entry blocked: {state['reentry_count_today']}/{REENTRY_MAX_PER_DAY} used")
+        reason = f"max re-entries used ({state['reentry_count_today']}/{REENTRY_MAX_PER_DAY})"
+        plog(f"Re-entry blocked: {reason}")
+        telegram.notify(f"🚫 Re-entry blocked — {reason}")
         return False
     last_close = parse_ist_dt(state.get("last_close_time"))
     if last_close:
@@ -1354,7 +1364,9 @@ def reentry_ok() -> bool:
     last_pnl = state.get("last_trade_pnl", 0)
     max_loss = REENTRY_MAX_LOSS * NUMBER_OF_LOTS
     if last_pnl < -max_loss:
-        plog(f"Re-entry blocked: last loss ₹{last_pnl:,.2f} > cap ₹{-max_loss:,.2f}")
+        reason = f"last loss ₹{last_pnl:,.2f} > cap ₹{-max_loss:,.2f}"
+        plog(f"Re-entry blocked: {reason}")
+        telegram.notify(f"🚫 Re-entry blocked — {reason}")
         return False
     return True
 
@@ -1463,6 +1475,7 @@ class NiftyShortStraddle:
         expiry = resolve_expiry()
         if not expiry:
             plog("Could not resolve expiry — skip", "ERROR")
+            telegram.notify("❌ Entry skipped — could not resolve expiry")
             return
 
         dte = compute_dte(expiry)
