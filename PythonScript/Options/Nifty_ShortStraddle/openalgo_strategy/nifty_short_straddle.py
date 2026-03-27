@@ -1354,7 +1354,7 @@ class NiftyShortStraddle:
         self.reconciler = Reconciler(self.engine)
         self._stop_event = threading.Event()
         self._entry_done_today = False
-        self._daily_reset_done = False
+        self._daily_reset_date: str = ""
         self._shutdown_done = False
 
     def run(self):
@@ -1419,18 +1419,16 @@ class NiftyShortStraddle:
                 self._stop_event.wait(60)
                 continue
 
+            today_date = now.strftime("%Y-%m-%d")
+
             if hhmm < "09:15" or hhmm >= "15:30":
-                if hhmm >= "15:30" and not self._daily_reset_done:
-                    self._daily_reset()
+                if hhmm >= "15:30" and self._daily_reset_date != today_date:
+                    self._daily_reset(today_date)
                 self._stop_event.wait(10)
                 continue
 
-            if not self._daily_reset_done and hhmm >= "09:15":
-                self._daily_reset_done = True
-                self._entry_done_today = False
-                state["reentry_count_today"] = 0
-                state["cumulative_daily_pnl"] = 0.0
-                state["trade_count"] = 0
+            if self._daily_reset_date != today_date and hhmm >= "09:15":
+                self._daily_reset(today_date)
 
             if hhmm >= f"{exit_h:02d}:{exit_m:02d}" and state["in_position"]:
                 plog("Hard exit time reached")
@@ -1477,8 +1475,9 @@ class NiftyShortStraddle:
             if not is_reentry:
                 self._entry_done_today = True
 
-    def _daily_reset(self):
-        self._daily_reset_done = True
+    def _daily_reset(self, today_date: str):
+        self._daily_reset_date = today_date
+        self._entry_done_today = False
         if state["cumulative_daily_pnl"] != 0:
             plog(f"Day end — cumulative P&L: ₹{state['cumulative_daily_pnl']:,.2f}")
         state["reentry_count_today"] = 0
@@ -1486,6 +1485,7 @@ class NiftyShortStraddle:
         state["trade_count"] = 0
         state["last_close_time"] = None
         state["last_trade_pnl"] = 0.0
+        plog(f"Daily reset for {today_date}")
 
     def _handle_signal(self, signum, _frame):
         plog(f"Signal {signum} received — shutting down")
