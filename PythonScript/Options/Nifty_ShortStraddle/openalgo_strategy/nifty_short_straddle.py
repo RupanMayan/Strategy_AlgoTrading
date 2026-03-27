@@ -1230,14 +1230,15 @@ class Reconciler:
     def __init__(self, engine: OrderEngine):
         self.engine = engine
 
-    def reconcile(self):
+    def reconcile(self) -> str:
+        """Returns: 'clean', 'restored', or 'externally_closed'"""
         load_state()
         if not state["in_position"]:
             if os.path.exists(STATE_FILE):
                 plog("Stale state file found — removing")
                 clear_state_file()
             plog("Reconciler: no position — clean start")
-            return
+            return "clean"
 
         plog("Reconciler: saved state has position — checking broker")
         today_str = now_ist().strftime("%Y-%m-%d")
@@ -1245,7 +1246,7 @@ class Reconciler:
             plog("Reconciler: position from previous day — resetting")
             reset_state()
             clear_state_file()
-            return
+            return "clean"
 
         positions = self._fetch_broker_positions()
 
@@ -1262,10 +1263,12 @@ class Reconciler:
             if state["entry_price_ce"] <= 0 or state["entry_price_pe"] <= 0:
                 self._refetch_fills()
             save_state()
+            return "restored"
         else:
             plog("Reconciler: broker is flat — externally closed")
             reset_state()
             clear_state_file()
+            return "externally_closed"
 
     def _fetch_broker_positions(self) -> set[str]:
         try:
@@ -1381,11 +1384,15 @@ class NiftyShortStraddle:
                        f"Lots: {NUMBER_OF_LOTS} × {LOT_SIZE} = {qty()}")
         ws_feed.subscribe_market_symbols()
         ws_feed.start()
-        self.reconciler.reconcile()
+        reconcile_result = self.reconciler.reconcile()
 
         if state["in_position"]:
             self._entry_done_today = True
             plog("Resumed with open position — monitoring")
+        elif reconcile_result == "externally_closed":
+            self._entry_done_today = True
+            plog("Positions were closed externally — no new entry today")
+            telegram.notify("Positions were closed externally while script was stopped.\nNo automatic re-entry. Restart before entry time for fresh entry.")
         else:
             plog(f"Waiting for entry at {ENTRY_TIME}")
 
