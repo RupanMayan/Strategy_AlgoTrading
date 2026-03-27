@@ -1334,27 +1334,30 @@ def dte_filter_ok(dte: int) -> bool:
         return False
     return True
 
+_reentry_block_alerted = False
+
 def reentry_ok() -> bool:
+    global _reentry_block_alerted
     if not REENTRY_ENABLED:
         return False
+
+    def _block(reason: str) -> bool:
+        global _reentry_block_alerted
+        plog(f"Re-entry blocked: {reason}")
+        if not _reentry_block_alerted:
+            telegram.notify(f"🚫 Re-entry blocked — {reason}")
+            _reentry_block_alerted = True
+        return False
+
     cum_pnl = state.get("cumulative_daily_pnl", 0)
     effective_target = DAILY_TARGET * NUMBER_OF_LOTS
     if effective_target > 0 and cum_pnl >= effective_target:
-        reason = f"daily target already hit (₹{cum_pnl:,.2f})"
-        plog(f"Re-entry blocked: {reason}")
-        telegram.notify(f"🚫 Re-entry blocked — {reason}")
-        return False
+        return _block(f"daily target already hit (₹{cum_pnl:,.2f})")
     effective_limit = DAILY_LOSS_LIMIT * NUMBER_OF_LOTS
     if effective_limit < 0 and cum_pnl <= effective_limit:
-        reason = f"daily loss limit already hit (₹{cum_pnl:,.2f})"
-        plog(f"Re-entry blocked: {reason}")
-        telegram.notify(f"🚫 Re-entry blocked — {reason}")
-        return False
+        return _block(f"daily loss limit already hit (₹{cum_pnl:,.2f})")
     if state["reentry_count_today"] >= REENTRY_MAX_PER_DAY:
-        reason = f"max re-entries used ({state['reentry_count_today']}/{REENTRY_MAX_PER_DAY})"
-        plog(f"Re-entry blocked: {reason}")
-        telegram.notify(f"🚫 Re-entry blocked — {reason}")
-        return False
+        return _block(f"max re-entries used ({state['reentry_count_today']}/{REENTRY_MAX_PER_DAY})")
     last_close = parse_ist_dt(state.get("last_close_time"))
     if last_close:
         elapsed = (now_ist() - last_close).total_seconds() / 60
@@ -1364,10 +1367,7 @@ def reentry_ok() -> bool:
     last_pnl = state.get("last_trade_pnl", 0)
     max_loss = REENTRY_MAX_LOSS * NUMBER_OF_LOTS
     if last_pnl < -max_loss:
-        reason = f"last loss ₹{last_pnl:,.2f} > cap ₹{-max_loss:,.2f}"
-        plog(f"Re-entry blocked: {reason}")
-        telegram.notify(f"🚫 Re-entry blocked — {reason}")
-        return False
+        return _block(f"last loss ₹{last_pnl:,.2f} > cap ₹{-max_loss:,.2f}")
     return True
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1504,8 +1504,10 @@ class NiftyShortStraddle:
                 self._entry_done_today = True
 
     def _daily_reset(self, today_date: str):
+        global _reentry_block_alerted
         self._daily_reset_date = today_date
         self._entry_done_today = False
+        _reentry_block_alerted = False
         if state["cumulative_daily_pnl"] != 0:
             plog(f"Day end — cumulative P&L: ₹{state['cumulative_daily_pnl']:,.2f}")
         state["reentry_count_today"] = 0
