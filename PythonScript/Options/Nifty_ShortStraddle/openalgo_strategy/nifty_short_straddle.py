@@ -1327,6 +1327,15 @@ def dte_filter_ok(dte: int) -> bool:
 def reentry_ok() -> bool:
     if not REENTRY_ENABLED:
         return False
+    cum_pnl = state.get("cumulative_daily_pnl", 0)
+    effective_target = DAILY_TARGET * NUMBER_OF_LOTS
+    if effective_target > 0 and cum_pnl >= effective_target:
+        plog(f"Re-entry blocked: daily target already hit (₹{cum_pnl:,.2f})")
+        return False
+    effective_limit = DAILY_LOSS_LIMIT * NUMBER_OF_LOTS
+    if effective_limit < 0 and cum_pnl <= effective_limit:
+        plog(f"Re-entry blocked: daily loss limit already hit (₹{cum_pnl:,.2f})")
+        return False
     if state["reentry_count_today"] >= REENTRY_MAX_PER_DAY:
         plog(f"Re-entry blocked: {state['reentry_count_today']}/{REENTRY_MAX_PER_DAY} used")
         return False
