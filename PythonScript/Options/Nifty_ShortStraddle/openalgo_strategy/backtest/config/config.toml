@@ -12,6 +12,8 @@ product = "MIS"
 strike_rounding = 50
 capital = 250000          # Starting capital in Rs
 dynamic_lot_sizing = true # Use SEBI lot size + capital-based allocation per day
+compound_capital = true   # Reinvest profits into capital for lot sizing
+max_lots = 50             # Cap lot count for realism (liquidity/margin limits)
 
 [timing]
 entry_time = "09:17"

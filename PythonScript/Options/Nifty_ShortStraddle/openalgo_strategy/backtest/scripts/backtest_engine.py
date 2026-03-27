@@ -139,6 +139,8 @@ class Config:
     # Capital
     capital: float = 250000.0   # starting capital in Rs
     dynamic_lot_sizing: bool = True  # use SEBI lot size + capital-based allocation
+    compound_capital: bool = False   # reinvest profits into capital for lot sizing
+    max_lots: int = 50               # cap lot count (liquidity/margin realism)
 
     # Timing
     entry_time: time = field(default_factory=lambda: time(9, 17))
@@ -226,6 +228,8 @@ def load_config(path: str | Path) -> Config:
     c.strike_rounding = inst.get("strike_rounding", c.strike_rounding)
     c.capital = inst.get("capital", c.capital)
     c.dynamic_lot_sizing = inst.get("dynamic_lot_sizing", c.dynamic_lot_sizing)
+    c.compound_capital = inst.get("compound_capital", c.compound_capital)
+    c.max_lots = inst.get("max_lots", c.max_lots)
 
     timing = raw.get("timing", {})
     if "entry_time" in timing:
@@ -374,6 +378,7 @@ class TradeRecord:
     lot_size: int = 65
     number_of_lots: int = 1
     qty: int = 65
+    capital_used: float = 250000.0
     sl_events: list[dict] = field(default_factory=list)
     charges_breakdown: dict = field(default_factory=dict)
 
@@ -395,6 +400,7 @@ class BacktestEngine:
         self.pe = self._index_by_timestamp(pe_df)
         self.vix = self._index_by_timestamp(vix_df)
         self.trades: list[TradeRecord] = []
+        self.running_capital: float = config.capital  # tracks compounded capital
 
     @staticmethod
     def _index_by_timestamp(df: pd.DataFrame) -> pd.DataFrame:
@@ -414,7 +420,8 @@ class BacktestEngine:
 
         trading_days = self._get_trading_days(start, end)
         print(f"\nBacktest: {start} to {end} ({len(trading_days)} trading days)")
-        lot_info = (f"Dynamic (capital=₹{self.cfg.capital:,.0f})"
+        compound_tag = " + compounding" if self.cfg.compound_capital else ""
+        lot_info = (f"Dynamic (capital=₹{self.cfg.capital:,.0f}{compound_tag})"
                     if self.cfg.dynamic_lot_sizing
                     else f"Fixed (lots={self.cfg.number_of_lots}, qty={self.cfg.qty})")
         print(f"Config: SL={self.cfg.leg_sl_pct}%, Target=+{self.cfg.daily_target}, "
@@ -542,7 +549,8 @@ class BacktestEngine:
         # Dynamic lot sizing: SEBI lot size for the date + capital-based allocation
         if self.cfg.dynamic_lot_sizing:
             lot_size = get_lot_size_for_date(day)
-            num_lots = calc_lots_for_capital(self.cfg.capital, spot, lot_size)
+            cap = self.running_capital if self.cfg.compound_capital else self.cfg.capital
+            num_lots = min(calc_lots_for_capital(cap, spot, lot_size), self.cfg.max_lots)
         else:
             lot_size = self.cfg.lot_size
             num_lots = self.cfg.number_of_lots
@@ -1003,14 +1011,17 @@ class BacktestEngine:
             lot_size=trade.lot_size,
             number_of_lots=trade.number_of_lots,
             qty=trade.qty,
+            capital_used=round(self.running_capital, 2),
             sl_events=trade.sl_events,
             charges_breakdown=charges_detail,
         )
         self.trades.append(record)
 
-        # Update day state
+        # Update day state and running capital
         day_state.cumulative_pnl += net_pnl
         day_state.last_close_time = datetime.fromisoformat(exit_time) if exit_time else None
+        if self.cfg.compound_capital:
+            self.running_capital += net_pnl
 
     def _trades_to_dataframe(self) -> pd.DataFrame:
         if not self.trades:
@@ -1040,6 +1051,7 @@ class BacktestEngine:
                 "lot_size": t.lot_size,
                 "number_of_lots": t.number_of_lots,
                 "qty": t.qty,
+                "capital_used": t.capital_used,
                 "num_sl_events": len(t.sl_events),
             })
 

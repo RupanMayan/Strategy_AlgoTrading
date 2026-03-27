@@ -327,6 +327,7 @@ def generate_report(df: pd.DataFrame, summary: dict, results_dir: Path):
     # Capital info
     capital = 250000  # default
     has_lot_info = "lot_size" in df.columns and "number_of_lots" in df.columns
+    has_capital_info = "capital_used" in df.columns
 
     # Yearly table with gross, charges, net, lot info
     yearly = df_copy.groupby("year").agg(
@@ -382,11 +383,16 @@ def generate_report(df: pd.DataFrame, summary: dict, results_dir: Path):
                          f"Rs {row['net_pnl']:,.0f} | {row['win_rate']} |\n")
 
     # Capital allocation section
-    capital_section = f"""## Capital & Lot Allocation
+    final_capital = capital + summary['net_pnl']
+    is_compounded = has_capital_info and df["capital_used"].iloc[-1] != df["capital_used"].iloc[0]
+    compound_label = " (Compounded)" if is_compounded else " (Fixed)"
+
+    capital_section = f"""## Capital & Lot Allocation{compound_label}
 
 | Parameter | Value |
 |-----------|-------|
 | Starting Capital | Rs {capital:,.0f} |
+| Final Capital | Rs {final_capital:,.0f} |
 | Net P&L (5 years) | Rs {summary['net_pnl']:,.2f} |
 | Total Return | {(summary['net_pnl'] / capital * 100):.1f}% |
 | CAGR (approx) | {((1 + summary['net_pnl'] / capital) ** (1/5) - 1) * 100:.1f}% |
@@ -403,6 +409,21 @@ def generate_report(df: pd.DataFrame, summary: dict, results_dir: Path):
 
 **Dynamic Allocation:** Capital-based lot sizing with 9% SPAN margin + 20% buffer
 """
+
+    if is_compounded and has_lot_info:
+        # Show capital growth by year
+        cap_yearly = df_copy.groupby("year").agg(
+            start_capital=("capital_used", "first"),
+            end_capital=("capital_used", "last"),
+            avg_lots=("number_of_lots", "mean"),
+        ).reset_index()
+        capital_section += "\n**Capital Growth by Year:**\n\n"
+        capital_section += "| Year | Start Capital | End Capital | Avg Lots |\n"
+        capital_section += "|------|---------------|-------------|----------|\n"
+        for _, row in cap_yearly.iterrows():
+            capital_section += (f"| {int(row['year'])} | Rs {row['start_capital']:,.0f} | "
+                               f"Rs {row['end_capital']:,.0f} | {row['avg_lots']:.1f} |\n")
+        capital_section += "\n"
 
     report = f"""# Backtest Report — Nifty Short Straddle
 
