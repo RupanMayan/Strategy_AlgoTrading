@@ -237,6 +237,8 @@ class TelegramNotifier:
     def stop(self):
         self._stop.set()
         self._has_msg.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
 
 telegram = TelegramNotifier()
 
@@ -350,6 +352,12 @@ class WebSocketFeed:
                 self._ws.close()
             except Exception:
                 pass
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                plog("WS thread did not stop in 5s", "WARNING")
+        self._ws = None
+        plog("WebSocket feed stopped")
 
     def subscribe(self, symbol: str, exchange: str):
         key = f"{symbol}.{exchange}"
@@ -357,8 +365,8 @@ class WebSocketFeed:
         if self._ws:
             try:
                 self._ws.send(json.dumps({
-                    "action": "subscribe", "mode": "ltp",
-                    "instruments": [{"exchange": exchange, "symbol": symbol}],
+                    "action": "subscribe", "mode": 1,
+                    "symbols": [{"exchange": exchange, "symbol": symbol}],
                 }))
             except Exception:
                 pass
@@ -369,8 +377,8 @@ class WebSocketFeed:
         if self._ws:
             try:
                 self._ws.send(json.dumps({
-                    "action": "unsubscribe", "mode": "ltp",
-                    "instruments": [{"exchange": exchange, "symbol": symbol}],
+                    "action": "unsubscribe", "mode": 1,
+                    "symbols": [{"exchange": exchange, "symbol": symbol}],
                 }))
             except Exception:
                 pass
@@ -406,7 +414,7 @@ class WebSocketFeed:
                 with ws_sync.connect(ws_url, close_timeout=5) as ws:
                     self._ws = ws
                     delay = 1
-                    auth_msg = json.dumps({"type": "auth", "api_key": OPENALGO_API_KEY})
+                    auth_msg = json.dumps({"action": "authenticate", "api_key": OPENALGO_API_KEY})
                     ws.send(auth_msg)
                     auth_resp = json.loads(ws.recv(timeout=10))
                     if auth_resp.get("type") != "auth" or auth_resp.get("status") != "success":
@@ -414,12 +422,13 @@ class WebSocketFeed:
                         time.sleep(delay)
                         continue
                     plog("WebSocket authenticated")
-                    instruments = []
+                    symbols = []
                     for key in list(self._subscribed):
                         sym, exch = key.split(".", 1)
-                        instruments.append({"exchange": exch, "symbol": sym})
-                    if instruments:
-                        ws.send(json.dumps({"action": "subscribe", "mode": "ltp", "instruments": instruments}))
+                        symbols.append({"exchange": exch, "symbol": sym})
+                    if symbols:
+                        ws.send(json.dumps({"action": "subscribe", "mode": 1, "symbols": symbols}))
+                        plog(f"WS subscribed to {len(symbols)} symbols")
                     self._receive_loop(ws)
             except Exception as exc:
                 if not self._stop.is_set():
@@ -1478,11 +1487,16 @@ class NiftyShortStraddle:
         if self._shutdown_done:
             return
         self._shutdown_done = True
+        plog("Shutdown initiated...")
         if state["in_position"]:
             plog("Shutdown with open position — closing all")
             self.engine.close_all("Script Shutdown")
         telegram.flush()
-        telegram.send_sync("Strategy Stopped — Nifty Short Straddle")
+        # Send stop message synchronously before killing anything
+        try:
+            telegram.send_sync("Strategy Stopped — Nifty Short Straddle")
+        except Exception as exc:
+            plog(f"Telegram stop message failed: {exc}", "WARNING")
         ws_feed.stop()
         telegram.stop()
         plog("Shutdown complete")
