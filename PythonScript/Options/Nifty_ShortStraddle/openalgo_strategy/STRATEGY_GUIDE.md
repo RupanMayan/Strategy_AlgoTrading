@@ -30,7 +30,7 @@ All parameters are defined as constants at the top of the script. No external co
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `UNDERLYING` | `NIFTY` | Index to trade |
-| `LOT_SIZE` | `75` | NIFTY lot size (verify current NSE lot size) |
+| `LOT_SIZE` | `65` | NIFTY lot size (verify current NSE lot size) |
 | `NUMBER_OF_LOTS` | `1` | Lots per leg |
 | `PRODUCT` | `MIS` | MIS (intraday) or NRML (carry forward) |
 | `STRIKE_ROUNDING` | `50` | Strike interval for ATM calculation |

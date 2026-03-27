@@ -851,6 +851,10 @@ class OrderEngine:
         if not state[active_key]:
             return
 
+        if state.get(f"close_failed_{leg_l}"):
+            plog(f"Skipping {leg} close — already failed max retries (manual intervention needed)", "WARNING")
+            return
+
         symbol = state[sym_key]
         plog(f"Closing {leg} ({symbol}): {reason}")
 
@@ -887,6 +891,8 @@ class OrderEngine:
         if not order_sent:
             plog(f"CRITICAL: Could not close {leg} after 3 attempts — leg still open", "ERROR")
             telegram.notify(f"🚨 CRITICAL: Failed to close {leg} ({symbol}) after 3 attempts. Position still open!")
+            state[f"close_failed_{leg_l}"] = True
+            save_state()
             return
 
         if fill_price <= 0:
