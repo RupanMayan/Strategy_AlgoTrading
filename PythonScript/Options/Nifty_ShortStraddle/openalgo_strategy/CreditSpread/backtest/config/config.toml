@@ -1,0 +1,51 @@
+# Nifty Bull Put Spread — Backtest Configuration
+# Sell OTM PE + Buy further OTM PE for defined-risk theta capture
+
+[instrument]
+underlying = "NIFTY"
+exchange = "NSE_INDEX"
+option_exchange = "NFO"
+lot_size = 65
+number_of_lots = 1
+product = "MIS"
+strike_rounding = 50
+capital = 250000
+dynamic_lot_sizing = true
+compound_capital = false
+max_lots = 50
+
+[spread]
+# Sell PE at ATM - sell_offset points, Buy PE at ATM - buy_offset points
+sell_offset = 100   # ATM-2 strikes = ATM-100 pts (sell leg)
+buy_offset = 300    # ATM-6 strikes = ATM-300 pts (buy leg / protection)
+# Spread width = buy_offset - sell_offset = 200 pts
+
+[timing]
+entry_time = "09:17"
+exit_time = "15:15"
+monitor_interval_sec = 5
+
+[filters]
+trade_dte = [0, 1, 2, 3, 4]
+skip_months = []
+
+[risk]
+# SL on spread: exit if unrealised loss reaches X% of max possible loss
+spread_sl_pct = 70.0   # Exit if loss = 70% of max loss (spread_width - credit)
+
+[risk.daily_limits]
+profit_target = 5000
+loss_limit = -5000
+
+[charges]
+brokerage_per_order = 20.0
+stt_sell_pct = 0.0625
+exchange_txn_pct = 0.053
+sebi_pct = 0.0001
+gst_pct = 18.0
+stamp_duty_buy_pct = 0.003
+
+[backtest]
+start_date = "2021-04-01"
+end_date = "2026-03-28"
+slippage_points = 1.0
