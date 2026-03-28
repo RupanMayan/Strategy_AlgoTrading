@@ -36,6 +36,7 @@ TRADE_DTE        = [0, 1, 2, 3, 4]
 SKIP_MONTHS      = []
 
 LEG_SL_PERCENT   = 30.0
+LEG_SL_DTE_MAP   = {0: 40.0}  # DTE-specific SL override (expiry day gets wider SL)
 DAILY_TARGET     = 10000
 DAILY_LOSS_LIMIT = -6000
 NET_PNL_GUARD_MAX_DEFER_MIN = 15
@@ -577,7 +578,9 @@ def sl_level(leg: str) -> float:
             return round(other_entry * (1.0 + LEG_SL_PERCENT / 100.0), 2)
         return 0.0
 
-    fixed_sl = round(entry * (1.0 + LEG_SL_PERCENT / 100.0), 2)
+    dte = state.get("current_dte")
+    sl_pct = LEG_SL_DTE_MAP.get(dte, LEG_SL_PERCENT) if dte is not None else LEG_SL_PERCENT
+    fixed_sl = round(entry * (1.0 + sl_pct / 100.0), 2)
 
     if BREAKEVEN_ENABLED and state.get(f"breakeven_active_{leg_l}", False):
         be_sl = state.get(f"breakeven_sl_{leg_l}", 0.0)

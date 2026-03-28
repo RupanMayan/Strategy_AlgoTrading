@@ -27,6 +27,7 @@ skip_months = []  # No months skipped
 [risk.per_leg_sl]
 enabled = true
 sl_percent = 30.0  # % above entry premium
+sl_dte_map = {0 = 40.0}  # DTE 0 (expiry day) gets wider SL to survive gamma spikes
 
 [risk.daily_limits]
 profit_target = 10000   # Per lot, Rs

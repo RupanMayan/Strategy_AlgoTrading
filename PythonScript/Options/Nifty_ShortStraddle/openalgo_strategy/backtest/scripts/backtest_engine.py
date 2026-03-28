@@ -150,8 +150,16 @@ class Config:
     trade_dte: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
     skip_months: list[int] = field(default_factory=lambda: [11])
 
+    # Entry filters
+    min_combined_premium: float = 0.0  # Skip entry if combined premium < this (0 = disabled)
+
     # Per-leg SL
     leg_sl_pct: float = 30.0
+    leg_sl_dte_map: dict[int, float] = field(default_factory=dict)  # DTE-specific SL override
+
+    # Combined SL (alternative to per-leg)
+    combined_sl_enabled: bool = False   # Use combined premium SL instead of per-leg
+    combined_sl_pct: float = 30.0       # Exit if combined premium rises by this %
 
     # Daily limits
     daily_target: float = 10000.0
@@ -243,10 +251,17 @@ def load_config(path: str | Path) -> Config:
     filt = raw.get("filters", {})
     c.trade_dte = filt.get("trade_dte", c.trade_dte)
     c.skip_months = filt.get("skip_months", c.skip_months)
+    c.min_combined_premium = filt.get("min_combined_premium", c.min_combined_premium)
 
     risk = raw.get("risk", {})
     sl = risk.get("per_leg_sl", {})
     c.leg_sl_pct = sl.get("sl_percent", c.leg_sl_pct)
+    if "sl_dte_map" in sl:
+        c.leg_sl_dte_map = {int(k): float(v) for k, v in sl["sl_dte_map"].items()}
+
+    csl = risk.get("combined_sl", {})
+    c.combined_sl_enabled = csl.get("enabled", c.combined_sl_enabled)
+    c.combined_sl_pct = csl.get("sl_percent", c.combined_sl_pct)
 
     dl = risk.get("daily_limits", {})
     c.daily_target = dl.get("profit_target", c.daily_target)
@@ -548,6 +563,11 @@ class BacktestEngine:
         if ce_entry <= 0 or pe_entry <= 0:
             return None
 
+        # Min combined premium filter
+        if self.cfg.min_combined_premium > 0:
+            if (ce_entry + pe_entry) < self.cfg.min_combined_premium:
+                return None
+
         vix = self._get_vix_at(entry_dt)
 
         # Dynamic lot sizing: SEBI lot size for the date + capital-based allocation
@@ -671,9 +691,12 @@ class BacktestEngine:
     ) -> str | None:
         """Run all exit checks in production priority order."""
 
-        # --- Priority 1: Per-Leg SL Check ---
+        # --- Priority 1: Per-Leg SL Check (skip if combined SL is active with both legs) ---
+        skip_per_leg_sl = self.cfg.combined_sl_enabled and trade.ce.active and trade.pe.active
         for leg_name, leg, candle in [("CE", trade.ce, ce_candle), ("PE", trade.pe, pe_candle)]:
             if not leg.active or candle is None:
+                continue
+            if skip_per_leg_sl:  # Combined SL handles both legs; per-leg SL still runs for single survivor
                 continue
 
             ltp = candle["high"]  # Worst case for sold option
@@ -716,6 +739,16 @@ class BacktestEngine:
 
         if self._active_leg_count(trade) == 0:
             return trade.exit_reason
+
+        # --- Combined SL Check (alternative to per-leg SL) ---
+        if self.cfg.combined_sl_enabled and trade.ce.active and trade.pe.active and ce_candle and pe_candle:
+            combined_entry = trade.ce.entry_price + trade.pe.entry_price
+            combined_current = ce_candle["high"] + pe_candle["high"]  # Worst case
+            combined_rise_pct = ((combined_current - combined_entry) / combined_entry) * 100
+            if combined_rise_pct >= self.cfg.combined_sl_pct:
+                reason = f"Combined SL ({combined_rise_pct:.1f}%)"
+                self._close_all_with_candles(trade, reason, tick_time, ce_candle, pe_candle)
+                return reason
 
         # --- Priority 2: Combined Checks (both legs active) ---
         if trade.ce.active and trade.pe.active and ce_candle and pe_candle:
@@ -835,7 +868,9 @@ class BacktestEngine:
         if entry <= 0:
             return 0.0
 
-        fixed_sl = round(entry * (1.0 + self.cfg.leg_sl_pct / 100.0), 2)
+        # DTE-specific SL override
+        sl_pct = self.cfg.leg_sl_dte_map.get(trade.current_dte, self.cfg.leg_sl_pct) if self.cfg.leg_sl_dte_map else self.cfg.leg_sl_pct
+        fixed_sl = round(entry * (1.0 + sl_pct / 100.0), 2)
 
         if self.cfg.breakeven_enabled and leg.breakeven_active:
             be_sl = leg.breakeven_sl
