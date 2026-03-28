@@ -4,44 +4,77 @@ Production-sync backtest for `nifty_short_straddle.py`. Replays every exit modul
 
 ---
 
-## Results Summary (2026-03-28, Post-Optimization)
+## Results Summary (2026-03-29, Production Config with 7 Risk Fixes)
 
-### Fixed Capital Mode (₹2.5L, no compounding)
+### Fixed Capital Mode (Rs 2.5L, no compounding) — RECOMMENDED
 
 | Metric | Value |
 |--------|-------|
 | Period | Apr 2021 - Mar 2026 (5 years) |
 | Starting Capital | Rs 2,50,000 |
-| Total Trades | 1,220 |
-| Net P&L (after charges) | Rs 13,31,475 |
-| ROI (5 year) | 533% |
-| Annual ROI | 106% |
-| Win Rate | 65.2% |
-| Profit Factor | 2.33 |
-| Sharpe Ratio | 4.91 |
-| Calmar Ratio | 40.47 |
-| Max Drawdown | Rs -32,897 (13% of capital) |
-| Total Charges | Rs 1,58,074 (10.6% of gross) |
+| Final Capital | Rs 29,34,686 |
+| Total Trades | 1,101 |
+| Net P&L (after charges) | Rs 26,84,686 |
+| ROI (5 year) | 1,074% |
+| Annual ROI | ~215% |
+| Win Rate | 85.2% |
+| Profit Factor | 9.38 |
+| Sharpe Ratio | 12.84 |
+| Calmar Ratio | 282.13 |
+| Max Drawdown | Rs -9,516 (3.8% of capital) |
+| Total Charges | Rs 1,45,833 (5.2% of gross) |
+| Avg Daily P&L | Rs 2,438 |
+| Max Consecutive Loss Days | 3 |
 
-### Compounded Capital Mode (₹2.5L start, profits reinvested, max 50 lots)
+### Compounded Capital Mode (Rs 2.5L start, profits reinvested, max 50 lots)
 
 | Metric | Value |
 |--------|-------|
-| Total Trades | 1,220 |
-| Net P&L (after charges) | Rs 2,49,14,096 (Rs 2.49 Cr) |
-| Win Rate | 66.1% |
-| Profit Factor | 2.27 |
-| Max Drawdown | Rs -9,84,350 |
+| Total Trades | 1,042 |
+| Net P&L (after charges) | Rs 4,24,37,949 (Rs 4.24 Cr) |
+| ROI (5 year) | 16,975% |
+| Win Rate | 85.6% |
+| Profit Factor | 7.24 |
+| Sharpe Ratio | 8.30 |
+| Calmar Ratio | 106.92 |
+| Max Drawdown | Rs -3,96,903 (158.8% of starting capital) |
+| Total Charges | Rs 7,90,739 |
+| Avg Lots/Trade | 44.49 |
+| Largest Single Loss | Rs -3,10,298 |
 
-### Optimisation Applied
+**Why Fixed is Recommended:** Compounding hits max 50 lots by mid-2022 and stays capped. At 50 lots x 65 = 3,250 qty, liquidity in weekly NIFTY options becomes a real concern. Risk-adjusted returns (Sharpe 12.84 vs 8.30, Calmar 282x vs 107x) strongly favor fixed capital. A single bad compounding trade can lose Rs 3.1L vs Rs 6.7K in fixed mode.
+
+### Year-Wise Summary (Fixed Capital)
+
+| Year | Trades | Net P&L | Win Rate | Avg Lots | Lot Size |
+|------|--------|---------|----------|----------|----------|
+| 2021 | 180 | Rs 5,04,418 | 86.7% | 5.2 | 25 |
+| 2022 | 229 | Rs 6,77,922 | 87.3% | 5.0 | 25 |
+| 2023 | 217 | Rs 4,97,358 | 90.3% | 4.4 | 25 |
+| 2024 | 234 | Rs 5,72,157 | 82.9% | 3.2 | 25-75 |
+| 2025 | 198 | Rs 3,85,766 | 81.3% | 1.0 | 75 |
+| 2026 | 43 | Rs 47,066 | 72.1% | 1.0 | 65 |
+
+### Risk Management — 7 Institutional Fixes (All Enabled)
+
+| Fix | Description | Impact |
+|-----|-------------|--------|
+| 1. Max Trade Loss | Rs 15,000/lot absolute cap per trade | Catastrophic loss prevention |
+| 2. Margin Fail-Closed | Skip entry if margin API fails (was fail-open) | Prevents unintended exposure |
+| 3. VIX Entry Filter | Skip entry if VIX < 11 or VIX > 25 | Avoids thin premiums and gamma risk |
+| 4. Spot-Move Exit | Close if spot moves >= combined premium collected | Limits directional exposure |
+| 5. Weekly Drawdown Guard | Skip entry if rolling 5-day P&L < Rs -20,000/lot | Prevents drawdown spirals |
+| 6. ORB Filter | Skip entry if spot moved > 0.5% from 09:15 open | Avoids gap-up/gap-down entries |
+| 7. Combined SL | 30% combined premium SL (replaces per-leg SL when both legs active) | Single biggest contributor — reduced per-leg SL hits from 87 to 22 |
+
+### Optimization History (Applied)
 
 | Change | Impact |
 |--------|--------|
 | Re-entry disabled (`max_per_day = 0`) | +9% P&L, -17% max DD, +3% win rate |
 | DTE 0 wider SL (`sl_dte_map = {0: 40}`) | +28% P&L, -56% max DD |
 | November enabled (`skip_months = []`) | More trading days, all months net positive |
-
-See `BACKTEST_REPORT.md` for full optimization history with all test results and rejected approaches.
+| 7 risk fixes (combined) | +102% P&L, -71% max DD, +20pp win rate |
 
 ---
 
@@ -52,7 +85,7 @@ The engine uses SEBI-mandated NIFTY 50 lot sizes which changed over the backtest
 | Period | Lot Size | Reason |
 |--------|----------|--------|
 | Apr 2021 - Nov 19, 2024 | 25 | Pre-SEBI revision |
-| Nov 20, 2024 - Jan 5, 2026 | 75 | SEBI min contract value ₹15L (tripled from 25) |
+| Nov 20, 2024 - Jan 5, 2026 | 75 | SEBI min contract value Rs 15L (tripled from 25) |
 | Jan 6, 2026 onwards | 65 | NSE periodic revision (Sep 2025 avg prices) |
 
 Sources: NSE Circular FAOP70616, Zerodha, Groww, Angel One
@@ -64,9 +97,11 @@ Sources: NSE Circular FAOP70616, Zerodha, Groww, Angel One
 ```
 backtest/
 ├── README.md                    # This file
-├── BACKTEST_REPORT.md           # Full optimization report & recommendations
 ├── config/
-│   ├── config.toml              # Final production-synced config
+│   ├── config.toml              # Baseline config (pre-risk fixes)
+│   ├── config_production.toml   # Current production config (7 risk fixes)
+│   ├── config_production_compound.toml  # Production + compounding
+│   ├── config_enhanced_risk.toml # Enhanced risk config (used in comparison)
 │   ├── opt_no_reentry.toml      # Test: no re-entry (APPLIED)
 │   ├── opt_dte0_sl40.toml       # Test: DTE 0 wider SL (APPLIED)
 │   ├── opt_sl25.toml            # Test: SL 25% (REJECTED)
@@ -88,12 +123,19 @@ backtest/
 │   ├── analytics.py             # Post-trade analytics & charts
 │   ├── dashboard.py             # Interactive HTML dashboard generator
 │   ├── run_backtest.py          # Main entry — orchestrates everything
+│   ├── run_comparison.py        # Baseline vs enhanced risk comparison
+│   ├── run_fixed_vs_compound.py # Fixed vs compounding capital comparison
 │   └── run_optimization.py      # Optimization test runner (multi-config)
 └── results/
-    └── 2026-03-28/
-        ├── fixed/index.html     # Interactive dashboard (final config)
-        ├── compounded/index.html # Interactive dashboard (compounded mode)
-        └── optimization/        # All optimization test results
+    ├── 2026-03-28/
+    │   ├── fixed/index.html     # Dashboard (pre-risk-fixes config)
+    │   ├── compounded/index.html
+    │   ├── comparison/          # Baseline vs enhanced comparison
+    │   └── optimization/        # All optimization test results
+    └── 2026-03-29/
+        ├── production/index.html  # Dashboard (production config, 7 risk fixes)
+        ├── fixed/index.html       # Dashboard (fixed capital, latest)
+        └── fixed_vs_compound/     # Fixed vs compounding comparison
 ```
 
 ---
@@ -106,7 +148,7 @@ backtest/
 | ATM CE/PE 1-min | Dhan | `/v2/charts/rollingoption` (30-day chunks) | 5 years |
 | India VIX 1-min | OpenAlgo | `/api/v1/history` (30-day chunks) | 5 years |
 
-**Note:** Dhan VIX data was incorrect (returned Nifty spot values). VIX is sourced from OpenAlgo API instead.
+**Note:** Dhan VIX data was incorrect (returned Nifty spot values). VIX is sourced from OpenAlgo API instead. VIX has a data gap for Apr-Jul 2021 (86 days) — VIX entry filter can't fire for those days, which is conservative (allows more trades).
 
 ---
 
@@ -119,8 +161,8 @@ Uses static `lot_size` and `number_of_lots` from config for all trades.
 
 ### 2. Dynamic Mode (`dynamic_lot_sizing = true, compound_capital = false`)
 - Lot size per SEBI history for the trade date
-- Number of lots = `floor(capital / (spot × lot_size × 9% margin × 1.20 buffer))`
-- Capital stays fixed at ₹2.5L throughout
+- Number of lots = `floor(capital / (spot x lot_size x 9% margin x 1.20 buffer))`
+- Capital stays fixed at Rs 2.5L throughout
 
 ### 3. Compounded Mode (`dynamic_lot_sizing = true, compound_capital = true`)
 - Same as dynamic, but capital = starting capital + cumulative net P&L
@@ -130,13 +172,22 @@ Uses static `lot_size` and `number_of_lots` from config for all trades.
 
 ---
 
-## Production Logic — 13 Exit Modules (Priority Order)
+## Production Logic — Exit Priority Chain
 
 The backtest engine replicates every exit check in the exact same priority order as `Monitor._tick_inner()` in `nifty_short_straddle.py`:
 
-### Priority 1: Per-Leg Stop Loss
-- SL = entry_price × 1.30 (30% above entry), **1.40 on DTE 0** (expiry day)
-- DTE 0 gets wider SL to survive gamma spikes — avoids ~49 false SL exits
+### Priority 0: Max Trade Loss (absolute rupee cap)
+- Close all if combined MTM breaches Rs 15,000/lot
+- Highest priority — overrides all other exits
+
+### Priority 0b: Combined SL (both legs active)
+- Exit if combined premium rises 30% from entry
+- Replaces per-leg SL when both legs are active
+- Single biggest contributor to improved results
+
+### Priority 1: Per-Leg Stop Loss (single survivor only)
+- SL = entry_price x 1.30 (30% above entry), **1.40 on DTE 0** (expiry day)
+- Only fires when one leg has already been closed
 - Uses candle **high** (worst case for sold option)
 - Net P&L guard: defer SL up to 15min if net position is profitable
 - Breakeven SL replaces fixed SL after partial exit
@@ -148,33 +199,46 @@ The backtest engine replicates every exit check in the exact same priority order
 - Close all when combined premium decays to target
 
 **2b. Asymmetric Leg Booking:**
-- Winner leg ≤ 40% of entry AND loser leg ≥ 80% of entry → close winner only
+- Winner leg <= 40% of entry AND loser leg >= 80% of entry -> close winner only
 
 **2c. Combined Profit Trailing:**
 - Activate at 30% combined decay, track peak
 - Exit on 40% retracement from peak
 
 ### Priority 3: Winner Booking (single survivor)
-- If survivor decayed to ≤ 30% of entry → close it
+- If survivor decayed to <= 30% of entry -> close it
 
-### Priority 4: VIX Spike Exit
-- Every 5 min: if VIX rose ≥ 15% from entry AND VIX ≥ 18 → close all
+### Priority 4: P&L Calculation
+- Combined = closed_pnl + open_mtm
 
-### Priority 5: Daily P&L Limits
-- Profit target: +₹10,000/lot → close all
-- Loss limit: -₹6,000/lot → close all
+### Priority 5: VIX Spike Exit
+- Every 5 min: if VIX rose >= 15% from entry AND VIX >= 18 -> close all
 
-### Priority 6: Time Exit
-- At 15:15 IST → close all remaining legs
+### Priority 5b: Spot-Move Exit
+- Close if |current_spot - entry_spot| >= combined_premium x multiplier
 
-### Re-Entry Logic (DISABLED)
-- `max_per_day = 0` — re-entry disabled after backtest optimization
-- Re-entry trades had 42% win rate and lost Rs 87,743 total over 5 years
-- Disabling improved all metrics: +9% P&L, better Sharpe, lower drawdown
+### Priority 6: Daily P&L Limits
+- Profit target: +Rs 10,000/lot -> close all
+- Loss limit: -Rs 6,000/lot -> close all
+
+### Priority 7: Time Exit
+- At 15:15 IST -> close all remaining legs
+
+### Entry Filters (checked before entry)
+
+| Order | Filter | Condition |
+|-------|--------|-----------|
+| 1 | Skip Months | Month in skip list |
+| 2 | DTE Filter | DTE not in [0,1,2,3,4] |
+| 3 | VIX Entry Filter | VIX < 11 or VIX > 25 |
+| 4 | ORB Filter | Spot moved > 0.5% from 09:15 open |
+| 5 | Weekly Drawdown Guard | Rolling 5-day P&L < Rs -20,000/lot |
+| 6 | Re-entry Check | Cooldown, max per day, max loss |
+| 7 | Margin Guard | Insufficient margin (fail-closed) |
 
 ### Breakeven SL Activation
-- After one leg exits at a loss → survivor gets breakeven SL
-- BE SL = entry + (closed_loss / qty) × 1.05 (5% buffer)
+- After one leg exits at a loss -> survivor gets breakeven SL
+- BE SL = entry + (closed_loss / qty) x 1.05 (5% buffer)
 - 5 min grace period before activation
 - Only if survivor is currently losing
 
@@ -194,8 +258,8 @@ The backtest engine replicates every exit check in the exact same priority order
 **Example:** Straddle with combined premium Rs 400, qty 65:
 - Premium value = Rs 26,000
 - Brokerage = Rs 80 (4 orders)
-- STT + Exchange + SEBI + GST + Stamp ≈ Rs 64
-- **Total ≈ Rs 144 per trade**
+- STT + Exchange + SEBI + GST + Stamp ~ Rs 64
+- **Total ~ Rs 144 per trade**
 
 ---
 
@@ -204,10 +268,12 @@ The backtest engine replicates every exit check in the exact same priority order
 | Check | Candle Field | Rationale |
 |-------|-------------|-----------|
 | SL hit (sold option rising) | **High** | Worst case intraday |
+| Combined SL | **High** + **High** | Conservative (both legs worst case) |
 | Decay / P&L calculation | **Close** | End-of-minute fair value |
 | Entry price | **Open** of 09:17 candle | Market order fills near open |
 | Exit price | **Close** of trigger candle | Conservative fill estimate |
-| Slippage | +1 pt entry, -1 pt exit | Configurable in config.toml |
+| SL fill price | **max(Close, SL level)** | Simulates market order fill at/above SL |
+| Slippage | -1 pt entry (sell lower), +1 pt exit (buy higher) | Adverse for short positions |
 
 ---
 
@@ -224,8 +290,14 @@ export DHAN_ACCESS_TOKEN="your_token"
 # Step 1: Fetch data (one-time, ~10 min)
 python scripts/data_fetcher.py
 
-# Step 2: Run backtest
-python scripts/run_backtest.py
+# Step 2: Run backtest (production config)
+python scripts/run_backtest.py --config config/config_production.toml
+
+# Step 3: Compare fixed vs compounding
+python scripts/run_fixed_vs_compound.py
+
+# Step 4: Compare baseline vs enhanced risk
+python scripts/run_comparison.py
 
 # Custom date range
 python scripts/run_backtest.py --start 2023-01-01 --end 2024-12-31
@@ -235,10 +307,10 @@ python scripts/run_backtest.py --start 2023-01-01 --end 2024-12-31
 
 ### Switching Between Modes
 
-Edit `config/config.toml`:
+Edit `config/config_production.toml`:
 
 ```toml
-# Fixed capital (no compounding)
+# Fixed capital (no compounding) — RECOMMENDED
 compound_capital = false
 
 # Compounded capital (profits reinvested)
@@ -255,9 +327,18 @@ Each run creates `results/YYYY-MM-DD/` with:
 - `summary.json` — key metrics for programmatic comparison
 - `trades.csv` — every trade with P&L, charges, lot size, capital used
 - `report.md` — full report with year-wise and month-wise breakdowns
+- `index.html` — interactive dashboard with equity curve, drawdown, monthly heatmap, DTE breakdown, exit reasons
 
-The report includes:
-- Gross P&L, charges, and net P&L at monthly and yearly level
-- Capital allocation per year (lots, lot size, qty)
-- Win/loss statistics and exit reason analysis
-- 6 charts: equity curve, drawdown, monthly heatmap, DTE breakdown, exit reasons, yearly summary
+---
+
+## Backtest vs Production Sync Status
+
+Last verified: 2026-03-29
+
+- Config values: **100% match** (all 40+ parameters verified)
+- Exit logic priority chain: **100% match** (all 13 exit modules in same order)
+- Entry filter chain: **100% match** (all 7 filters in same order)
+- Known intentional differences:
+  - Backtest uses candle high for SL checks (conservative); production uses live LTP
+  - Backtest uses max(close, SL) for SL fill price; production fills at market
+  - Margin guard uses internal calculation in backtest vs API call in production

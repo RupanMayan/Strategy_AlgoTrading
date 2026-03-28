@@ -1,36 +1,44 @@
-# Backtest Report — Nifty Short Straddle
+# Backtest Report — Nifty Short Straddle (Production Config)
 
-Generated: 2026-03-29 02:28:30
+Generated: 2026-03-29
+Config: `config_production.toml` (7 institutional risk fixes enabled)
+Mode: Fixed capital (Rs 2,50,000, no compounding)
+
+---
 
 ## Key Metrics
 
 | Metric | Value |
 |--------|-------|
-| Total Trades | 1101 |
+| Period | Apr 2021 - Mar 2026 (1,226 trading days) |
+| Total Trades | 1,101 |
 | Win Rate | 85.2% |
-| Gross P&L | Rs 2,830,519.50 |
-| Total Charges (Brokerage + Tax) | Rs 145,833.04 |
-| Net P&L (after charges) | Rs 2,684,686.46 |
+| Gross P&L | Rs 28,30,520 |
+| Total Charges (Brokerage + Tax) | Rs 1,45,833 |
+| Net P&L (after charges) | Rs 26,84,686 |
 | Profit Factor | 9.38 |
-| Max Drawdown | Rs -9,515.75 |
+| Max Drawdown | Rs -9,516 |
 | Max DD Date | 2025-01-29 |
+| Max DD as % of Capital | 3.8% |
 | Sharpe Ratio | 12.84 |
 | Calmar Ratio | 282.13 |
 | Avg Trade Duration | 301 min |
-| Profitable Days | 938/1101 (85.2%) |
+| Profitable Days | 938/1,101 (85.2%) |
 | Re-entry Trades | 0 |
+| Max Consecutive Loss Days | 3 |
+| Worst 5% Avg Loss | Rs -3,842 |
 
 ## Capital & Lot Allocation (Fixed)
 
 | Parameter | Value |
 |-----------|-------|
-| Starting Capital | Rs 250,000 |
-| Final Capital | Rs 2,934,686 |
-| Net P&L (5 years) | Rs 2,684,686.46 |
-| Total Return | 1073.9% |
-| CAGR (approx) | 63.7% |
-| Total Charges (Tax+Brokerage) | Rs 145,833.04 |
+| Starting Capital | Rs 2,50,000 |
+| Final Capital | Rs 29,34,686 |
+| Total Return | 1,074% |
+| CAGR (approx) | ~63.7% |
+| Total Charges (Tax+Brokerage) | Rs 1,45,833 |
 | Charges as % of Gross | 5.2% |
+| Avg Daily P&L | Rs 2,438 |
 
 **SEBI Lot Size History:**
 - Apr 2021 - Nov 2024: Lot size = 25
@@ -39,18 +47,30 @@ Generated: 2026-03-29 02:28:30
 
 **Dynamic Allocation:** Capital-based lot sizing with 9% SPAN margin + 20% buffer
 
+## Risk Management — 7 Institutional Fixes
+
+All fixes enabled in this backtest, matching production:
+
+| # | Fix | Config Value | Purpose |
+|---|-----|-------------|---------|
+| 1 | Max Trade Loss | Rs 15,000/lot | Absolute rupee cap per trade |
+| 2 | Margin Fail-Closed | `fail_open = false` | Skip entry if margin API fails |
+| 3 | VIX Entry Filter | 11.0 - 25.0 | Avoid thin premiums / gamma risk |
+| 4 | Spot-Move Exit | 1.0x premium | Close if spot moves beyond premium |
+| 5 | Weekly Drawdown Guard | Rs -20,000/lot | Pause after sustained losses |
+| 6 | ORB Filter | 0.5% threshold | Skip entry on gap-up/gap-down |
+| 7 | Combined SL | 30% rise | Replace per-leg SL when both legs active |
 
 ## Yearly Breakdown
 
 | Year | Trades | Gross P&L | Charges | Net P&L | Win Rate | Avg Lots | Lot Size | Avg Qty |
 |------|--------|-----------|---------|---------|----------|----------|----------|----------|
-| 2021 | 180 | Rs 528,852 | Rs 24,434 | Rs 504,418 | 86.7% | 5.2 | 25 | 130 |
-| 2022 | 229 | Rs 710,789 | Rs 32,867 | Rs 677,922 | 87.3% | 5.0 | 25 | 124 |
-| 2023 | 217 | Rs 524,595 | Rs 27,237 | Rs 497,358 | 90.3% | 4.4 | 25 | 111 |
-| 2024 | 234 | Rs 602,876 | Rs 30,719 | Rs 572,157 | 82.9% | 3.2 | 31 | 85 |
-| 2025 | 198 | Rs 410,662 | Rs 24,897 | Rs 385,766 | 81.3% | 1.0 | 75 | 75 |
+| 2021 | 180 | Rs 5,28,852 | Rs 24,434 | Rs 5,04,418 | 86.7% | 5.2 | 25 | 130 |
+| 2022 | 229 | Rs 7,10,789 | Rs 32,867 | Rs 6,77,922 | 87.3% | 5.0 | 25 | 124 |
+| 2023 | 217 | Rs 5,24,595 | Rs 27,237 | Rs 4,97,358 | 90.3% | 4.4 | 25 | 111 |
+| 2024 | 234 | Rs 6,02,876 | Rs 30,719 | Rs 5,72,157 | 82.9% | 3.2 | 31 | 85 |
+| 2025 | 198 | Rs 4,10,662 | Rs 24,897 | Rs 3,85,766 | 81.3% | 1.0 | 75 | 75 |
 | 2026 | 43 | Rs 52,744 | Rs 5,679 | Rs 47,066 | 72.1% | 1.0 | 65 | 65 |
-
 
 ## Monthly Breakdown
 
@@ -117,18 +137,36 @@ Generated: 2026-03-29 02:28:30
 | 2026 | Feb | 18 | Rs 25,538 | Rs 2,217 | Rs 23,321 | 77.8% |
 | 2026 | Mar | 12 | Rs 5,258 | Rs 1,823 | Rs 3,436 | 58.3% |
 
-
 ## Win/Loss Stats
 
 | Metric | Value |
 |--------|-------|
-| Avg Win | Rs 3,203.71 |
-| Avg Loss | Rs -1,965.59 |
-| Largest Win | Rs 20,569.86 |
-| Largest Loss | Rs -6,718.72 |
-| Avg Combined Premium | Rs 206.89 |
-| Best Month | 2023-02 (Rs 84,166.72) |
-| Worst Month | 2026-03 (Rs 3,435.66) |
+| Avg Win | Rs 3,204 |
+| Avg Loss | Rs -1,966 |
+| Largest Win | Rs 20,570 |
+| Largest Loss | Rs -6,719 |
+| Avg Combined Premium | Rs 207 |
+| Best Month | 2023-02 (Rs 84,167) |
+| Worst Month | 2026-03 (Rs 3,436) |
+| Avg Lots/Trade | 3.65 |
+| Max Lots/Trade | 6 |
+
+## Fixed vs Compounding Comparison
+
+| Metric | Fixed | Compound | Delta |
+|--------|-------|----------|-------|
+| Net P&L | Rs 26,84,686 | Rs 4,24,37,949 | +Rs 3,97,53,263 |
+| Total Return | 1,074% | 16,975% | +15,901% |
+| Win Rate | 85.2% | 85.6% | +0.4pp |
+| Profit Factor | 9.38 | 7.24 | -2.14 |
+| Max Drawdown | Rs -9,516 | Rs -3,96,903 | -Rs 3,87,388 |
+| Max DD % Capital | 3.8% | 158.8% | +155.0pp |
+| Sharpe Ratio | 12.84 | 8.30 | -4.54 |
+| Calmar Ratio | 282.13 | 106.92 | -175.21 |
+| Largest Loss | Rs -6,719 | Rs -3,10,298 | -Rs 3,03,580 |
+| Return/MaxDD | 282.1x | 106.9x | -175.2x |
+
+**Verdict:** Fixed capital is recommended for production. Compounding amplifies both gains and losses — at 50 lots, a single bad trade can lose Rs 3.1L. Risk-adjusted metrics (Sharpe, Calmar) strongly favor fixed.
 
 ## Charges Breakdown
 
@@ -141,11 +179,14 @@ Generated: 2026-03-29 02:28:30
 | GST | 18% on brokerage + exchange + SEBI |
 | Stamp Duty | 0.003% on buy side |
 
-## Charts
+## Caveats
 
-- [Equity Curve](charts/equity_curve.png)
-- [Drawdown](charts/drawdown.png)
-- [Monthly Heatmap](charts/monthly_heatmap.png)
-- [DTE Breakdown](charts/dte_breakdown.png)
-- [Exit Reasons](charts/exit_reasons.png)
-- [Yearly Summary](charts/yearly_summary.png)
+- **85% win rate may be optimistic for live:** Backtest uses 1-min candles; live trading with 5-second monitoring may trigger more SLs
+- **Slippage is conservative:** 1pt per leg may underestimate real-world slippage, especially at higher lot counts
+- **VIX data gap:** Apr-Jul 2021 (86 days) has no VIX data — VIX entry filter can't fire for those days
+- **No position sizing risk:** Fixed capital mode uses Rs 2.5L throughout; actual margin requirements vary
+- **Past performance:** 5-year backtest does not guarantee future results; market microstructure changes (e.g., SEBI lot size changes, expiry day shifts from Thursday to Tuesday) affect strategy behavior
+
+## Dashboard
+
+Interactive HTML dashboard: [index.html](index.html)
