@@ -1028,8 +1028,9 @@ class BacktestEngine:
         self.trades.append(record)
 
         # Update day state and running capital
-        day_state.cumulative_pnl += net_pnl
-        day_state.last_trade_pnl = net_pnl
+        # Production uses gross P&L (closed_pnl) for daily tracking, not net
+        day_state.cumulative_pnl += gross_pnl
+        day_state.last_trade_pnl = gross_pnl
         day_state.last_close_time = datetime.fromisoformat(exit_time) if exit_time else None
         if self.cfg.compound_capital:
             self.running_capital += net_pnl

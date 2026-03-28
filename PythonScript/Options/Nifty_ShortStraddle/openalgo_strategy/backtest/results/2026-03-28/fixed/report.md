@@ -1,35 +1,35 @@
 # Backtest Report — Nifty Short Straddle
 
-Generated: 2026-03-28 11:47:04
+Generated: 2026-03-28 12:15:44
 
 ## Key Metrics
 
 | Metric | Value |
 |--------|-------|
-| Total Trades | 1422 |
-| Win Rate | 58.9% |
-| Gross P&L | Rs 1,136,638.15 |
-| Total Charges (Brokerage + Tax) | Rs 183,664.42 |
-| Net P&L (after charges) | Rs 952,973.73 |
+| Total Trades | 1425 |
+| Win Rate | 58.8% |
+| Gross P&L | Rs 1,133,984.15 |
+| Total Charges (Brokerage + Tax) | Rs 183,936.08 |
+| Net P&L (after charges) | Rs 950,048.07 |
 | Profit Factor | 1.72 |
-| Max Drawdown | Rs -89,666.38 |
+| Max Drawdown | Rs -89,759.10 |
 | Max DD Date | 2023-12-20 |
-| Sharpe Ratio | 3.48 |
-| Calmar Ratio | 10.63 |
+| Sharpe Ratio | 3.47 |
+| Calmar Ratio | 10.58 |
 | Avg Trade Duration | 264 min |
-| Profitable Days | 720/1220 (59.0%) |
-| Re-entry Trades | 202 |
+| Profitable Days | 719/1220 (58.9%) |
+| Re-entry Trades | 205 |
 
 ## Capital & Lot Allocation (Fixed)
 
 | Parameter | Value |
 |-----------|-------|
 | Starting Capital | Rs 250,000 |
-| Final Capital | Rs 1,202,974 |
-| Net P&L (5 years) | Rs 952,973.73 |
-| Total Return | 381.2% |
+| Final Capital | Rs 1,200,048 |
+| Net P&L (5 years) | Rs 950,048.07 |
+| Total Return | 380.0% |
 | CAGR (approx) | 36.9% |
-| Total Charges (Tax+Brokerage) | Rs 183,664.42 |
+| Total Charges (Tax+Brokerage) | Rs 183,936.08 |
 | Charges as % of Gross | 16.2% |
 
 **SEBI Lot Size History:**
@@ -46,9 +46,9 @@ Generated: 2026-03-28 11:47:04
 |------|--------|-----------|---------|---------|----------|----------|----------|----------|
 | 2021 | 216 | Rs 164,271 | Rs 28,824 | Rs 135,447 | 60.6% | 5.2 | 25 | 130 |
 | 2022 | 277 | Rs 473,056 | Rs 39,345 | Rs 433,710 | 69.3% | 5.0 | 25 | 124 |
-| 2023 | 284 | Rs 49,576 | Rs 34,908 | Rs 14,668 | 51.1% | 4.4 | 25 | 110 |
-| 2024 | 292 | Rs 229,280 | Rs 37,308 | Rs 191,972 | 57.5% | 3.2 | 31 | 85 |
-| 2025 | 290 | Rs 176,570 | Rs 35,346 | Rs 141,224 | 56.2% | 1.0 | 75 | 75 |
+| 2023 | 285 | Rs 49,586 | Rs 35,011 | Rs 14,575 | 50.9% | 4.4 | 25 | 110 |
+| 2024 | 293 | Rs 229,456 | Rs 37,409 | Rs 192,046 | 57.7% | 3.2 | 31 | 85 |
+| 2025 | 291 | Rs 173,730 | Rs 35,414 | Rs 138,316 | 56.0% | 1.0 | 75 | 75 |
 | 2026 | 63 | Rs 43,885 | Rs 7,933 | Rs 35,953 | 60.3% | 1.0 | 65 | 65 |
 
 
@@ -84,7 +84,7 @@ Generated: 2026-03-28 11:47:04
 | 2023 | May | 24 | Rs -17,015 | Rs 2,970 | Rs -19,985 | 29.2% |
 | 2023 | Jun | 23 | Rs -277 | Rs 2,683 | Rs -2,959 | 47.8% |
 | 2023 | Jul | 23 | Rs 4,494 | Rs 2,781 | Rs 1,713 | 60.9% |
-| 2023 | Aug | 24 | Rs -12,151 | Rs 2,862 | Rs -15,013 | 37.5% |
+| 2023 | Aug | 25 | Rs -12,141 | Rs 2,965 | Rs -15,106 | 36.0% |
 | 2023 | Sep | 24 | Rs 1,914 | Rs 2,834 | Rs -920 | 54.2% |
 | 2023 | Oct | 22 | Rs -14,587 | Rs 2,673 | Rs -17,260 | 50.0% |
 | 2023 | Nov | 25 | Rs -8,594 | Rs 2,888 | Rs -11,482 | 48.0% |
@@ -95,18 +95,18 @@ Generated: 2026-03-28 11:47:04
 | 2024 | Apr | 24 | Rs 19,498 | Rs 3,065 | Rs 16,433 | 54.2% |
 | 2024 | May | 22 | Rs 33,451 | Rs 3,073 | Rs 30,378 | 63.6% |
 | 2024 | Jun | 21 | Rs 19,214 | Rs 2,901 | Rs 16,313 | 47.6% |
-| 2024 | Jul | 29 | Rs 926 | Rs 3,530 | Rs -2,605 | 48.3% |
+| 2024 | Jul | 30 | Rs 1,102 | Rs 3,632 | Rs -2,530 | 50.0% |
 | 2024 | Aug | 27 | Rs -2,631 | Rs 3,243 | Rs -5,874 | 44.4% |
 | 2024 | Sep | 22 | Rs 1,726 | Rs 2,692 | Rs -967 | 54.5% |
 | 2024 | Oct | 29 | Rs 25,778 | Rs 3,527 | Rs 22,251 | 65.5% |
 | 2024 | Nov | 24 | Rs 45,900 | Rs 2,974 | Rs 42,926 | 75.0% |
 | 2024 | Dec | 24 | Rs 33,947 | Rs 3,084 | Rs 30,864 | 54.2% |
 | 2025 | Jan | 27 | Rs 27,526 | Rs 3,465 | Rs 24,061 | 51.9% |
-| 2025 | Feb | 25 | Rs 48,974 | Rs 3,038 | Rs 45,936 | 76.0% |
+| 2025 | Feb | 26 | Rs 46,497 | Rs 3,137 | Rs 43,360 | 73.1% |
 | 2025 | Mar | 21 | Rs -2,108 | Rs 2,564 | Rs -4,672 | 38.1% |
-| 2025 | Apr | 22 | Rs -3,854 | Rs 2,776 | Rs -6,629 | 40.9% |
+| 2025 | Apr | 23 | Rs -4,858 | Rs 2,878 | Rs -7,736 | 39.1% |
 | 2025 | May | 27 | Rs 18,172 | Rs 3,520 | Rs 14,652 | 55.6% |
-| 2025 | Jun | 23 | Rs 24,678 | Rs 2,973 | Rs 21,705 | 56.5% |
+| 2025 | Jun | 22 | Rs 25,319 | Rs 2,839 | Rs 22,480 | 59.1% |
 | 2025 | Jul | 26 | Rs 14,084 | Rs 3,065 | Rs 11,019 | 61.5% |
 | 2025 | Aug | 23 | Rs 14,416 | Rs 2,698 | Rs 11,719 | 56.5% |
 | 2025 | Sep | 25 | Rs 230 | Rs 2,900 | Rs -2,670 | 60.0% |
@@ -122,11 +122,11 @@ Generated: 2026-03-28 11:47:04
 
 | Metric | Value |
 |--------|-------|
-| Avg Win | Rs 2,720.12 |
-| Avg Loss | Rs -2,262.85 |
+| Avg Win | Rs 2,716.96 |
+| Avg Loss | Rs -2,260.25 |
 | Largest Win | Rs 20,569.86 |
 | Largest Loss | Rs -24,072.89 |
-| Avg Combined Premium | Rs 184.87 |
+| Avg Combined Premium | Rs 184.41 |
 | Best Month | 2022-03 (Rs 79,238.10) |
 | Worst Month | 2023-05 (Rs -19,984.81) |
 
