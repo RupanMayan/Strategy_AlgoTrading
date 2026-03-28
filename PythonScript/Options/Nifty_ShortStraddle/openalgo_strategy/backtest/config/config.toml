@@ -62,7 +62,7 @@ buffer_pct = 5.0
 [risk.reentry]
 enabled = true
 cooldown_min = 45
-max_per_day = 2
+max_per_day = 0
 max_loss = 2000  # Per lot, Rs — skip re-entry if cumulative loss exceeds
 
 [risk.vix_spike]

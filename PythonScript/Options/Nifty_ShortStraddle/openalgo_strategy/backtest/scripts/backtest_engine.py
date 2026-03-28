@@ -191,6 +191,7 @@ class Config:
     reentry_cooldown_min: float = 45.0
     reentry_max_per_day: int = 2
     reentry_max_loss: float = 2000.0
+    reentry_only_on_profit: bool = False  # Only re-enter if last trade was profitable
 
     # VIX spike
     vix_spike_enabled: bool = True
@@ -284,6 +285,7 @@ def load_config(path: str | Path) -> Config:
     c.reentry_cooldown_min = re.get("cooldown_min", c.reentry_cooldown_min)
     c.reentry_max_per_day = re.get("max_per_day", c.reentry_max_per_day)
     c.reentry_max_loss = re.get("max_loss", c.reentry_max_loss)
+    c.reentry_only_on_profit = re.get("only_on_profit", c.reentry_only_on_profit)
 
     vs = risk.get("vix_spike", {})
     c.vix_spike_enabled = vs.get("enabled", c.vix_spike_enabled)
@@ -961,6 +963,10 @@ class BacktestEngine:
         # Cooldown check
         elapsed = (tick_time - day_state.last_close_time).total_seconds() / 60
         if elapsed < self.cfg.reentry_cooldown_min:
+            return False
+
+        # Only re-enter after profitable trade (optional)
+        if self.cfg.reentry_only_on_profit and day_state.last_trade_pnl <= 0:
             return False
 
         # Max loss check — production checks LAST trade P&L

@@ -70,7 +70,7 @@ BREAKEVEN_BUFFER_PCT         = 5.0
 
 REENTRY_ENABLED              = True
 REENTRY_COOLDOWN_MIN         = 45
-REENTRY_MAX_PER_DAY          = 2
+REENTRY_MAX_PER_DAY          = 0
 REENTRY_MAX_LOSS             = 2000
 
 WS_ENABLED             = True
