@@ -43,7 +43,7 @@ NET_PNL_GUARD_MAX_DEFER_MIN = 15
 
 MARGIN_GUARD_ENABLED = True
 MARGIN_BUFFER        = 1.20
-MARGIN_FAIL_OPEN     = True
+MARGIN_FAIL_OPEN     = False  # Fail-closed: skip entry if margin API fails
 
 VIX_SPIKE_ENABLED      = True
 VIX_SPIKE_THRESHOLD    = 15.0
@@ -73,6 +73,34 @@ REENTRY_ENABLED              = True
 REENTRY_COOLDOWN_MIN         = 45
 REENTRY_MAX_PER_DAY          = 0
 REENTRY_MAX_LOSS             = 2000
+
+# ── Enhanced Risk Fixes (backtest-validated 2026-03-28) ──────────────────────
+
+# Fix 1: Max trade loss — absolute rupee cap per trade
+MAX_TRADE_LOSS_ENABLED       = True
+MAX_TRADE_LOSS               = 15000  # Per lot, Rs
+
+# Fix 3: VIX entry filter — skip entry outside safe range
+VIX_ENTRY_FILTER_ENABLED     = True
+VIX_ENTRY_MIN                = 11.0
+VIX_ENTRY_MAX                = 25.0
+
+# Fix 4: Spot-move exit — close if underlying moves beyond premium collected
+SPOT_MOVE_EXIT_ENABLED       = True
+SPOT_MOVE_MULTIPLIER         = 1.0
+
+# Fix 5: Weekly drawdown guard — pause after sustained losses
+WEEKLY_DRAWDOWN_ENABLED      = True
+WEEKLY_LOSS_LIMIT            = -20000  # Per lot, Rs
+WEEKLY_PNL_FILE              = "weekly_pnl.json"
+
+# Fix 6: ORB filter — skip entry if market already moved sharply
+ORB_FILTER_ENABLED           = True
+ORB_THRESHOLD_PCT            = 0.5  # %
+
+# Fix 7: Combined SL — use combined premium SL when both legs active
+COMBINED_SL_ENABLED          = True
+COMBINED_SL_PCT              = 30.0
 
 WS_ENABLED             = True
 WS_STALENESS_S         = 60
@@ -988,6 +1016,7 @@ class OrderEngine:
         state["trade_count"] += 1
 
         self._append_trade_log(reason)
+        _record_daily_pnl(final_pnl)
 
         exit_msg = (
             f"{'🟢' if final_pnl >= 0 else '🔴'} EXIT — {reason}\n"
@@ -1077,7 +1106,39 @@ class Monitor:
         if not legs:
             return
 
-        # 1. Per-leg SL check
+        # 0. Max trade loss — absolute rupee cap (highest priority)
+        if MAX_TRADE_LOSS_ENABLED:
+            open_mtm = 0.0
+            for leg in legs:
+                leg_l = leg.lower()
+                entry_px = state[f"entry_price_{leg_l}"]
+                ltp = fetch_ltp(state[f"symbol_{leg_l}"], OPTION_EXCH)
+                if entry_px > 0 and ltp > 0:
+                    open_mtm += (entry_px - ltp) * qty()
+            combined_mtm = state["closed_pnl"] + open_mtm
+            max_loss_threshold = -(MAX_TRADE_LOSS * NUMBER_OF_LOTS)
+            if combined_mtm <= max_loss_threshold:
+                plog(f"MAX TRADE LOSS: ₹{combined_mtm:,.2f} <= ₹{max_loss_threshold:,.2f}")
+                self.engine.close_all(f"Max Trade Loss (₹{combined_mtm:,.2f})")
+                return
+
+        # 0b. Combined SL — skip per-leg SL when both legs active
+        if COMBINED_SL_ENABLED and len(legs) == 2:
+            ce_ltp = fetch_ltp(state["symbol_ce"], OPTION_EXCH)
+            pe_ltp = fetch_ltp(state["symbol_pe"], OPTION_EXCH)
+            ce_entry = state["entry_price_ce"]
+            pe_entry = state["entry_price_pe"]
+            if ce_ltp > 0 and pe_ltp > 0 and ce_entry > 0 and pe_entry > 0:
+                combined_entry = ce_entry + pe_entry
+                combined_current = ce_ltp + pe_ltp
+                combined_rise_pct = ((combined_current - combined_entry) / combined_entry) * 100
+                if combined_rise_pct >= COMBINED_SL_PCT:
+                    plog(f"COMBINED SL: premium rose {combined_rise_pct:.1f}% >= {COMBINED_SL_PCT}%")
+                    self.engine.close_all(f"Combined SL ({combined_rise_pct:.1f}%)")
+                    return
+
+        # 1. Per-leg SL check (skip if combined SL active with both legs)
+        skip_per_leg_sl = COMBINED_SL_ENABLED and len(legs) == 2
         for leg in list(legs):
             leg_l = leg.lower()
             sym = state[f"symbol_{leg_l}"]
@@ -1092,6 +1153,9 @@ class Monitor:
 
             self.engine._consecutive_quote_fails = 0
             self.engine._quote_fail_alerted = False
+
+            if skip_per_leg_sl:
+                continue  # Combined SL handles both legs; per-leg only for single survivor
 
             sl = sl_level(leg)
             if sl <= 0:
@@ -1221,6 +1285,19 @@ class Monitor:
                         self.engine.close_all(f"VIX Spike Exit ({spike_pct:.1f}%)")
                         return
 
+        # 5b. Spot-move exit — underlying moved beyond premium collected
+        if SPOT_MOVE_EXIT_ENABLED and state.get("underlying_ltp", 0) > 0:
+            current_spot = fetch_ltp(UNDERLYING, EXCHANGE)
+            if current_spot > 0:
+                entry_spot = state["underlying_ltp"]
+                spot_move = abs(current_spot - entry_spot)
+                combined_premium = state["entry_price_ce"] + state["entry_price_pe"]
+                threshold = combined_premium * SPOT_MOVE_MULTIPLIER
+                if combined_premium > 0 and spot_move >= threshold:
+                    plog(f"SPOT MOVE: {spot_move:.0f}pts >= {threshold:.0f}pts threshold")
+                    self.engine.close_all(f"Spot Move Exit ({spot_move:.0f}pts > {threshold:.0f}pts)")
+                    return
+
         # 6. Daily profit target / loss limit
         effective_target = DAILY_TARGET * NUMBER_OF_LOTS
         effective_limit = DAILY_LOSS_LIMIT * NUMBER_OF_LOTS
@@ -1336,6 +1413,56 @@ def dte_filter_ok(dte: int) -> bool:
         plog(f"Month filter: {month} in skip list — skip")
         return False
     return True
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  WEEKLY P&L TRACKING (for drawdown guard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_weekly_pnl() -> list[dict]:
+    if not os.path.exists(WEEKLY_PNL_FILE):
+        return []
+    try:
+        with open(WEEKLY_PNL_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def _save_weekly_pnl(entries: list[dict]):
+    try:
+        tmp = WEEKLY_PNL_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(entries, f, indent=2)
+        os.replace(tmp, WEEKLY_PNL_FILE)
+    except Exception as exc:
+        plog(f"Weekly P&L save failed: {exc}", "WARNING")
+
+def _record_daily_pnl(pnl: float):
+    if not WEEKLY_DRAWDOWN_ENABLED:
+        return
+    today = now_ist().strftime("%Y-%m-%d")
+    entries = _load_weekly_pnl()
+    existing = [i for i, e in enumerate(entries) if e["date"] == today]
+    if existing:
+        entries[existing[0]]["pnl"] += pnl
+    else:
+        entries.append({"date": today, "pnl": pnl})
+    entries = entries[-10:]
+    _save_weekly_pnl(entries)
+
+def _get_weekly_rolling_pnl() -> float:
+    entries = _load_weekly_pnl()
+    if not entries:
+        return 0.0
+    today = now_ist().date()
+    total = 0.0
+    for e in entries:
+        try:
+            d = datetime.strptime(e["date"], "%Y-%m-%d").date()
+            if (today - d).days <= 5:
+                total += e["pnl"]
+        except (ValueError, KeyError):
+            pass
+    return total
 
 _reentry_block_alerted = False
 
@@ -1488,6 +1615,38 @@ class NiftyShortStraddle:
             self._entry_done_today = True
             return
 
+        # VIX entry filter — skip if VIX outside safe range
+        if VIX_ENTRY_FILTER_ENABLED:
+            vix = fetch_vix()
+            if vix > 0 and (vix < VIX_ENTRY_MIN or vix > VIX_ENTRY_MAX):
+                plog(f"VIX entry filter: VIX={vix:.2f} outside [{VIX_ENTRY_MIN}, {VIX_ENTRY_MAX}] — skip")
+                telegram.notify(f"🚫 Entry skipped — VIX {vix:.2f} outside range [{VIX_ENTRY_MIN}-{VIX_ENTRY_MAX}]")
+                self._entry_done_today = True
+                return
+
+        # ORB filter — skip if spot moved too much from market open
+        if ORB_FILTER_ENABLED:
+            spot = fetch_ltp(UNDERLYING, EXCHANGE)
+            if spot > 0:
+                open_spot = state.get("_orb_open_spot", 0)
+                if open_spot > 0:
+                    move_pct = abs(spot - open_spot) / open_spot * 100
+                    if move_pct > ORB_THRESHOLD_PCT:
+                        plog(f"ORB filter: spot moved {move_pct:.2f}% > {ORB_THRESHOLD_PCT}% — skip")
+                        telegram.notify(f"🚫 Entry skipped — ORB breach: {move_pct:.2f}% move from open")
+                        self._entry_done_today = True
+                        return
+
+        # Weekly drawdown guard — skip if rolling losses exceed threshold
+        if WEEKLY_DRAWDOWN_ENABLED:
+            rolling_pnl = _get_weekly_rolling_pnl()
+            weekly_threshold = WEEKLY_LOSS_LIMIT * NUMBER_OF_LOTS
+            if rolling_pnl <= weekly_threshold:
+                plog(f"Weekly drawdown guard: rolling P&L ₹{rolling_pnl:,.2f} <= ₹{weekly_threshold:,.2f} — skip")
+                telegram.notify(f"🚫 Entry skipped — weekly drawdown guard: ₹{rolling_pnl:,.2f}")
+                self._entry_done_today = True
+                return
+
         is_reentry = state.get("last_close_time") is not None and state.get("trade_count", 0) > 0
         state["is_reentry"] = is_reentry
         if is_reentry:
@@ -1518,6 +1677,10 @@ class NiftyShortStraddle:
         state["trade_count"] = 0
         state["last_close_time"] = None
         state["last_trade_pnl"] = 0.0
+        # Capture opening spot for ORB filter
+        if ORB_FILTER_ENABLED:
+            open_spot = fetch_ltp(UNDERLYING, EXCHANGE)
+            state["_orb_open_spot"] = open_spot if open_spot > 0 else 0
         plog(f"Daily reset for {today_date}")
 
     def _handle_signal(self, signum, _frame):

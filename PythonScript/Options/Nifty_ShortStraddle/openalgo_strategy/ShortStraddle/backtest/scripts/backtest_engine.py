@@ -204,6 +204,27 @@ class Config:
     scaled_entry_interval_min: int = 15  # Minutes between each scaling step
     scaled_entry_require_profit: bool = True  # Only add lot if current P&L > 0
 
+    # Max trade loss (absolute rupee cap per trade)
+    max_trade_loss_enabled: bool = False
+    max_trade_loss: float = 15000.0  # Per lot, Rs — close all if MTM breaches
+
+    # VIX entry filter
+    vix_entry_filter_enabled: bool = False
+    vix_entry_min: float = 11.0   # Skip entry if VIX below
+    vix_entry_max: float = 25.0   # Skip entry if VIX above
+
+    # Spot-move exit
+    spot_move_exit_enabled: bool = False
+    spot_move_multiplier: float = 1.0  # Exit if |spot_move| >= premium * multiplier
+
+    # Weekly drawdown guard
+    weekly_drawdown_enabled: bool = False
+    weekly_loss_limit: float = -20000.0  # Per lot, Rs — skip entry if rolling 5-day P&L below
+
+    # ORB (Opening Range Breakout) filter
+    orb_filter_enabled: bool = False
+    orb_threshold_pct: float = 0.5  # Skip entry if spot moved > this % from open
+
     # Re-entry
     reentry_enabled: bool = True
     reentry_cooldown_min: float = 45.0
@@ -314,6 +335,27 @@ def load_config(path: str | Path) -> Config:
     c.scaled_entry_max_lots = se.get("max_lots", c.scaled_entry_max_lots)
     c.scaled_entry_interval_min = se.get("interval_min", c.scaled_entry_interval_min)
     c.scaled_entry_require_profit = se.get("require_profit", c.scaled_entry_require_profit)
+
+    mtl = risk.get("max_trade_loss", {})
+    c.max_trade_loss_enabled = mtl.get("enabled", c.max_trade_loss_enabled)
+    c.max_trade_loss = mtl.get("amount", c.max_trade_loss)
+
+    vef = risk.get("vix_entry_filter", {})
+    c.vix_entry_filter_enabled = vef.get("enabled", c.vix_entry_filter_enabled)
+    c.vix_entry_min = vef.get("min", c.vix_entry_min)
+    c.vix_entry_max = vef.get("max", c.vix_entry_max)
+
+    sme = risk.get("spot_move_exit", {})
+    c.spot_move_exit_enabled = sme.get("enabled", c.spot_move_exit_enabled)
+    c.spot_move_multiplier = sme.get("multiplier", c.spot_move_multiplier)
+
+    wdg = risk.get("weekly_drawdown", {})
+    c.weekly_drawdown_enabled = wdg.get("enabled", c.weekly_drawdown_enabled)
+    c.weekly_loss_limit = wdg.get("loss_limit", c.weekly_loss_limit)
+
+    orb = risk.get("orb_filter", {})
+    c.orb_filter_enabled = orb.get("enabled", c.orb_filter_enabled)
+    c.orb_threshold_pct = orb.get("threshold_pct", c.orb_threshold_pct)
 
     re = risk.get("reentry", {})
     c.reentry_enabled = re.get("enabled", c.reentry_enabled)
@@ -458,6 +500,7 @@ class BacktestEngine:
         self.otm_pe = self._index_by_timestamp(otm_pe_df) if otm_pe_df is not None and not otm_pe_df.empty else pd.DataFrame()
         self.trades: list[TradeRecord] = []
         self.running_capital: float = config.capital  # tracks compounded capital
+        self._recent_daily_pnl: list[tuple[date, float]] = []  # (date, pnl) for weekly drawdown
 
     @staticmethod
     def _index_by_timestamp(df: pd.DataFrame) -> pd.DataFrame:
@@ -574,6 +617,29 @@ class BacktestEngine:
         spot = self._get_spot_at(entry_dt)
         if spot <= 0:
             return  # No spot data for this day
+
+        # VIX entry filter — skip if VIX outside acceptable range
+        if self.cfg.vix_entry_filter_enabled:
+            vix = self._get_vix_at(entry_dt)
+            if vix > 0 and (vix < self.cfg.vix_entry_min or vix > self.cfg.vix_entry_max):
+                return
+
+        # ORB filter — skip if spot moved too much from market open
+        if self.cfg.orb_filter_enabled:
+            open_dt = IST.localize(datetime.combine(day, time(9, 15)))
+            open_spot = self._get_spot_at(open_dt)
+            if open_spot > 0 and spot > 0:
+                move_pct = abs(spot - open_spot) / open_spot * 100
+                if move_pct > self.cfg.orb_threshold_pct:
+                    return
+
+        # Weekly drawdown guard — skip if rolling 5-day P&L below threshold
+        if self.cfg.weekly_drawdown_enabled:
+            recent = [pnl for d, pnl in self._recent_daily_pnl if (day - d).days <= 5]
+            if recent:
+                rolling_pnl = sum(recent)
+                if rolling_pnl <= self.cfg.weekly_loss_limit:
+                    return
 
         # Initialize day state
         day_state = DayState()
@@ -828,6 +894,19 @@ class BacktestEngine:
     ) -> str | None:
         """Run all exit checks in production priority order."""
 
+        # --- Priority 0: Max Trade Loss (absolute rupee cap) ---
+        if self.cfg.max_trade_loss_enabled:
+            open_mtm_all = 0.0
+            for ln, lg, cn in [("CE", trade.ce, ce_candle), ("PE", trade.pe, pe_candle)]:
+                if lg.active and cn and lg.entry_price > 0 and cn["close"] > 0:
+                    open_mtm_all += (lg.entry_price - cn["close"]) * trade.qty
+            combined_mtm = trade.closed_pnl + open_mtm_all
+            max_loss_threshold = -(self.cfg.max_trade_loss * trade.number_of_lots)
+            if combined_mtm <= max_loss_threshold:
+                reason = f"Max Trade Loss ({combined_mtm:,.0f})"
+                self._close_all_with_candles(trade, reason, tick_time, ce_candle, pe_candle)
+                return reason
+
         # --- Priority 1: Per-Leg SL Check (skip if combined SL is active with both legs) ---
         skip_per_leg_sl = self.cfg.combined_sl_enabled and trade.ce.active and trade.pe.active
         for leg_name, leg, candle in [("CE", trade.ce, ce_candle), ("PE", trade.pe, pe_candle)]:
@@ -978,6 +1057,18 @@ class BacktestEngine:
                 spike_pct = ((current_vix - trade.vix_at_entry) / trade.vix_at_entry) * 100
                 if spike_pct >= self.cfg.vix_spike_threshold_pct and current_vix >= self.cfg.vix_spike_abs_floor:
                     reason = f"VIX Spike Exit ({spike_pct:.1f}%)"
+                    self._close_all_with_candles(trade, reason, tick_time, ce_candle, pe_candle)
+                    return reason
+
+        # --- Priority 5b: Spot-Move Exit ---
+        if self.cfg.spot_move_exit_enabled and trade.underlying_at_entry > 0:
+            current_spot = self._get_spot_at(tick_time)
+            if current_spot > 0:
+                spot_move = abs(current_spot - trade.underlying_at_entry)
+                combined_premium = trade.ce.entry_price + trade.pe.entry_price
+                threshold = combined_premium * self.cfg.spot_move_multiplier
+                if combined_premium > 0 and spot_move >= threshold:
+                    reason = f"Spot Move Exit ({spot_move:.0f}pts > {threshold:.0f}pts)"
                     self._close_all_with_candles(trade, reason, tick_time, ce_candle, pe_candle)
                     return reason
 
@@ -1271,6 +1362,19 @@ class BacktestEngine:
         day_state.last_close_time = datetime.fromisoformat(exit_time) if exit_time else None
         if self.cfg.compound_capital:
             self.running_capital += net_pnl
+
+        # Track daily P&L for weekly drawdown guard
+        if self.cfg.weekly_drawdown_enabled and trade.entry_date:
+            # Update or add entry for this day
+            existing = [i for i, (d, _) in enumerate(self._recent_daily_pnl) if d == trade.entry_date]
+            if existing:
+                old_pnl = self._recent_daily_pnl[existing[0]][1]
+                self._recent_daily_pnl[existing[0]] = (trade.entry_date, old_pnl + net_pnl)
+            else:
+                self._recent_daily_pnl.append((trade.entry_date, net_pnl))
+            # Prune entries older than 10 days
+            self._recent_daily_pnl = [(d, p) for d, p in self._recent_daily_pnl
+                                       if (trade.entry_date - d).days <= 10]
 
     def _trades_to_dataframe(self) -> pd.DataFrame:
         if not self.trades:
