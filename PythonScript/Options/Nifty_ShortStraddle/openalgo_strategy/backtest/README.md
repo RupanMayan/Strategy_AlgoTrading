@@ -4,47 +4,44 @@ Production-sync backtest for `nifty_short_straddle.py`. Replays every exit modul
 
 ---
 
-## Results Summary (2026-03-28)
-
-### Compounded Mode (₹2.5L start, profits reinvested, max 50 lots)
-
-| Metric | Value |
-|--------|-------|
-| Period | Apr 2021 - Mar 2026 (5 years) |
-| Starting Capital | Rs 2,50,000 |
-| Final Capital | Rs 4.77 Cr |
-| Net P&L (after charges) | Rs 4.74 Cr |
-| Total Return | 18,963% |
-| CAGR | 185.8% |
-| Total Trades | 1,282 |
-| Win Rate | 75.7% |
-| Profit Factor | 4.69 |
-| Sharpe Ratio | 7.30 |
-| Max Drawdown | Rs -4.83L |
-| Total Charges | Rs 9.71L (2.0% of gross) |
+## Results Summary (2026-03-28, Post-Optimization)
 
 ### Fixed Capital Mode (₹2.5L, no compounding)
 
 | Metric | Value |
 |--------|-------|
-| Net P&L (after charges) | Rs 25.90L |
-| Total Return | 1,036% |
-| CAGR | 62.6% |
-| Win Rate | 75.2% |
-| Profit Factor | 5.12 |
-| Max Drawdown | Rs -28,980 |
-| Total Charges | Rs 1.70L (6.2% of gross) |
+| Period | Apr 2021 - Mar 2026 (5 years) |
+| Starting Capital | Rs 2,50,000 |
+| Total Trades | 1,220 |
+| Net P&L (after charges) | Rs 13,31,475 |
+| ROI (5 year) | 533% |
+| Annual ROI | 106% |
+| Win Rate | 65.2% |
+| Profit Factor | 2.33 |
+| Sharpe Ratio | 4.91 |
+| Calmar Ratio | 40.47 |
+| Max Drawdown | Rs -32,897 (13% of capital) |
+| Total Charges | Rs 1,58,074 (10.6% of gross) |
 
-### Capital Growth (Compounded)
+### Compounded Capital Mode (₹2.5L start, profits reinvested, max 50 lots)
 
-| Year | Start Capital | End Capital | Avg Lots | Lot Size | Net P&L |
-|------|---------------|-------------|----------|----------|---------|
-| 2021 | Rs 2.5L | Rs 15.1L | 14.8 | 25 | Rs 12.8L |
-| 2022 | Rs 15.3L | Rs 95.2L | 48.5 | 25 | Rs 80.1L |
-| 2023 | Rs 95.4L | Rs 1.42 Cr | 50 (capped) | 25 | Rs 46.9L |
-| 2024 | Rs 1.42 Cr | Rs 2.28 Cr | 50 (capped) | 25/75 | Rs 84.5L |
-| 2025 | Rs 2.27 Cr | Rs 4.31 Cr | 50 (capped) | 75 | Rs 2.05 Cr |
-| 2026 | Rs 4.32 Cr | Rs 4.75 Cr | 50 (capped) | 65 | Rs 44.6L |
+| Metric | Value |
+|--------|-------|
+| Total Trades | 1,220 |
+| Net P&L (after charges) | Rs 2,49,14,096 (Rs 2.49 Cr) |
+| Win Rate | 66.1% |
+| Profit Factor | 2.27 |
+| Max Drawdown | Rs -9,84,350 |
+
+### Optimisation Applied
+
+| Change | Impact |
+|--------|--------|
+| Re-entry disabled (`max_per_day = 0`) | +9% P&L, -17% max DD, +3% win rate |
+| DTE 0 wider SL (`sl_dte_map = {0: 40}`) | +28% P&L, -56% max DD |
+| November enabled (`skip_months = []`) | More trading days, all months net positive |
+
+See `BACKTEST_REPORT.md` for full optimization history with all test results and rejected approaches.
 
 ---
 
@@ -67,8 +64,18 @@ Sources: NSE Circular FAOP70616, Zerodha, Groww, Angel One
 ```
 backtest/
 ├── README.md                    # This file
+├── BACKTEST_REPORT.md           # Full optimization report & recommendations
 ├── config/
-│   └── config.toml              # Strategy parameters (mirrors production)
+│   ├── config.toml              # Final production-synced config
+│   ├── opt_no_reentry.toml      # Test: no re-entry (APPLIED)
+│   ├── opt_dte0_sl40.toml       # Test: DTE 0 wider SL (APPLIED)
+│   ├── opt_sl25.toml            # Test: SL 25% (REJECTED)
+│   ├── opt_no_dte1.toml         # Test: removed DTE 1 (REJECTED)
+│   ├── opt_loss5000.toml        # Test: daily loss -5000 (REJECTED)
+│   ├── opt_reentry_profit_only.toml  # Test: re-entry after profit only (REJECTED)
+│   ├── opt_min_premium120.toml  # Test: min premium filter (REJECTED)
+│   ├── opt_combined_sl30.toml   # Test: combined SL (REJECTED — tail risk)
+│   └── opt_combined_best.toml   # Test: all 3 combined (REJECTED)
 ├── data/                        # .gitignored — regenerate with data_fetcher.py
 │   ├── nifty_spot_1min.parquet  # 527K candles (2021-04 to 2026-03)
 │   ├── nifty_atm_ce_1min.parquet # 462K candles (rolling ATM CE)
@@ -79,20 +86,14 @@ backtest/
 │   ├── backtest_engine.py       # Core simulation (mirrors production monitor)
 │   ├── charges.py               # Brokerage + statutory charges calculator
 │   ├── analytics.py             # Post-trade analytics & charts
-│   └── run_backtest.py          # Main entry — orchestrates everything
+│   ├── dashboard.py             # Interactive HTML dashboard generator
+│   ├── run_backtest.py          # Main entry — orchestrates everything
+│   └── run_optimization.py      # Optimization test runner (multi-config)
 └── results/
-    └── YYYY-MM-DD/              # Each run gets a date folder
-        ├── report.md            # Full report with monthly/yearly breakdown
-        ├── summary.json         # Machine-readable metrics
-        ├── trades.csv           # All trades with P&L, charges, lots, capital
-        ├── config_snapshot.toml # Exact config used for this run
-        └── charts/
-            ├── equity_curve.png
-            ├── drawdown.png
-            ├── monthly_heatmap.png
-            ├── dte_breakdown.png
-            ├── exit_reasons.png
-            └── yearly_summary.png
+    └── 2026-03-28/
+        ├── fixed/index.html     # Interactive dashboard (final config)
+        ├── compounded/index.html # Interactive dashboard (compounded mode)
+        └── optimization/        # All optimization test results
 ```
 
 ---
@@ -134,7 +135,8 @@ Uses static `lot_size` and `number_of_lots` from config for all trades.
 The backtest engine replicates every exit check in the exact same priority order as `Monitor._tick_inner()` in `nifty_short_straddle.py`:
 
 ### Priority 1: Per-Leg Stop Loss
-- SL = entry_price × 1.30 (30% above entry)
+- SL = entry_price × 1.30 (30% above entry), **1.40 on DTE 0** (expiry day)
+- DTE 0 gets wider SL to survive gamma spikes — avoids ~49 false SL exits
 - Uses candle **high** (worst case for sold option)
 - Net P&L guard: defer SL up to 15min if net position is profitable
 - Breakeven SL replaces fixed SL after partial exit
@@ -165,11 +167,10 @@ The backtest engine replicates every exit check in the exact same priority order
 ### Priority 6: Time Exit
 - At 15:15 IST → close all remaining legs
 
-### Re-Entry Logic
-- 45 min cooldown after exit
-- Max 2 re-entries per day
-- Only if cumulative daily loss < ₹2,000/lot
-- Blocked after daily target or loss limit hit
+### Re-Entry Logic (DISABLED)
+- `max_per_day = 0` — re-entry disabled after backtest optimization
+- Re-entry trades had 42% win rate and lost Rs 87,743 total over 5 years
+- Disabling improved all metrics: +9% P&L, better Sharpe, lower drawdown
 
 ### Breakeven SL Activation
 - After one leg exits at a loss → survivor gets breakeven SL

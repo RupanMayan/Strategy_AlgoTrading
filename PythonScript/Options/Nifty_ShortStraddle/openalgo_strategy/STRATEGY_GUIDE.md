@@ -48,7 +48,7 @@ All parameters are defined as constants at the top of the script. No external co
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `TRADE_DTE` | `[0,1,2,3,4]` | Allowed DTEs. 0=expiry day (Tue), 4=Wed. All 5 trading days |
-| `SKIP_MONTHS` | `[11]` | Skip November — consistent loss month across all backtest years |
+| `SKIP_MONTHS` | `[]` | No months skipped — all months are net positive in 5-year backtest |
 
 ---
 
@@ -59,13 +59,16 @@ All parameters are defined as constants at the top of the script. No external co
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `LEG_SL_PERCENT` | `30.0` | % of entry premium. CE and PE have independent SLs |
+| `LEG_SL_DTE_MAP` | `{0: 40.0}` | DTE-specific SL override — expiry day gets 40% SL |
 
 **How it works:**
-- CE SL = `CE_entry_price x (1 + 30/100)` = 130% of entry
-- PE SL = `PE_entry_price x (1 + 30/100)` = 130% of entry
+- CE SL = `CE_entry_price x (1 + SL%/100)` — 130% on DTE 1-4, 140% on DTE 0
+- PE SL = `PE_entry_price x (1 + SL%/100)` — 130% on DTE 1-4, 140% on DTE 0
 - When one leg hits SL, only that leg closes. The other continues
 
-**Why 30%:** Wider SL lets trades breathe for theta capture. At 20% (previous), false SL hits were common on morning volatility spikes especially DTE2+. 30% reduces premature stops while daily loss limit (-6K) caps total risk.
+**Why 30% base:** Wider SL lets trades breathe for theta capture. At 25%, false SL hits nearly doubled and the strategy lost 60% of its edge. 30% reduces premature stops while daily loss limit (-6K) caps total risk.
+
+**Why 40% on DTE 0 (expiry day):** Expiry day has the highest gamma — small Nifty moves cause disproportionately large option price swings. The 30% SL gives only ~30-40 pts buffer on low-premium expiry days, which gets eaten by normal noise. 40% SL gives the trade room to survive these gamma spikes while theta decay (fastest on DTE 0) works in your favor. Backtest shows this avoids ~49 false SL exits, adding +28% P&L with -56% max drawdown.
 
 ### 2. Daily Profit Target & Loss Limit
 
@@ -157,24 +160,24 @@ When both legs active:
 
 This protects combined gains before the decay target is reached. Example: decay peaks at 55%, then drops to 15% (40-point retrace) → exit.
 
-### 8. Re-Entry After Early Close
+### 8. Re-Entry After Early Close (DISABLED)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `REENTRY_ENABLED` | `true` | Allow re-entry after early SL exit |
+| `REENTRY_ENABLED` | `true` | Re-entry logic exists but is disabled via max_per_day = 0 |
 | `REENTRY_COOLDOWN_MIN` | `45` | Minutes to wait after close before re-entry |
-| `REENTRY_MAX_PER_DAY` | `2` | Maximum re-entries per day |
+| `REENTRY_MAX_PER_DAY` | `0` | **DISABLED** — set to 0 to prevent all re-entries |
 | `REENTRY_MAX_LOSS` | `2000` | Per-lot Rs. — skip re-entry if previous loss exceeds this |
 
-**How it works:**
-After a full close with a manageable loss (< Rs.2000/lot), the strategy waits 45 minutes for conditions to stabilise, then re-enters a fresh straddle. All entry filters are re-checked.
+**Status: DISABLED (backtest-optimised)**
 
-**Safety guards:**
-- 45-min cooldown lets market settle after adverse move
-- Rs.2000/lot loss cap blocks re-entry after large SL losses
-- Max 2 re-entries/day prevents runaway loops
-- Full filter chain runs on every re-entry
-- Cumulative daily P&L carries forward (FIX-XVII)
+5-year backtest analysis showed re-entry trades have **negative expected value**:
+- 205 re-entry trades with 42% win rate (vs 62% for first trades)
+- Average P&L per re-entry: -Rs 428
+- Total re-entry losses: -Rs 87,743
+- 65% of re-entry losses came from afternoon sessions (13:00-14:00)
+
+**Why re-entry hurts:** After an SL exit, the market has already moved significantly. Afternoon re-entries have less time for theta decay, and premiums are already compressed. Disabling re-entry improved every single metric: +9% P&L, +17% win rate improvement, -17% max drawdown.
 
 ### 9. VIX Spike Monitor
 
@@ -330,13 +333,38 @@ python nifty_short_straddle.py
 
 ---
 
-## Backtest Results (5-Year: 2021-2026)
+## Backtest Results (5-Year: Apr 2021 – Mar 2026)
+
+**Fixed Capital Mode** (Rs 2,50,000, 1 lot)
 
 | Metric | Value |
 |--------|-------|
-| Net P&L | Rs.13.15L |
-| Win Rate | 69.7% |
-| Max Drawdown | -Rs.11,516 |
-| Calmar Ratio | 114.2 |
-| Losing Months | 0 |
-| Fixed Entry | 09:17 (all DTEs) |
+| Total Trades | 1,220 |
+| Net P&L (after charges) | Rs 13,31,475 |
+| ROI (5 year) | 533% |
+| Annual ROI | 106% |
+| Win Rate | 65.2% |
+| Profit Factor | 2.33 |
+| Sharpe Ratio | 4.91 |
+| Calmar Ratio | 40.47 |
+| Max Drawdown | Rs -32,897 (13% of capital) |
+| Total Charges | Rs 1,58,074 (10.6% of gross) |
+
+**Compounded Capital Mode** (Rs 2,50,000 start, profits reinvested)
+
+| Metric | Value |
+|--------|-------|
+| Total Trades | 1,220 |
+| Net P&L | Rs 2,49,14,096 (Rs 2.49 Cr) |
+| Win Rate | 66.1% |
+| Profit Factor | 2.27 |
+| Max Drawdown | Rs -9,84,350 |
+
+**Key Optimisations Applied:**
+1. Re-entry disabled (`REENTRY_MAX_PER_DAY = 0`) — saves Rs 88K, improves all metrics
+2. DTE 0 wider SL (`LEG_SL_DTE_MAP = {0: 40.0}`) — +28% P&L, -56% max drawdown
+3. November enabled (`SKIP_MONTHS = []`) — all months net positive
+
+**Backtest-to-Live Gap:** ~8% lower returns expected in production due to candle vs tick differences, real slippage, and broker execution delays.
+
+See `backtest/BACKTEST_REPORT.md` for full optimization history, rejected tests, and risk analysis.
