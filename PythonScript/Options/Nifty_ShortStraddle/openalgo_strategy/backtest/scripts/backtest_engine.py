@@ -349,6 +349,7 @@ class DayState:
     trade_count: int = 0
     reentry_count: int = 0
     last_close_time: datetime | None = None
+    last_trade_pnl: float = 0.0  # Net P&L of the most recent trade (for re-entry check)
     target_hit: bool = False
     loss_limit_hit: bool = False
 
@@ -538,8 +539,9 @@ class BacktestEngine:
         if not ce_candle or not pe_candle:
             return None
 
-        ce_entry = ce_candle["open"] + self.cfg.slippage_points
-        pe_entry = pe_candle["open"] + self.cfg.slippage_points
+        # Slippage: SELL fills lower than theoretical (adverse for short)
+        ce_entry = ce_candle["open"] - self.cfg.slippage_points
+        pe_entry = pe_candle["open"] - self.cfg.slippage_points
 
         if ce_entry <= 0 or pe_entry <= 0:
             return None
@@ -602,10 +604,11 @@ class BacktestEngine:
                 if self._can_reenter(day_state, trade, tick_time, exit_dt):
                     spot = self._get_spot_at(tick_time)
                     if spot > 0:
-                        trade = self._try_entry(day, dte, tick_time, spot,
-                                                day_state, is_reentry=True)
-                        if trade is None:
-                            break
+                        new_trade = self._try_entry(day, dte, tick_time, spot,
+                                                    day_state, is_reentry=True)
+                        if new_trade is None:
+                            continue  # No data for re-entry, keep scanning
+                        trade = new_trade
                         last_vix_check = None
                         continue
                     else:
@@ -634,7 +637,7 @@ class BacktestEngine:
                 continue
 
         # Time exit at 15:15 — close any remaining position
-        if trade.in_position:
+        if trade is not None and trade.in_position:
             self._close_all(trade, "Time Exit (15:15)", exit_dt, ce_candles, pe_candles)
             self._record_trade(trade, day_state)
 
@@ -694,7 +697,10 @@ class BacktestEngine:
 
                 sl_type = "Breakeven SL" if leg.breakeven_active else "Fixed SL"
                 reason = f"{sl_type} hit ({leg_name})"
-                self._close_leg(trade, leg_name, reason, candle["close"], tick_time)
+                # SL fill: use max(close, sl) — when SL triggers on candle high,
+                # a market order fills at or above SL level, not at candle close
+                sl_exit_price = max(candle["close"], sl)
+                self._close_leg(trade, leg_name, reason, sl_exit_price, tick_time)
 
                 if not trade.in_position:
                     return reason
@@ -804,17 +810,17 @@ class BacktestEngine:
                     return reason
 
         # --- Priority 6: Daily P&L Limits ---
+        # Production checks per-trade P&L only (not cumulative daily)
         effective_target = self.cfg.daily_target * trade.number_of_lots
         effective_loss = self.cfg.daily_loss_limit * trade.number_of_lots
-        effective_pnl = day_state.cumulative_pnl + combined_pnl
-        if effective_target > 0 and effective_pnl >= effective_target:
-            reason = f"Daily Target ({effective_pnl:,.0f})"
+        if effective_target > 0 and combined_pnl >= effective_target:
+            reason = f"Daily Target ({combined_pnl:,.0f})"
             self._close_all_with_candles(trade, reason, tick_time, ce_candle, pe_candle)
             day_state.target_hit = True
             return reason
 
-        if effective_loss < 0 and effective_pnl <= effective_loss:
-            reason = f"Daily Loss Limit ({effective_pnl:,.0f})"
+        if effective_loss < 0 and combined_pnl <= effective_loss:
+            reason = f"Daily Loss Limit ({combined_pnl:,.0f})"
             self._close_all_with_candles(trade, reason, tick_time, ce_candle, pe_candle)
             day_state.loss_limit_hit = True
             return reason
@@ -827,7 +833,7 @@ class BacktestEngine:
         if entry <= 0:
             return 0.0
 
-        fixed_sl = entry * (1.0 + self.cfg.leg_sl_pct / 100.0)
+        fixed_sl = round(entry * (1.0 + self.cfg.leg_sl_pct / 100.0), 2)
 
         if self.cfg.breakeven_enabled and leg.breakeven_active:
             be_sl = leg.breakeven_sl
@@ -890,7 +896,8 @@ class BacktestEngine:
         if not leg.active:
             return
 
-        exit_price = max(exit_ltp - self.cfg.slippage_points, 0.01)
+        # Slippage: BUY fills higher than theoretical (adverse for short)
+        exit_price = exit_ltp + self.cfg.slippage_points
         leg_pnl = (leg.entry_price - exit_price) * trade.qty
 
         leg.active = False
@@ -934,11 +941,18 @@ class BacktestEngine:
 
     def _can_reenter(self, day_state: DayState, last_trade: TradeState,
                      tick_time: datetime, exit_dt: datetime) -> bool:
-        """Check if re-entry is allowed — mirrors production logic."""
+        """Check if re-entry is allowed — mirrors production reentry_ok()."""
         if not self.cfg.reentry_enabled:
             return False
-        if day_state.target_hit or day_state.loss_limit_hit:
+
+        # Production checks cumulative daily P&L against daily limits
+        effective_target = self.cfg.daily_target * max(self.cfg.number_of_lots, 1)
+        if effective_target > 0 and day_state.cumulative_pnl >= effective_target:
             return False
+        effective_limit = self.cfg.daily_loss_limit * max(self.cfg.number_of_lots, 1)
+        if effective_limit < 0 and day_state.cumulative_pnl <= effective_limit:
+            return False
+
         if day_state.reentry_count >= self.cfg.reentry_max_per_day:
             return False
         if day_state.last_close_time is None:
@@ -949,13 +963,9 @@ class BacktestEngine:
         if elapsed < self.cfg.reentry_cooldown_min:
             return False
 
-        # Don't re-enter too close to exit time
-        if (exit_dt - tick_time).total_seconds() < 30 * 60:  # 30 min before exit
-            return False
-
-        # Max loss check — use config lots (day-level check, not trade-specific)
+        # Max loss check — production checks LAST trade P&L
         effective_max_loss = self.cfg.reentry_max_loss * max(self.cfg.number_of_lots, 1)
-        if day_state.cumulative_pnl < -effective_max_loss:
+        if day_state.last_trade_pnl < -effective_max_loss:
             return False
 
         return True
@@ -1019,6 +1029,7 @@ class BacktestEngine:
 
         # Update day state and running capital
         day_state.cumulative_pnl += net_pnl
+        day_state.last_trade_pnl = net_pnl
         day_state.last_close_time = datetime.fromisoformat(exit_time) if exit_time else None
         if self.cfg.compound_capital:
             self.running_capital += net_pnl

@@ -29,9 +29,6 @@ def generate_all(
         results_dir: timestamped results directory
         config_dict: raw config dict for snapshot
     """
-    charts_dir = results_dir / "charts"
-    charts_dir.mkdir(parents=True, exist_ok=True)
-
     if trades_df.empty:
         print("  No trades to analyze!")
         return
@@ -43,15 +40,11 @@ def generate_all(
     summary = compute_summary(trades_df)
     save_summary(summary, results_dir)
     save_trades(trades_df, results_dir)
-
-    plot_equity_curve(trades_df, charts_dir)
-    plot_drawdown(trades_df, charts_dir)
-    plot_monthly_heatmap(trades_df, charts_dir)
-    plot_dte_breakdown(trades_df, charts_dir)
-    plot_exit_reasons(trades_df, charts_dir)
-    plot_yearly_summary(trades_df, charts_dir)
-
     generate_report(trades_df, summary, results_dir)
+
+    # Interactive HTML dashboard (replaces PNG charts)
+    from dashboard import generate_dashboard
+    generate_dashboard(trades_df, summary, results_dir, config_dict)
 
     print(f"\n  Results saved to: {results_dir}")
     print(f"  Total Trades: {summary['total_trades']}")

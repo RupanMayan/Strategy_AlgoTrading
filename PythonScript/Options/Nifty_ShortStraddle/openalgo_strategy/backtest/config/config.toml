@@ -22,7 +22,7 @@ monitor_interval_sec = 5  # Production uses 5s; backtest uses 1-min candles
 
 [filters]
 trade_dte = [0, 1, 2, 3, 4]
-skip_months = [11]  # November — consistent loss month
+skip_months = []  # No months skipped
 
 [risk.per_leg_sl]
 enabled = true

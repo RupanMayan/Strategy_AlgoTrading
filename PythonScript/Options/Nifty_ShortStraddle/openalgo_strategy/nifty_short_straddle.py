@@ -33,7 +33,7 @@ EXIT_TIME        = "15:15"
 MONITOR_INTERVAL = 5
 
 TRADE_DTE        = [0, 1, 2, 3, 4]
-SKIP_MONTHS      = [11]
+SKIP_MONTHS      = []
 
 LEG_SL_PERCENT   = 30.0
 DAILY_TARGET     = 10000

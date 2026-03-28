@@ -68,7 +68,6 @@ def main():
     mode = "compounded" if config.compound_capital else "fixed"
     results_dir = BACKTEST_DIR / "results" / date_str / mode
     results_dir.mkdir(parents=True, exist_ok=True)
-    (results_dir / "charts").mkdir(exist_ok=True)
 
     # Snapshot config
     shutil.copy2(config_path, results_dir / "config_snapshot.toml")
