@@ -1,6 +1,6 @@
 # Backtest Report — Nifty Short Straddle
 
-Generated: 2026-03-28 15:40:54
+Generated: 2026-03-28 17:01:51
 
 ## Key Metrics
 

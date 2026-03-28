@@ -248,6 +248,46 @@ max_loss = 2000
 | Skip Wednesday | Wednesday is net positive, skipping loses money |
 | Skip Jul-Sep | All months net positive |
 | VIX < 12 filter | Marginal Rs 31K benefit, adds complexity |
+| Scaled Entry (1→3 lots) | -36% P&L, +56% worse max DD — see Round 3 below |
+
+---
+
+## Optimization Round 3 — Scaled Entry (Pyramiding)
+
+Tested whether gradually scaling into the position (1 lot → 2 → 3) instead of entering all lots at once would reduce risk.
+
+### Round 3 Setup
+
+- **All-at-once (baseline)**: 3 lots × 65 = 195 qty entered at 09:17
+- **Scaled entry**: 1 lot at 09:17, +1 lot at 09:30 if profitable, +1 lot at 09:45 if profitable
+
+### Round 3 Results
+
+| Metric | All-at-Once (3 lots) | Scaled (1→3 lots) | Difference |
+|--------|---------------------|-------------------|------------|
+| Net P&L | Rs 26,56,594 | Rs 16,97,008 | **-36%** |
+| Win Rate | 66.1% | 59.5% | -6.6% |
+| Profit Factor | 2.34 | 2.33 | Same |
+| Max Drawdown | Rs -52,741 | Rs -82,191 | **56% worse** |
+| Calmar | 20.65 | 20.65 | Same |
+
+### Lot Distribution (Scaled Entry)
+
+| Lots Reached | Trades | Win Rate | Avg P&L | Total P&L |
+|-------------|--------|----------|---------|-----------|
+| 1 lot (never scaled) | 546 (45%) | 46.0% | -Rs 372 | -Rs 2,03,161 |
+| 2 lots (partial scale) | 94 (8%) | 21.3% | -Rs 2,371 | -Rs 2,22,919 |
+| 3 lots (fully scaled) | 580 (48%) | 78.4% | +Rs 3,660 | +Rs 21,23,089 |
+
+### Why Scaled Entry Failed (REJECTED)
+
+1. **Opening premium advantage lost**: The 09:17 entry captures peak opening IV (15-25% inflated). Lots added at 09:30/09:45 get 10-20% less premium, reducing SL buffer and theta capture.
+2. **45% of days stay at 1 lot**: Small losses but also small wins — money left on the table.
+3. **8% of days partially scale then reverse**: 21% win rate on 2-lot trades — worst-case scenario where you scale in just before a reversal.
+4. **Max drawdown is worse**: Weighted average entry after scaling is lower, giving tighter absolute SL buffer. When market reverses after full scaling, losses are larger.
+5. **Scaled entry suits directional strategies, not theta decay**: For short straddles, maximum premium exposure from minute 1 is optimal — time is literally money.
+
+**Conclusion**: Enter all lots at 09:17. When scaling capital, increase lot count at the same entry time.
 
 ---
 
@@ -265,7 +305,9 @@ backtest/
 │   ├── opt_min_premium120.toml          # Test: min premium filter
 │   ├── opt_dte0_sl40.toml              # Test: DTE 0 wider SL (APPLIED)
 │   ├── opt_combined_sl30.toml           # Test: combined SL (REJECTED)
-│   └── opt_combined_best.toml           # Test: all 3 combined (REJECTED)
+│   ├── opt_combined_best.toml           # Test: all 3 combined (REJECTED)
+│   ├── opt_3lots_allatonce.toml        # Test: 3 lots baseline (for scaled comparison)
+│   └── opt_3lots_scaled.toml           # Test: 3 lots scaled entry (REJECTED)
 ├── results/2026-03-28/
 │   ├── fixed/index.html                 # Interactive dashboard (final)
 │   ├── compounded/index.html            # Interactive dashboard (compounded)

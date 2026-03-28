@@ -194,6 +194,12 @@ class Config:
     breakeven_grace_min: float = 5.0
     breakeven_buffer_pct: float = 5.0
 
+    # Scaled entry (pyramiding)
+    scaled_entry_enabled: bool = False
+    scaled_entry_max_lots: int = 3       # Total lots including initial
+    scaled_entry_interval_min: int = 15  # Minutes between each scaling step
+    scaled_entry_require_profit: bool = True  # Only add lot if current P&L > 0
+
     # Re-entry
     reentry_enabled: bool = True
     reentry_cooldown_min: float = 45.0
@@ -295,6 +301,12 @@ def load_config(path: str | Path) -> Config:
     c.breakeven_grace_min = be.get("grace_min", c.breakeven_grace_min)
     c.breakeven_buffer_pct = be.get("buffer_pct", c.breakeven_buffer_pct)
 
+    se = risk.get("scaled_entry", {})
+    c.scaled_entry_enabled = se.get("enabled", c.scaled_entry_enabled)
+    c.scaled_entry_max_lots = se.get("max_lots", c.scaled_entry_max_lots)
+    c.scaled_entry_interval_min = se.get("interval_min", c.scaled_entry_interval_min)
+    c.scaled_entry_require_profit = se.get("require_profit", c.scaled_entry_require_profit)
+
     re = risk.get("reentry", {})
     c.reentry_enabled = re.get("enabled", c.reentry_enabled)
     c.reentry_cooldown_min = re.get("cooldown_min", c.reentry_cooldown_min)
@@ -358,6 +370,10 @@ class TradeState:
     lot_size: int = 65
     number_of_lots: int = 1
     qty: int = 65
+    # Scaled entry tracking
+    scaled_lots_added: int = 0        # How many lots added so far (including initial)
+    next_scale_time: datetime | None = None  # When next lot can be added
+    scale_entries: list[dict] = field(default_factory=list)  # Log of each scaling step
 
 
 @dataclass
@@ -399,6 +415,7 @@ class TradeRecord:
     capital_used: float = 250000.0
     sl_events: list[dict] = field(default_factory=list)
     charges_breakdown: dict = field(default_factory=dict)
+    scale_entries: list[dict] = field(default_factory=list)  # Scaled entry log
 
 
 # ── Backtest Engine ──────────────────────────────────────────────────────────
@@ -578,7 +595,16 @@ class BacktestEngine:
         else:
             lot_size = self.cfg.lot_size
             num_lots = self.cfg.number_of_lots
-        qty = lot_size * num_lots
+
+        # Scaled entry: start with 1 lot, add more during monitoring
+        if self.cfg.scaled_entry_enabled and not is_reentry:
+            target_lots = min(num_lots, self.cfg.scaled_entry_max_lots)
+            initial_lots = 1
+            qty = lot_size * initial_lots
+        else:
+            target_lots = num_lots
+            initial_lots = num_lots
+            qty = lot_size * num_lots
 
         trade = TradeState(
             in_position=True,
@@ -591,9 +617,18 @@ class BacktestEngine:
             current_dte=dte,
             is_reentry=is_reentry,
             lot_size=lot_size,
-            number_of_lots=num_lots,
+            number_of_lots=initial_lots,
             qty=qty,
+            scaled_lots_added=initial_lots,
         )
+        # Store target lots for scaling and set next scale time
+        trade._target_lots = target_lots
+        if self.cfg.scaled_entry_enabled and initial_lots < target_lots:
+            trade.next_scale_time = entry_dt + timedelta(minutes=self.cfg.scaled_entry_interval_min)
+        trade.scale_entries.append({
+            "lot": 1, "time": entry_dt.isoformat(),
+            "ce_price": ce_entry, "pe_price": pe_entry, "lots": initial_lots,
+        })
 
         day_state.trade_count += 1
         if is_reentry:
@@ -642,6 +677,13 @@ class BacktestEngine:
             ce_candle = self._get_candle_at_index(ce_candles, tick_time)
             pe_candle = self._get_candle_at_index(pe_candles, tick_time)
 
+            # Scaled entry: try adding lots at intervals
+            if (self.cfg.scaled_entry_enabled and trade.next_scale_time is not None
+                    and tick_time >= trade.next_scale_time
+                    and trade.ce.active and trade.pe.active
+                    and ce_candle and pe_candle):
+                self._try_scale_lot(trade, ce_candle, pe_candle, tick_time)
+
             # Run exit checks (mirrors Monitor._tick_inner)
             exit_reason = self._check_exits(
                 trade, ce_candle, pe_candle, tick_time, day_state,
@@ -676,6 +718,63 @@ class BacktestEngine:
                 "close": float(row["close"]),
             }
         return None
+
+    # ── Scaled Entry ──────────────────────────────────────────────────────────
+
+    def _try_scale_lot(self, trade: TradeState, ce_candle: dict, pe_candle: dict,
+                       tick_time: datetime):
+        """Try to add another lot via scaled entry (pyramiding)."""
+        target_lots = getattr(trade, '_target_lots', trade.number_of_lots)
+        if trade.scaled_lots_added >= target_lots:
+            trade.next_scale_time = None
+            return
+
+        # Check profit condition: current position must be profitable
+        if self.cfg.scaled_entry_require_profit:
+            ce_mtm = (trade.ce.entry_price - ce_candle["close"]) * trade.qty
+            pe_mtm = (trade.pe.entry_price - pe_candle["close"]) * trade.qty
+            open_pnl = ce_mtm + pe_mtm
+            if open_pnl <= 0:
+                # Not profitable — skip this interval, try again next interval
+                trade.next_scale_time = tick_time + timedelta(
+                    minutes=self.cfg.scaled_entry_interval_min)
+                return
+
+        # Add 1 lot: update weighted average entry price
+        old_qty = trade.qty
+        add_qty = trade.lot_size * 1  # Add 1 lot at a time
+        new_qty = old_qty + add_qty
+
+        # New lot enters at current candle open (with slippage)
+        new_ce_entry = ce_candle["open"] - self.cfg.slippage_points
+        new_pe_entry = pe_candle["open"] - self.cfg.slippage_points
+
+        if new_ce_entry <= 0 or new_pe_entry <= 0:
+            return
+
+        # Weighted average entry price
+        trade.ce.entry_price = round(
+            (trade.ce.entry_price * old_qty + new_ce_entry * add_qty) / new_qty, 2)
+        trade.pe.entry_price = round(
+            (trade.pe.entry_price * old_qty + new_pe_entry * add_qty) / new_qty, 2)
+
+        trade.qty = new_qty
+        trade.number_of_lots += 1
+        trade.scaled_lots_added += 1
+
+        trade.scale_entries.append({
+            "lot": trade.scaled_lots_added, "time": tick_time.isoformat(),
+            "ce_price": new_ce_entry, "pe_price": new_pe_entry,
+            "lots": trade.number_of_lots, "avg_ce": trade.ce.entry_price,
+            "avg_pe": trade.pe.entry_price,
+        })
+
+        # Schedule next scaling or stop
+        if trade.scaled_lots_added >= target_lots:
+            trade.next_scale_time = None
+        else:
+            trade.next_scale_time = tick_time + timedelta(
+                minutes=self.cfg.scaled_entry_interval_min)
 
     # ── Exit Check Hierarchy (mirrors Monitor._tick_inner) ───────────────────
 
@@ -1029,6 +1128,18 @@ class BacktestEngine:
             pe_exited=trade.pe.exit_price > 0,
         )
         charges_total = charges_detail["total"]
+
+        # Scaled entry: extra brokerage for additional entry orders
+        # Each scaling step adds 2 orders (CE + PE sell)
+        extra_scale_orders = max(0, trade.scaled_lots_added - 1) * 2 if self.cfg.scaled_entry_enabled else 0
+        if extra_scale_orders > 0:
+            extra_brokerage = extra_scale_orders * self.cfg.charges.brokerage_per_order
+            # GST on extra brokerage
+            extra_gst = extra_brokerage * self.cfg.charges.gst_pct / 100
+            charges_total += extra_brokerage + extra_gst
+            charges_detail["extra_scale_brokerage"] = round(extra_brokerage + extra_gst, 2)
+            charges_detail["total"] = round(charges_total, 2)
+
         net_pnl = gross_pnl - charges_total
 
         exit_time = trade.sl_events[-1]["time"] if trade.sl_events else ""
@@ -1065,6 +1176,7 @@ class BacktestEngine:
             capital_used=round(self.running_capital, 2),
             sl_events=trade.sl_events,
             charges_breakdown=charges_detail,
+            scale_entries=trade.scale_entries,
         )
         self.trades.append(record)
 
@@ -1106,6 +1218,7 @@ class BacktestEngine:
                 "qty": t.qty,
                 "capital_used": t.capital_used,
                 "num_sl_events": len(t.sl_events),
+                "scaled_lots": len(t.scale_entries),
             })
 
         return pd.DataFrame(records)
