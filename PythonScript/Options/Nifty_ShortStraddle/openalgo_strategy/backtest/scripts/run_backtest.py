@@ -86,6 +86,20 @@ def main():
         vix_file = data_dir / "india_vix_daily.parquet"
     vix_df = _load_parquet(vix_file, "India VIX")
 
+    # OTM data for iron butterfly (optional)
+    otm_ce_df = pd.DataFrame()
+    otm_pe_df = pd.DataFrame()
+    if config.iron_butterfly_enabled:
+        otm_ce_file = data_dir / "nifty_otm_ce_1min.parquet"
+        otm_pe_file = data_dir / "nifty_otm_pe_1min.parquet"
+        if otm_ce_file.exists() and otm_pe_file.exists():
+            otm_ce_df = _load_parquet(otm_ce_file, "OTM CE (+200)")
+            otm_pe_df = _load_parquet(otm_pe_file, "OTM PE (-200)")
+        else:
+            print("  WARNING: OTM data not found — run data_fetcher.py to fetch OTM data")
+            print("  Iron butterfly will be disabled for this run")
+            config.iron_butterfly_enabled = False
+
     if spot_df.empty or ce_df.empty or pe_df.empty:
         print("\nERROR: Missing required data files. Run data_fetcher.py first:")
         print("  python scripts/data_fetcher.py")
@@ -93,7 +107,7 @@ def main():
 
     # Run backtest
     print("\nRunning backtest engine...")
-    engine = BacktestEngine(config, spot_df, ce_df, pe_df, vix_df)
+    engine = BacktestEngine(config, spot_df, ce_df, pe_df, vix_df, otm_ce_df, otm_pe_df)
     trades_df = engine.run(start_date, end_date)
 
     if trades_df.empty:

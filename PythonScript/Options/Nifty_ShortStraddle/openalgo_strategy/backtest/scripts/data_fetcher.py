@@ -153,11 +153,13 @@ def fetch_rolling_options(
     option_type: str,  # "CE" or "PE"
     from_date: date,
     to_date: date,
+    strike: str = "ATM",  # "ATM", "ATM+4", "ATM-4", etc.
 ) -> pd.DataFrame:
-    """Fetch ATM rolling option 1-min candles from Dhan.
+    """Fetch rolling option 1-min candles from Dhan.
 
     The rolling option API returns candles for the nearest weekly expiry
-    ATM option, rolling automatically on expiry.
+    option at the specified strike, rolling automatically on expiry.
+    Strike can be "ATM", "ATM+N", "ATM-N" where N is strike intervals (50 pts each for Nifty).
     """
     url = f"{DHAN_BASE_URL}/charts/rollingoption"
     chunks = _date_chunks(from_date, to_date, ROLLING_OPT_MAX_DAYS)
@@ -173,7 +175,7 @@ def fetch_rolling_options(
             "interval": 1,
             "expiryFlag": "WEEK",
             "expiryCode": 1,  # 1=nearest weekly expiry
-            "strike": "ATM",
+            "strike": strike,
             "drvOptionType": drv_option,
             "requiredData": ["open", "high", "low", "close", "volume", "oi", "iv", "spot"],
             "fromDate": chunk_start.strftime("%Y-%m-%d"),
@@ -389,7 +391,33 @@ def fetch_all(start_date: str = "2021-04-01", end_date: str = "2026-03-28"):
     # 5. India VIX daily — not available via Dhan API for VIX security ID
     # VIX intraday (step 4) covers ~1 year. For older dates, VIX spike exit
     # will be auto-disabled (no data = no trigger).
-    print("\n[5/5] VIX daily: skipped (not available via Dhan; using intraday VIX where available)")
+    print("\n[5/7] VIX daily: skipped (not available via Dhan; using intraday VIX where available)")
+
+    # 6. OTM CE 1-min (ATM+4 = ATM+200 pts, for iron butterfly)
+    otm_ce_file = DATA_DIR / "nifty_otm_ce_1min.parquet"
+    if otm_ce_file.exists():
+        print(f"\n[SKIP] OTM CE already exists: {otm_ce_file}")
+    else:
+        print("\n[6/7] Fetching Nifty OTM CE (ATM+200) 1-min candles...")
+        otm_ce_df = fetch_rolling_options("CE", start, end, strike="ATM+4")
+        if len(otm_ce_df) > 0:
+            otm_ce_df.to_parquet(otm_ce_file, index=False)
+            print(f"  Saved: {len(otm_ce_df)} candles -> {otm_ce_file}")
+        else:
+            print("  WARNING: No OTM CE data fetched!")
+
+    # 7. OTM PE 1-min (ATM-4 = ATM-200 pts, for iron butterfly)
+    otm_pe_file = DATA_DIR / "nifty_otm_pe_1min.parquet"
+    if otm_pe_file.exists():
+        print(f"\n[SKIP] OTM PE already exists: {otm_pe_file}")
+    else:
+        print("\n[7/7] Fetching Nifty OTM PE (ATM-200) 1-min candles...")
+        otm_pe_df = fetch_rolling_options("PE", start, end, strike="ATM-4")
+        if len(otm_pe_df) > 0:
+            otm_pe_df.to_parquet(otm_pe_file, index=False)
+            print(f"  Saved: {len(otm_pe_df)} candles -> {otm_pe_file}")
+        else:
+            print("  WARNING: No OTM PE data fetched!")
 
     # Summary
     print(f"\n{'='*60}")

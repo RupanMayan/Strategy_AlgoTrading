@@ -249,6 +249,7 @@ max_loss = 2000
 | Skip Jul-Sep | All months net positive |
 | VIX < 12 filter | Marginal Rs 31K benefit, adds complexity |
 | Scaled Entry (1→3 lots) | -36% P&L, +56% worse max DD — see Round 3 below |
+| Iron Butterfly (OTM hedge) | OTM cost destroyed profits (-Rs 25.5L hedge loss) — see Round 4 below |
 
 ---
 
@@ -291,6 +292,44 @@ Tested whether gradually scaling into the position (1 lot → 2 → 3) instead o
 
 ---
 
+## Optimization Round 4 — Iron Butterfly (OTM Hedge)
+
+Tested adding OTM protection (BUY ATM+200 CE + BUY ATM-200 PE) to the existing short straddle to cap per-trade max loss.
+
+### Round 4 Results (REJECTED)
+
+| Metric | Naked Straddle | + Iron Butterfly Hedge | Difference |
+|--------|---------------|----------------------|------------|
+| Net P&L | Rs 13,31,475 | Rs -13,52,706 | **-Rs 26.8L** |
+| Win Rate | 65.2% | 26.1% | -39% |
+| Profit Factor | 2.33 | 0.24 | Collapsed |
+| Max Drawdown | Rs -32,897 | Rs -13,62,918 | 41x worse |
+
+### Cost Breakdown
+
+| Component | P&L |
+|-----------|-----|
+| ATM legs (same as naked straddle) | +Rs 14,94,194 |
+| OTM hedge cost | **-Rs 25,55,021** |
+| Extra charges (8 orders/trade) | -Rs 1,29,159 |
+
+- Avg OTM entry cost: ~82 pts/trade (CE ~40 + PE ~42)
+- On 815 profitable ATM days: OTM lost Rs 22.87L (both options decayed to zero)
+- On 405 losing ATM days: OTM **still** lost Rs 2.68L (SL exits too early for hedge to pay off)
+
+### Why It Failed
+
+1. **Double protection is redundant**: Per-leg SL already caps loss at 30-40%. Buying OTM wings on top is paying for insurance twice.
+2. **SL exits before OTM kicks in**: When ATM CE hits SL (+30%), the OTM CE (+200 away) has barely moved — not enough gain to offset its purchase cost.
+3. **Opposite OTM always loses**: On a CE SL day (market up), OTM PE also crashes — both hedge legs lose money.
+4. **Hedge cost >> hedge benefit**: Rs 82 pts/trade × 1,220 trades = Rs 25.5L cost vs Rs 14.9L total ATM profit.
+
+### Key Insight
+
+Iron butterfly is a **standalone strategy** (no SL needed — wings ARE the risk cap), not a hedge to add on top of an SL-based straddle. Testing iron butterfly as a separate strategy with its own exit logic would be a different exercise entirely.
+
+---
+
 ## Files & Dashboards
 
 ```
@@ -307,7 +346,8 @@ backtest/
 │   ├── opt_combined_sl30.toml           # Test: combined SL (REJECTED)
 │   ├── opt_combined_best.toml           # Test: all 3 combined (REJECTED)
 │   ├── opt_3lots_allatonce.toml        # Test: 3 lots baseline (for scaled comparison)
-│   └── opt_3lots_scaled.toml           # Test: 3 lots scaled entry (REJECTED)
+│   ├── opt_3lots_scaled.toml           # Test: 3 lots scaled entry (REJECTED)
+│   └── opt_iron_butterfly.toml        # Test: iron butterfly hedge (REJECTED)
 ├── results/2026-03-28/
 │   ├── fixed/index.html                 # Interactive dashboard (final)
 │   ├── compounded/index.html            # Interactive dashboard (compounded)

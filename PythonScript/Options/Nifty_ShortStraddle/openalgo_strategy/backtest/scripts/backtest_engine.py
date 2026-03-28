@@ -194,6 +194,10 @@ class Config:
     breakeven_grace_min: float = 5.0
     breakeven_buffer_pct: float = 5.0
 
+    # Iron butterfly (buy OTM protection)
+    iron_butterfly_enabled: bool = False
+    iron_butterfly_offset: int = 200     # Points away from ATM (ATM+200 CE, ATM-200 PE)
+
     # Scaled entry (pyramiding)
     scaled_entry_enabled: bool = False
     scaled_entry_max_lots: int = 3       # Total lots including initial
@@ -301,6 +305,10 @@ def load_config(path: str | Path) -> Config:
     c.breakeven_grace_min = be.get("grace_min", c.breakeven_grace_min)
     c.breakeven_buffer_pct = be.get("buffer_pct", c.breakeven_buffer_pct)
 
+    ib = risk.get("iron_butterfly", {})
+    c.iron_butterfly_enabled = ib.get("enabled", c.iron_butterfly_enabled)
+    c.iron_butterfly_offset = ib.get("offset", c.iron_butterfly_offset)
+
     se = risk.get("scaled_entry", {})
     c.scaled_entry_enabled = se.get("enabled", c.scaled_entry_enabled)
     c.scaled_entry_max_lots = se.get("max_lots", c.scaled_entry_max_lots)
@@ -370,6 +378,11 @@ class TradeState:
     lot_size: int = 65
     number_of_lots: int = 1
     qty: int = 65
+    # Iron butterfly OTM legs (long protection)
+    otm_ce_entry: float = 0.0   # BUY price of OTM CE (ATM+200)
+    otm_pe_entry: float = 0.0   # BUY price of OTM PE (ATM-200)
+    otm_ce_exit: float = 0.0    # SELL price of OTM CE at exit
+    otm_pe_exit: float = 0.0    # SELL price of OTM PE at exit
     # Scaled entry tracking
     scaled_lots_added: int = 0        # How many lots added so far (including initial)
     next_scale_time: datetime | None = None  # When next lot can be added
@@ -413,6 +426,11 @@ class TradeRecord:
     number_of_lots: int = 1
     qty: int = 65
     capital_used: float = 250000.0
+    otm_ce_entry: float = 0.0
+    otm_pe_entry: float = 0.0
+    otm_ce_exit: float = 0.0
+    otm_pe_exit: float = 0.0
+    otm_pnl: float = 0.0  # P&L from OTM long legs
     sl_events: list[dict] = field(default_factory=list)
     charges_breakdown: dict = field(default_factory=dict)
     scale_entries: list[dict] = field(default_factory=list)  # Scaled entry log
@@ -428,12 +446,16 @@ class BacktestEngine:
         ce_df: pd.DataFrame,
         pe_df: pd.DataFrame,
         vix_df: pd.DataFrame,
+        otm_ce_df: pd.DataFrame | None = None,
+        otm_pe_df: pd.DataFrame | None = None,
     ):
         self.cfg = config
         self.spot = self._index_by_timestamp(spot_df)
         self.ce = self._index_by_timestamp(ce_df)
         self.pe = self._index_by_timestamp(pe_df)
         self.vix = self._index_by_timestamp(vix_df)
+        self.otm_ce = self._index_by_timestamp(otm_ce_df) if otm_ce_df is not None and not otm_ce_df.empty else pd.DataFrame()
+        self.otm_pe = self._index_by_timestamp(otm_pe_df) if otm_pe_df is not None and not otm_pe_df.empty else pd.DataFrame()
         self.trades: list[TradeRecord] = []
         self.running_capital: float = config.capital  # tracks compounded capital
 
@@ -630,6 +652,19 @@ class BacktestEngine:
             "ce_price": ce_entry, "pe_price": pe_entry, "lots": initial_lots,
         })
 
+        # Iron butterfly: buy OTM legs for protection
+        if self.cfg.iron_butterfly_enabled and not self.otm_ce.empty and not self.otm_pe.empty:
+            otm_ce_candle = self._get_candle(self.otm_ce, entry_dt)
+            otm_pe_candle = self._get_candle(self.otm_pe, entry_dt)
+            if otm_ce_candle and otm_pe_candle:
+                # BUY OTM: slippage works against us (higher buy price)
+                trade.otm_ce_entry = otm_ce_candle["open"] + self.cfg.slippage_points
+                trade.otm_pe_entry = otm_pe_candle["open"] + self.cfg.slippage_points
+            else:
+                # No OTM data — skip iron butterfly for this trade
+                trade.otm_ce_entry = 0.0
+                trade.otm_pe_entry = 0.0
+
         day_state.trade_count += 1
         if is_reentry:
             day_state.reentry_count += 1
@@ -644,6 +679,9 @@ class BacktestEngine:
         # Get all candles for the day from entry to exit
         ce_candles = self._get_day_candles(self.ce, day, self.cfg.entry_time, self.cfg.exit_time)
         pe_candles = self._get_day_candles(self.pe, day, self.cfg.entry_time, self.cfg.exit_time)
+        # OTM candles for iron butterfly
+        otm_ce_candles = self._get_day_candles(self.otm_ce, day, self.cfg.entry_time, self.cfg.exit_time) if not self.otm_ce.empty else pd.DataFrame()
+        otm_pe_candles = self._get_day_candles(self.otm_pe, day, self.cfg.entry_time, self.cfg.exit_time) if not self.otm_pe.empty else pd.DataFrame()
 
         if ce_candles.empty and pe_candles.empty:
             return
@@ -1116,6 +1154,24 @@ class BacktestEngine:
         """Record a completed trade and update day state."""
         gross_pnl = trade.closed_pnl
 
+        # Iron butterfly: close OTM legs and compute their P&L
+        otm_pnl = 0.0
+        if self.cfg.iron_butterfly_enabled and (trade.otm_ce_entry > 0 or trade.otm_pe_entry > 0):
+            exit_time_str = trade.sl_events[-1]["time"] if trade.sl_events else None
+            if exit_time_str:
+                exit_dt = datetime.fromisoformat(exit_time_str)
+                # Get OTM candle at exit time
+                otm_ce_candle = self._get_candle(self.otm_ce, exit_dt) if not self.otm_ce.empty else None
+                otm_pe_candle = self._get_candle(self.otm_pe, exit_dt) if not self.otm_pe.empty else None
+                # SELL OTM at exit: slippage works against us (lower sell price)
+                if otm_ce_candle and trade.otm_ce_entry > 0:
+                    trade.otm_ce_exit = max(otm_ce_candle["close"] - self.cfg.slippage_points, 0.05)
+                    otm_pnl += (trade.otm_ce_exit - trade.otm_ce_entry) * trade.qty
+                if otm_pe_candle and trade.otm_pe_entry > 0:
+                    trade.otm_pe_exit = max(otm_pe_candle["close"] - self.cfg.slippage_points, 0.05)
+                    otm_pnl += (trade.otm_pe_exit - trade.otm_pe_entry) * trade.qty
+            gross_pnl += otm_pnl
+
         # Calculate charges
         charges_detail = calc_trade_charges(
             entry_ce=trade.ce.entry_price,
@@ -1128,6 +1184,29 @@ class BacktestEngine:
             pe_exited=trade.pe.exit_price > 0,
         )
         charges_total = charges_detail["total"]
+
+        # Iron butterfly: extra charges for 4 OTM orders (buy entry + sell exit × 2 legs)
+        if self.cfg.iron_butterfly_enabled and (trade.otm_ce_entry > 0 or trade.otm_pe_entry > 0):
+            otm_orders = 0
+            if trade.otm_ce_entry > 0:
+                otm_orders += 2  # buy at entry + sell at exit
+            if trade.otm_pe_entry > 0:
+                otm_orders += 2
+            extra_otm_brokerage = otm_orders * self.cfg.charges.brokerage_per_order
+            extra_otm_gst = extra_otm_brokerage * self.cfg.charges.gst_pct / 100
+            # STT on OTM sell side
+            otm_sell_value = (trade.otm_ce_exit + trade.otm_pe_exit) * trade.qty
+            extra_otm_stt = otm_sell_value * self.cfg.charges.stt_sell_pct / 100
+            # Exchange + SEBI on both sides
+            otm_total_value = (trade.otm_ce_entry + trade.otm_pe_entry + trade.otm_ce_exit + trade.otm_pe_exit) * trade.qty
+            extra_otm_exchange = otm_total_value * self.cfg.charges.exchange_txn_pct / 100
+            extra_otm_sebi = otm_total_value * self.cfg.charges.sebi_pct / 100
+            extra_otm_stamp = (trade.otm_ce_entry + trade.otm_pe_entry) * trade.qty * self.cfg.charges.stamp_duty_buy_pct / 100
+
+            otm_charges = extra_otm_brokerage + extra_otm_gst + extra_otm_stt + extra_otm_exchange + extra_otm_sebi + extra_otm_stamp
+            charges_total += otm_charges
+            charges_detail["otm_charges"] = round(otm_charges, 2)
+            charges_detail["total"] = round(charges_total, 2)
 
         # Scaled entry: extra brokerage for additional entry orders
         # Each scaling step adds 2 orders (CE + PE sell)
@@ -1174,6 +1253,11 @@ class BacktestEngine:
             number_of_lots=trade.number_of_lots,
             qty=trade.qty,
             capital_used=round(self.running_capital, 2),
+            otm_ce_entry=trade.otm_ce_entry,
+            otm_pe_entry=trade.otm_pe_entry,
+            otm_ce_exit=trade.otm_ce_exit,
+            otm_pe_exit=trade.otm_pe_exit,
+            otm_pnl=round(otm_pnl, 2),
             sl_events=trade.sl_events,
             charges_breakdown=charges_detail,
             scale_entries=trade.scale_entries,
@@ -1217,6 +1301,11 @@ class BacktestEngine:
                 "number_of_lots": t.number_of_lots,
                 "qty": t.qty,
                 "capital_used": t.capital_used,
+                "otm_ce_entry": t.otm_ce_entry,
+                "otm_pe_entry": t.otm_pe_entry,
+                "otm_ce_exit": t.otm_ce_exit,
+                "otm_pe_exit": t.otm_pe_exit,
+                "otm_pnl": t.otm_pnl,
                 "num_sl_events": len(t.sl_events),
                 "scaled_lots": len(t.scale_entries),
             })
