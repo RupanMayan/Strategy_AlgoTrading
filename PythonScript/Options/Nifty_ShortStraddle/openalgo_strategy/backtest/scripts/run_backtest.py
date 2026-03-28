@@ -63,9 +63,10 @@ def main():
     print(f"  Period: {start_date} to {end_date}")
     print(f"{'='*60}")
 
-    # Create timestamped results folder
-    timestamp = datetime.now().strftime("%Y-%m-%d")
-    results_dir = BACKTEST_DIR / "results" / timestamp
+    # Create results folder: date / mode
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    mode = "compounded" if config.compound_capital else "fixed"
+    results_dir = BACKTEST_DIR / "results" / date_str / mode
     results_dir.mkdir(parents=True, exist_ok=True)
     (results_dir / "charts").mkdir(exist_ok=True)
 
