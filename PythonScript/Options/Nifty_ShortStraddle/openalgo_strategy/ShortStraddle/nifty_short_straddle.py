@@ -98,6 +98,12 @@ WEEKLY_PNL_FILE              = "weekly_pnl.json"
 ORB_FILTER_ENABLED           = True
 ORB_THRESHOLD_PCT            = 0.5  # %
 
+# Fix 8: IV entry filter — skip entry if ATM implied volatility too low
+# Uses OpenAlgo optiongreeks API (Black-76 model) to compute real-time IV
+# Backtest validated: Calmar 328 vs 282 (production), max DD -6,719 vs -9,516
+IV_ENTRY_FILTER_ENABLED  = True
+IV_ENTRY_MIN             = 12.0  # Skip if avg(CE_IV, PE_IV) < this %
+
 # Fix 7: Combined SL — use combined premium SL when both legs active
 COMBINED_SL_ENABLED          = True
 COMBINED_SL_PCT              = 30.0
