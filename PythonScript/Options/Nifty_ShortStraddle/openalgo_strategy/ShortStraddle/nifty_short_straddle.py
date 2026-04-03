@@ -1662,6 +1662,31 @@ class NiftyShortStraddle:
                         self._entry_done_today = True
                         return
 
+        # IV entry filter — skip if ATM implied volatility too low
+        if IV_ENTRY_FILTER_ENABLED:
+            spot = fetch_ltp(UNDERLYING, EXCHANGE)
+            if spot > 0:
+                atm_strike = round(spot / STRIKE_ROUNDING) * STRIKE_ROUNDING
+                expiry = resolve_expiry()
+                if expiry:
+                    sym_ce = f"{UNDERLYING}{expiry}{atm_strike}CE"
+                    sym_pe = f"{UNDERLYING}{expiry}{atm_strike}PE"
+                    ce_iv = fetch_iv(sym_ce)
+                    pe_iv = fetch_iv(sym_pe)
+                    if ce_iv > 0 and pe_iv > 0:
+                        avg_iv = (ce_iv + pe_iv) / 2.0
+                        if avg_iv < IV_ENTRY_MIN:
+                            plog(f"IV entry filter: avg IV={avg_iv:.2f}% < {IV_ENTRY_MIN}% — skip")
+                            telegram.notify(
+                                f"🚫 Entry skipped — IV too low: {avg_iv:.2f}% < {IV_ENTRY_MIN}%\n"
+                                f"CE IV: {ce_iv:.2f}% | PE IV: {pe_iv:.2f}%"
+                            )
+                            self._entry_done_today = True
+                            return
+                        plog(f"IV entry filter: avg IV={avg_iv:.2f}% >= {IV_ENTRY_MIN}% — OK")
+                    else:
+                        plog(f"IV entry filter: could not fetch IV (CE={ce_iv}, PE={pe_iv}) — allowing entry", "WARNING")
+
         # Weekly drawdown guard — skip if rolling losses exceed threshold
         if WEEKLY_DRAWDOWN_ENABLED:
             rolling_pnl = _get_weekly_rolling_pnl()
