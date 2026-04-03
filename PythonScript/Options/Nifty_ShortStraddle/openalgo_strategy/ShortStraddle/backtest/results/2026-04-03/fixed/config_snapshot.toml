@@ -115,4 +115,4 @@ stamp_duty_buy_pct = 0.003
 [backtest]
 start_date = "2021-04-01"
 end_date = "2026-03-28"
-slippage_points = 1.0
+slippage_points = 5.0

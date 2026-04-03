@@ -108,6 +108,13 @@ IV_ENTRY_MIN             = 12.0  # Skip if avg(CE_IV, PE_IV) < this %
 COMBINED_SL_ENABLED          = True
 COMBINED_SL_PCT              = 30.0
 
+# ── Hybrid Exchange SL (Layer 2 catastrophic protection) ───────────────
+# Places SL-M BUY orders on exchange after entry. Acts as safety net for
+# flash crashes and API/internet failures. Script's own 30% SL handles
+# normal exits; exchange SL at 45% only fires when script can't.
+EXCHANGE_SL_ENABLED          = True
+EXCHANGE_SL_PCT              = 45.0    # SL-M trigger at 45% above entry per leg
+
 WS_ENABLED             = True
 WS_STALENESS_S         = 60
 WS_RECONNECT_MAX_S     = 30
@@ -307,6 +314,7 @@ INITIAL_STATE = {
     "last_close_time": None, "last_trade_pnl": 0.0,
     "reentry_count_today": 0, "trade_count": 0,
     "exit_reason": "",
+    "exchange_sl_oid_ce": "", "exchange_sl_oid_pe": "",
 }
 
 state: dict = dict(INITIAL_STATE)
@@ -851,6 +859,8 @@ class OrderEngine:
             state["entry_time"] = now_dt.isoformat()
             state["entry_date"] = now_dt.strftime("%Y-%m-%d")
             state["exit_reason"] = ""
+            state["exchange_sl_oid_ce"] = ""
+            state["exchange_sl_oid_pe"] = ""
             state["trailing_active_ce"] = False
             state["trailing_active_pe"] = False
             state["trailing_sl_ce"] = 0.0
@@ -937,6 +947,206 @@ class OrderEngine:
                             telegram.notify(f"⚠️ {leg_f} fill price from LTP fallback: ₹{ltp:.2f}")
             save_state()
 
+        # Place exchange SL-M orders now that we have fill prices
+        self._place_exchange_sl()
+
+    def _place_exchange_sl(self):
+        """Place SL-M BUY orders on exchange as catastrophic protection (Layer 2).
+        Called after fill prices are captured. Fail-open: if placement fails,
+        strategy continues with script-only monitoring (same as before this feature).
+        """
+        if not EXCHANGE_SL_ENABLED:
+            return
+
+        for leg, price_key, oid_key in [
+            ("CE", "entry_price_ce", "exchange_sl_oid_ce"),
+            ("PE", "entry_price_pe", "exchange_sl_oid_pe"),
+        ]:
+            entry_price = state[price_key]
+            if entry_price <= 0:
+                plog(f"Exchange SL {leg}: no entry price — skipping", "WARNING")
+                continue
+
+            trigger = round(entry_price * (1 + EXCHANGE_SL_PCT / 100), 1)
+            symbol = state[f"symbol_{leg.lower()}"]
+
+            for attempt in range(3):
+                try:
+                    resp = broker.get().placeorder(
+                        strategy=STRATEGY_NAME,
+                        symbol=symbol,
+                        exchange=OPTION_EXCH,
+                        action="BUY",
+                        quantity=str(qty()),
+                        price_type="SL-M",
+                        product=PRODUCT,
+                        trigger_price=str(trigger),
+                    )
+                    if api_ok(resp):
+                        oid = str(resp.get("orderid", ""))
+                        with _monitor_lock:
+                            state[oid_key] = oid
+                            save_state()
+                        plog(f"Exchange SL {leg}: placed SL-M BUY at trigger ₹{trigger:.1f} (order {oid})")
+                        break
+                    else:
+                        plog(f"Exchange SL {leg} attempt {attempt+1}: {api_err(resp)}", "WARNING")
+                except Exception as exc:
+                    plog(f"Exchange SL {leg} attempt {attempt+1} error: {exc}", "WARNING")
+                time.sleep(1)
+            else:
+                plog(f"Exchange SL {leg}: FAILED after 3 attempts — continuing without", "ERROR")
+                telegram.notify(f"⚠️ Exchange SL {leg} placement failed — no Layer 2 protection for this leg")
+
+        # Summary notification
+        ce_oid = state.get("exchange_sl_oid_ce", "")
+        pe_oid = state.get("exchange_sl_oid_pe", "")
+        if ce_oid or pe_oid:
+            ce_trigger = round(state["entry_price_ce"] * (1 + EXCHANGE_SL_PCT / 100), 1) if state["entry_price_ce"] > 0 else 0
+            pe_trigger = round(state["entry_price_pe"] * (1 + EXCHANGE_SL_PCT / 100), 1) if state["entry_price_pe"] > 0 else 0
+            telegram.notify(
+                f"🛡️ Exchange SL placed (Layer 2)\n"
+                f"CE: trigger ₹{ce_trigger:.1f} ({ce_oid or 'FAILED'})\n"
+                f"PE: trigger ₹{pe_trigger:.1f} ({pe_oid or 'FAILED'})"
+            )
+
+    def _cancel_exchange_sl(self, leg: str):
+        """Cancel exchange SL-M order for a specific leg.
+        Called when script closes a leg via any of the 13 exit modules.
+        Fail-safe: if cancel fails, log and continue — MIS auto-square at 15:15 is backstop.
+        """
+        if not EXCHANGE_SL_ENABLED:
+            return
+
+        leg_l = leg.lower()
+        oid_key = f"exchange_sl_oid_{leg_l}"
+        oid = state.get(oid_key, "")
+        if not oid:
+            return
+
+        for attempt in range(3):
+            try:
+                resp = broker.get().cancelorder(
+                    order_id=oid,
+                    strategy=STRATEGY_NAME,
+                )
+                if api_ok(resp):
+                    plog(f"Exchange SL {leg}: cancelled order {oid}")
+                    with _monitor_lock:
+                        state[oid_key] = ""
+                        save_state()
+                    return
+                else:
+                    err = api_err(resp)
+                    # Order already completed or cancelled — not an error
+                    if "complete" in err.lower() or "cancel" in err.lower() or "traded" in err.lower():
+                        plog(f"Exchange SL {leg}: order {oid} already closed/cancelled")
+                        with _monitor_lock:
+                            state[oid_key] = ""
+                            save_state()
+                        return
+                    plog(f"Exchange SL {leg} cancel attempt {attempt+1}: {err}", "WARNING")
+            except Exception as exc:
+                plog(f"Exchange SL {leg} cancel attempt {attempt+1} error: {exc}", "WARNING")
+            time.sleep(0.5)
+
+        plog(f"Exchange SL {leg}: CANCEL FAILED after 3 attempts (order {oid})", "ERROR")
+        telegram.notify(f"🚨 Exchange SL {leg} cancel failed — order {oid} may still be active!")
+        # Clear the OID anyway to avoid repeated cancel attempts
+        with _monitor_lock:
+            state[oid_key] = ""
+            save_state()
+
+    def _check_exchange_sl_status(self) -> bool:
+        """Check if exchange SL-M orders were triggered by the exchange.
+        Called at the TOP of each monitor tick, before any exit logic.
+        Returns True if any leg was closed by exchange SL (caller should re-check state).
+        """
+        if not EXCHANGE_SL_ENABLED:
+            return False
+
+        any_triggered = False
+
+        for leg, oid_key, active_key in [
+            ("CE", "exchange_sl_oid_ce", "ce_active"),
+            ("PE", "exchange_sl_oid_pe", "pe_active"),
+        ]:
+            oid = state.get(oid_key, "")
+            if not oid or not state.get(active_key):
+                continue
+
+            try:
+                resp = broker.get().orderstatus(order_id=oid, strategy=STRATEGY_NAME)
+                if not api_ok(resp):
+                    continue
+
+                data = resp.get("data", {})
+                order_status = data.get("order_status", "").lower()
+
+                # Partial fill: not handled — ATM Nifty fills instantly; see spec edge case #4
+                if order_status == "complete":
+                    # Exchange SL triggered — leg was exited by exchange
+                    fill_price = float(data.get("average_price", 0) or 0)
+                    if fill_price <= 0:
+                        fill_price = fetch_ltp(state[f"symbol_{leg.lower()}"], OPTION_EXCH)
+
+                    plog(f"EXCHANGE SL TRIGGERED: {leg} filled at ₹{fill_price:.2f} (order {oid})", "WARNING")
+
+                    leg_l = leg.lower()
+                    entry_px = state[f"entry_price_{leg_l}"]
+                    leg_pnl = (entry_px - fill_price) * qty() if entry_px > 0 and fill_price > 0 else 0.0
+
+                    with _monitor_lock:
+                        state[active_key] = False
+                        state[f"exit_price_{leg_l}"] = fill_price
+                        state["closed_pnl"] += leg_pnl
+                        state[oid_key] = ""
+                        state["sl_events"].append({
+                            "leg": leg, "reason": "Exchange SL-M (45%)",
+                            "entry": entry_px, "exit": fill_price,
+                            "pnl": round(leg_pnl, 2),
+                            "time": now_ist().isoformat(),
+                        })
+
+                    telegram.notify(
+                        f"🛡️ EXCHANGE SL TRIGGERED — {leg}\n"
+                        f"Entry: ₹{entry_px:.2f} → Exit: ₹{fill_price:.2f}\n"
+                        f"Leg P&L: ₹{leg_pnl:,.2f}\n"
+                        f"Closed P&L: ₹{state['closed_pnl']:,.2f}"
+                    )
+
+                    any_triggered = True
+
+                    # Cancel survivor's exchange SL — script's breakeven SL takes over
+                    other_leg = "PE" if leg == "CE" else "CE"
+                    other_oid_key = f"exchange_sl_oid_{other_leg.lower()}"
+                    if state.get(other_oid_key):
+                        self._cancel_exchange_sl(other_leg)
+
+                    # Check if fully flat
+                    other_active = state.get(f"{other_leg.lower()}_active", False)
+                    if not other_active:
+                        state["in_position"] = False
+                        state["exit_reason"] = "Exchange SL-M (45%)"
+                        self._mark_fully_flat("Exchange SL-M (45%)")
+                    else:
+                        # Activate breakeven on survivor
+                        self._activate_breakeven_if_needed(other_leg.lower())
+                        save_state()
+
+                elif order_status in ("rejected", "cancelled"):
+                    plog(f"Exchange SL {leg}: order {oid} was {order_status} by broker", "WARNING")
+                    telegram.notify(f"⚠️ Exchange SL {leg} order {order_status} — no Layer 2 protection")
+                    with _monitor_lock:
+                        state[oid_key] = ""
+                        save_state()
+
+            except Exception as exc:
+                # Don't block the monitor loop — retry next tick
+                plog(f"Exchange SL {leg} status check error: {exc}", "WARNING")
+
+        return any_triggered
+
     def close_one_leg(self, leg: str, reason: str, current_ltp: float = 0.0):
         leg_l = leg.lower()
         sym_key = f"symbol_{leg_l}"
@@ -993,6 +1203,9 @@ class OrderEngine:
 
         if fill_price <= 0:
             fill_price = current_ltp if current_ltp > 0 else fetch_ltp(symbol, OPTION_EXCH)
+
+        # Cancel exchange SL for this leg (script handled the exit)
+        self._cancel_exchange_sl(leg)
 
         entry_px = state[entry_key]
         leg_pnl = (entry_px - fill_price) * qty() if entry_px > 0 and fill_price > 0 else 0.0
@@ -1068,6 +1281,10 @@ class OrderEngine:
             self.close_one_leg(leg, reason, current_ltp=ltp)
 
     def _mark_fully_flat(self, reason: str):
+        # Belt-and-suspenders: cancel any remaining exchange SL orders
+        for leg in ["CE", "PE"]:
+            self._cancel_exchange_sl(leg)
+
         ws_feed.unsubscribe_position_symbols()
 
         final_pnl = state["closed_pnl"]
@@ -1132,6 +1349,10 @@ class OrderEngine:
                 "sl_events": state.get("sl_events", []),
                 "trade_count": state.get("trade_count", 0),
                 "lots": NUMBER_OF_LOTS,
+                "exchange_sl_triggered": any(
+                    e.get("reason", "").startswith("Exchange SL")
+                    for e in state.get("sl_events", [])
+                ),
             }
             with open(TRADE_LOG_FILE, "a") as f:
                 f.write(json.dumps(record, default=str) + "\n")
@@ -1163,6 +1384,12 @@ class Monitor:
             _monitor_lock.release()
 
     def _tick_inner(self):
+        # Priority 0 (pre-check): Detect if exchange SL-M triggered independently
+        if self.engine._check_exchange_sl_status():
+            if not state["in_position"]:
+                return
+            # Refresh legs list — some legs may have been closed by exchange
+
         legs = active_legs()
         if not legs:
             return
