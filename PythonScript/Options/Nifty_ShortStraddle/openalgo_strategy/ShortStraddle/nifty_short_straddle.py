@@ -516,6 +516,25 @@ def fetch_vix() -> float:
         pass
     return 0.0
 
+
+def fetch_iv(symbol: str) -> float:
+    """Fetch implied volatility for an option symbol via OpenAlgo optiongreeks API.
+
+    Uses Black-76 model (server-side). Returns IV as percentage (e.g. 14.85),
+    or 0.0 on failure.
+    """
+    try:
+        resp = broker.get().optiongreeks(symbol=symbol, exchange=OPTION_EXCH)
+        if api_ok(resp):
+            iv = float(resp.get("implied_volatility", 0) or 0)
+            if iv > 0:
+                plog(f"fetch_iv({symbol}): IV={iv:.2f}%", "DEBUG")
+                return iv
+        plog(f"fetch_iv({symbol}): failed — {api_err(resp)}", "WARNING")
+    except Exception as exc:
+        plog(f"fetch_iv({symbol}): {exc}", "WARNING")
+    return 0.0
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  EXPIRY RESOLUTION
 # ─────────────────────────────────────────────────────────────────────────────
