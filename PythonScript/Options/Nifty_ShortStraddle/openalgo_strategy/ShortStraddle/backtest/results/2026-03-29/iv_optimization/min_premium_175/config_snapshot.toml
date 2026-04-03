@@ -1,0 +1,111 @@
+# Optimization Test: Minimum Combined Premium Filter = 175
+# Base: config_production.toml + min_combined_premium = 175
+
+[instrument]
+underlying = "NIFTY"
+exchange = "NSE_INDEX"
+option_exchange = "NFO"
+lot_size = 65
+number_of_lots = 1
+product = "MIS"
+strike_rounding = 50
+capital = 250000
+dynamic_lot_sizing = true
+compound_capital = false
+max_lots = 50
+
+[timing]
+entry_time = "09:17"
+exit_time = "15:15"
+monitor_interval_sec = 5
+
+[filters]
+trade_dte = [0, 1, 2, 3, 4]
+skip_months = []
+min_combined_premium = 175.0
+
+[risk.per_leg_sl]
+enabled = true
+sl_percent = 30.0
+sl_dte_map = {0 = 40.0}
+
+[risk.combined_sl]
+enabled = true
+sl_percent = 30.0
+
+[risk.daily_limits]
+profit_target = 10000
+loss_limit = -6000
+
+[risk.net_pnl_guard]
+max_defer_min = 15
+
+[risk.combined_decay]
+enabled = true
+default_pct = 60.0
+dte_map = {0 = 60.0, 1 = 65.0, 2 = 60.0, 3 = 50.0, 4 = 50.0}
+
+[risk.winner_booking]
+enabled = true
+decay_pct = 30.0
+
+[risk.asymmetric]
+enabled = true
+winner_decay_pct = 40.0
+loser_intact_pct = 80.0
+
+[risk.combined_trail]
+enabled = true
+activate_pct = 30.0
+trail_pct = 40.0
+
+[risk.breakeven]
+enabled = true
+grace_min = 5
+buffer_pct = 5.0
+
+[risk.reentry]
+enabled = true
+cooldown_min = 45
+max_per_day = 0
+max_loss = 2000
+
+[risk.vix_spike]
+enabled = true
+threshold_pct = 15.0
+abs_floor = 18.0
+check_interval_sec = 300
+
+[risk.max_trade_loss]
+enabled = true
+amount = 15000
+
+[risk.vix_entry_filter]
+enabled = true
+min = 11.0
+max = 25.0
+
+[risk.spot_move_exit]
+enabled = true
+multiplier = 1.0
+
+[risk.weekly_drawdown]
+enabled = true
+loss_limit = -20000
+
+[risk.orb_filter]
+enabled = true
+threshold_pct = 0.5
+
+[charges]
+brokerage_per_order = 20.0
+stt_sell_pct = 0.0625
+exchange_txn_pct = 0.053
+sebi_pct = 0.0001
+gst_pct = 18.0
+stamp_duty_buy_pct = 0.003
+
+[backtest]
+start_date = "2021-04-01"
+end_date = "2026-03-28"
+slippage_points = 1.0
