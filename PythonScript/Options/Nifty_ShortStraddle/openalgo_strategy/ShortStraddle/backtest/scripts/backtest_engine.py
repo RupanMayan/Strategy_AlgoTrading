@@ -225,6 +225,37 @@ class Config:
     orb_filter_enabled: bool = False
     orb_threshold_pct: float = 0.5  # Skip entry if spot moved > this % from open
 
+    # IV Entry Filter (Black-76 implied volatility)
+    iv_entry_filter_enabled: bool = False
+    iv_entry_min: float = 0.0       # Skip entry if annualized IV < this % (e.g. 10.0)
+    iv_entry_risk_free_rate: float = 0.065  # Risk-free rate for Black-76
+
+    # Data IV Entry Filter (use pre-computed IV from option chain data)
+    data_iv_entry_filter_enabled: bool = False
+    data_iv_entry_min: float = 0.0  # Skip if avg(CE_IV, PE_IV) < this %
+
+    # IV Skew Filter (CE-PE IV difference)
+    iv_skew_filter_enabled: bool = False
+    iv_skew_max_pct: float = 10.0  # Skip if |CE_IV - PE_IV| > this %
+
+    # OI Entry Filter (combined open interest threshold)
+    oi_entry_filter_enabled: bool = False
+    oi_entry_min: float = 500000.0  # Skip if CE_OI + PE_OI < this
+
+    # Volume Entry Filter (combined volume threshold)
+    volume_entry_filter_enabled: bool = False
+    volume_entry_min: float = 1000.0  # Skip if CE_vol + PE_vol < this
+
+    # Put-Call OI Ratio Filter
+    pcr_filter_enabled: bool = False
+    pcr_min: float = 0.7   # Skip if PE_OI/CE_OI < this
+    pcr_max: float = 1.5   # Skip if PE_OI/CE_OI > this
+
+    # IV Spike Exit (volatility expansion exit)
+    iv_spike_exit_enabled: bool = False
+    iv_spike_exit_threshold_pct: float = 20.0  # Exit if IV expanded > this % from entry
+    iv_spike_exit_require_loss: bool = True     # Only exit if position is losing
+
     # Re-entry
     reentry_enabled: bool = True
     reentry_cooldown_min: float = 45.0
@@ -357,6 +388,37 @@ def load_config(path: str | Path) -> Config:
     c.orb_filter_enabled = orb.get("enabled", c.orb_filter_enabled)
     c.orb_threshold_pct = orb.get("threshold_pct", c.orb_threshold_pct)
 
+    ivf = risk.get("iv_entry_filter", {})
+    c.iv_entry_filter_enabled = ivf.get("enabled", c.iv_entry_filter_enabled)
+    c.iv_entry_min = ivf.get("min", c.iv_entry_min)
+    c.iv_entry_risk_free_rate = ivf.get("risk_free_rate", c.iv_entry_risk_free_rate)
+
+    ivse = risk.get("iv_spike_exit", {})
+    c.iv_spike_exit_enabled = ivse.get("enabled", c.iv_spike_exit_enabled)
+    c.iv_spike_exit_threshold_pct = ivse.get("threshold_pct", c.iv_spike_exit_threshold_pct)
+    c.iv_spike_exit_require_loss = ivse.get("require_loss", c.iv_spike_exit_require_loss)
+
+    divf = risk.get("data_iv_entry_filter", {})
+    c.data_iv_entry_filter_enabled = divf.get("enabled", c.data_iv_entry_filter_enabled)
+    c.data_iv_entry_min = divf.get("min", c.data_iv_entry_min)
+
+    ivsf = risk.get("iv_skew_filter", {})
+    c.iv_skew_filter_enabled = ivsf.get("enabled", c.iv_skew_filter_enabled)
+    c.iv_skew_max_pct = ivsf.get("max_pct", c.iv_skew_max_pct)
+
+    oief = risk.get("oi_entry_filter", {})
+    c.oi_entry_filter_enabled = oief.get("enabled", c.oi_entry_filter_enabled)
+    c.oi_entry_min = oief.get("min", c.oi_entry_min)
+
+    volf = risk.get("volume_entry_filter", {})
+    c.volume_entry_filter_enabled = volf.get("enabled", c.volume_entry_filter_enabled)
+    c.volume_entry_min = volf.get("min", c.volume_entry_min)
+
+    pcrf = risk.get("pcr_filter", {})
+    c.pcr_filter_enabled = pcrf.get("enabled", c.pcr_filter_enabled)
+    c.pcr_min = pcrf.get("min", c.pcr_min)
+    c.pcr_max = pcrf.get("max", c.pcr_max)
+
     re = risk.get("reentry", {})
     c.reentry_enabled = re.get("enabled", c.reentry_enabled)
     c.reentry_cooldown_min = re.get("cooldown_min", c.reentry_cooldown_min)
@@ -429,6 +491,8 @@ class TradeState:
     scaled_lots_added: int = 0        # How many lots added so far (including initial)
     next_scale_time: datetime | None = None  # When next lot can be added
     scale_entries: list[dict] = field(default_factory=list)  # Log of each scaling step
+    # IV at entry (for IV spike exit)
+    iv_at_entry: float = 0.0
 
 
 @dataclass
@@ -476,6 +540,7 @@ class TradeRecord:
     sl_events: list[dict] = field(default_factory=list)
     charges_breakdown: dict = field(default_factory=dict)
     scale_entries: list[dict] = field(default_factory=list)  # Scaled entry log
+    iv_at_entry: float = 0.0
 
 
 # ── Backtest Engine ──────────────────────────────────────────────────────────
@@ -566,6 +631,33 @@ class BacktestEngine:
         except Exception:
             return None
 
+    def _get_extended_candle(self, df: pd.DataFrame, dt: datetime) -> dict | None:
+        """Get candle with IV, OI, volume at a specific timestamp."""
+        if df.empty:
+            return None
+        try:
+            loc = df.index.get_indexer([dt], method="nearest")[0]
+            if loc < 0 or loc >= len(df):
+                return None
+            row = df.iloc[loc]
+            if abs((df.index[loc] - dt).total_seconds()) > 120:
+                return None
+            result = {
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+            }
+            if "iv" in row.index:
+                result["iv"] = float(row["iv"]) if pd.notna(row["iv"]) else 0.0
+            if "oi" in row.index:
+                result["oi"] = float(row["oi"]) if pd.notna(row["oi"]) else 0.0
+            if "volume" in row.index:
+                result["volume"] = float(row["volume"]) if pd.notna(row["volume"]) else 0.0
+            return result
+        except Exception:
+            return None
+
     def _get_vix_at(self, dt: datetime) -> float:
         """Get VIX value at a given time. Falls back to daily open."""
         candle = self._get_candle(self.vix, dt)
@@ -633,6 +725,76 @@ class BacktestEngine:
                 if move_pct > self.cfg.orb_threshold_pct:
                     return
 
+        # IV entry filter — skip if implied volatility too low
+        if self.cfg.iv_entry_filter_enabled:
+            ce_candle_iv = self._get_candle(self.ce, entry_dt)
+            pe_candle_iv = self._get_candle(self.pe, entry_dt)
+            if ce_candle_iv and pe_candle_iv:
+                from black76 import compute_entry_iv
+                entry_iv = compute_entry_iv(
+                    ce_price=ce_candle_iv["open"],
+                    pe_price=pe_candle_iv["open"],
+                    spot=spot,
+                    dte=dte,
+                    r=self.cfg.iv_entry_risk_free_rate,
+                )
+                if entry_iv is not None and entry_iv < self.cfg.iv_entry_min:
+                    return
+
+        # Data IV Entry Filter — use pre-computed IV from option chain data
+        if self.cfg.data_iv_entry_filter_enabled:
+            ce_ext = self._get_extended_candle(self.ce, entry_dt)
+            pe_ext = self._get_extended_candle(self.pe, entry_dt)
+            if ce_ext and pe_ext:
+                ce_iv = ce_ext.get("iv", 0.0)
+                pe_iv = pe_ext.get("iv", 0.0)
+                if ce_iv > 0 and pe_iv > 0:
+                    avg_iv = (ce_iv + pe_iv) / 2.0
+                    if avg_iv < self.cfg.data_iv_entry_min:
+                        return
+
+        # IV Skew Filter — skip if CE-PE IV difference too large
+        if self.cfg.iv_skew_filter_enabled:
+            ce_ext = self._get_extended_candle(self.ce, entry_dt)
+            pe_ext = self._get_extended_candle(self.pe, entry_dt)
+            if ce_ext and pe_ext:
+                ce_iv = ce_ext.get("iv", 0.0)
+                pe_iv = pe_ext.get("iv", 0.0)
+                if ce_iv > 0 and pe_iv > 0:
+                    skew = abs(ce_iv - pe_iv)
+                    if skew > self.cfg.iv_skew_max_pct:
+                        return
+
+        # OI Entry Filter — skip if combined OI too low (illiquid)
+        if self.cfg.oi_entry_filter_enabled:
+            ce_ext = self._get_extended_candle(self.ce, entry_dt)
+            pe_ext = self._get_extended_candle(self.pe, entry_dt)
+            if ce_ext and pe_ext:
+                combined_oi = ce_ext.get("oi", 0.0) + pe_ext.get("oi", 0.0)
+                if combined_oi < self.cfg.oi_entry_min:
+                    return
+
+        # Volume Entry Filter — skip if combined volume too low
+        if self.cfg.volume_entry_filter_enabled:
+            ce_ext = self._get_extended_candle(self.ce, entry_dt)
+            pe_ext = self._get_extended_candle(self.pe, entry_dt)
+            if ce_ext and pe_ext:
+                combined_vol = ce_ext.get("volume", 0.0) + pe_ext.get("volume", 0.0)
+                if combined_vol < self.cfg.volume_entry_min:
+                    return
+
+        # Put-Call OI Ratio Filter — skip if PCR outside range
+        if self.cfg.pcr_filter_enabled:
+            ce_ext = self._get_extended_candle(self.ce, entry_dt)
+            pe_ext = self._get_extended_candle(self.pe, entry_dt)
+            if ce_ext and pe_ext:
+                ce_oi = ce_ext.get("oi", 0.0)
+                pe_oi = pe_ext.get("oi", 0.0)
+                if ce_oi > 0 and pe_oi > 0:
+                    pcr = pe_oi / ce_oi
+                    if pcr < self.cfg.pcr_min or pcr > self.cfg.pcr_max:
+                        return
+
         # Weekly drawdown guard — skip if rolling 5-day P&L below threshold
         if self.cfg.weekly_drawdown_enabled:
             recent = [pnl for d, pnl in self._recent_daily_pnl if (day - d).days <= 5]
@@ -675,6 +837,16 @@ class BacktestEngine:
 
         vix = self._get_vix_at(entry_dt)
 
+        # Compute IV at entry for IV spike exit
+        entry_iv = 0.0
+        if self.cfg.iv_spike_exit_enabled or self.cfg.iv_entry_filter_enabled:
+            from black76 import compute_entry_iv
+            entry_iv = compute_entry_iv(
+                ce_price=ce_entry, pe_price=pe_entry,
+                spot=spot, dte=dte,
+                r=self.cfg.iv_entry_risk_free_rate,
+            ) or 0.0
+
         # Dynamic lot sizing: SEBI lot size for the date + capital-based allocation
         if self.cfg.dynamic_lot_sizing:
             lot_size = get_lot_size_for_date(day)
@@ -708,6 +880,7 @@ class BacktestEngine:
             number_of_lots=initial_lots,
             qty=qty,
             scaled_lots_added=initial_lots,
+            iv_at_entry=entry_iv,
         )
         # Store target lots for scaling and set next scale time
         trade._target_lots = target_lots
@@ -1060,6 +1233,32 @@ class BacktestEngine:
                     self._close_all_with_candles(trade, reason, tick_time, ce_candle, pe_candle)
                     return reason
 
+        # --- Priority 5a: IV Spike Exit ---
+        if (self.cfg.iv_spike_exit_enabled and trade.iv_at_entry > 0
+                and trade.ce.active and trade.pe.active
+                and ce_candle and pe_candle):
+            from black76 import compute_entry_iv
+            current_spot = self._get_spot_at(tick_time)
+            if current_spot > 0:
+                current_iv = compute_entry_iv(
+                    ce_price=ce_candle["close"],
+                    pe_price=pe_candle["close"],
+                    spot=current_spot,
+                    dte=dte,
+                    r=self.cfg.iv_entry_risk_free_rate,
+                )
+                if current_iv is not None and current_iv > 0:
+                    iv_expansion_pct = ((current_iv - trade.iv_at_entry) / trade.iv_at_entry) * 100
+                    if iv_expansion_pct >= self.cfg.iv_spike_exit_threshold_pct:
+                        should_exit = True
+                        if self.cfg.iv_spike_exit_require_loss:
+                            if combined_pnl >= 0:
+                                should_exit = False
+                        if should_exit:
+                            reason = f"IV Spike Exit ({iv_expansion_pct:.1f}%)"
+                            self._close_all_with_candles(trade, reason, tick_time, ce_candle, pe_candle)
+                            return reason
+
         # --- Priority 5b: Spot-Move Exit ---
         if self.cfg.spot_move_exit_enabled and trade.underlying_at_entry > 0:
             current_spot = self._get_spot_at(tick_time)
@@ -1352,6 +1551,7 @@ class BacktestEngine:
             sl_events=trade.sl_events,
             charges_breakdown=charges_detail,
             scale_entries=trade.scale_entries,
+            iv_at_entry=trade.iv_at_entry,
         )
         self.trades.append(record)
 
@@ -1412,6 +1612,7 @@ class BacktestEngine:
                 "otm_pnl": t.otm_pnl,
                 "num_sl_events": len(t.sl_events),
                 "scaled_lots": len(t.scale_entries),
+                "iv_at_entry": t.iv_at_entry,
             })
 
         return pd.DataFrame(records)
