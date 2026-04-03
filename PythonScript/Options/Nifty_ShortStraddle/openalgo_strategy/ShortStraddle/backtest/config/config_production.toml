@@ -106,7 +106,7 @@ risk_free_rate = 0.065
 
 [charges]
 brokerage_per_order = 20.0
-stt_sell_pct = 0.0625
+stt_sell_pct = 0.15              # Budget 2026 rate (effective Apr 1, 2026)
 exchange_txn_pct = 0.053
 sebi_pct = 0.0001
 gst_pct = 18.0
