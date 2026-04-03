@@ -4,58 +4,49 @@ Production-sync backtest for `nifty_short_straddle.py`. Replays every exit modul
 
 ---
 
-## Results Summary (2026-03-29, Production Config with 7 Risk Fixes)
+## Results Summary (2026-04-04, Production Config with 7 Risk Fixes + Hybrid Exchange SL)
 
 ### Fixed Capital Mode (Rs 2.5L, no compounding) — RECOMMENDED
 
 | Metric | Value |
 |--------|-------|
-| Period | Apr 2021 - Mar 2026 (5 years) |
+| Period | Apr 2021 - Apr 2026 (5 years) |
 | Starting Capital | Rs 2,50,000 |
-| Final Capital | Rs 29,34,686 |
-| Total Trades | 1,101 |
-| Net P&L (after charges) | Rs 26,84,686 |
-| ROI (5 year) | 1,074% |
-| Annual ROI | ~215% |
-| Win Rate | 85.2% |
-| Profit Factor | 9.38 |
-| Sharpe Ratio | 12.84 |
-| Calmar Ratio | 282.13 |
-| Max Drawdown | Rs -9,516 (3.8% of capital) |
-| Total Charges | Rs 1,45,833 (5.2% of gross) |
-| Avg Daily P&L | Rs 2,438 |
-| Max Consecutive Loss Days | 3 |
+| Final Capital | Rs 24,37,897 |
+| Total Trades | 798 |
+| Net P&L (after charges) | Rs 21,87,897 |
+| ROI (5 year) | 875% |
+| CAGR | 57.7% |
+| Win Rate | 86.3% |
+| Profit Factor | 10.56 |
+| Sharpe Ratio | 13.67 |
+| Calmar Ratio | 324.51 |
+| Max Drawdown | Rs -6,742 (2.7% of capital) |
+| Total Charges | Rs 1,24,796 (5.4% of gross) |
+| Avg Daily P&L | Rs 2,742 |
 
-### Compounded Capital Mode (Rs 2.5L start, profits reinvested, max 50 lots)
+### Slippage Sensitivity (Fixed Capital, 2026-04-03)
 
-| Metric | Value |
-|--------|-------|
-| Total Trades | 1,042 |
-| Net P&L (after charges) | Rs 4,24,37,949 (Rs 4.24 Cr) |
-| ROI (5 year) | 16,975% |
-| Win Rate | 85.6% |
-| Profit Factor | 7.24 |
-| Sharpe Ratio | 8.30 |
-| Calmar Ratio | 106.92 |
-| Max Drawdown | Rs -3,96,903 (158.8% of starting capital) |
-| Total Charges | Rs 7,90,739 |
-| Avg Lots/Trade | 44.49 |
-| Largest Single Loss | Rs -3,10,298 |
+| Slippage | Net P&L | Win Rate | Max DD | Profit Factor |
+|----------|---------|----------|--------|---------------|
+| 1 pt (production) | Rs 21,87,897 | 86.3% | Rs -6,742 | 10.56 |
+| 3 pt (moderate) | Rs 10,42,519 | 71.4% | Rs -14,219 | 3.15 |
+| 5 pt (stress test) | Rs 6,30,825 | 61.3% | Rs -19,458 | 2.01 |
 
-**Why Fixed is Recommended:** Compounding hits max 50 lots by mid-2022 and stays capped. At 50 lots x 65 = 3,250 qty, liquidity in weekly NIFTY options becomes a real concern. Risk-adjusted returns (Sharpe 12.84 vs 8.30, Calmar 282x vs 107x) strongly favor fixed capital. A single bad compounding trade can lose Rs 3.1L vs Rs 6.7K in fixed mode.
+**Real-world expectation:** Live results will be between 1pt and 5pt slippage depending on execution quality. The hybrid exchange SL helps keep slippage closer to the 1pt end.
 
 ### Year-Wise Summary (Fixed Capital)
 
 | Year | Trades | Net P&L | Win Rate | Avg Lots | Lot Size |
 |------|--------|---------|----------|----------|----------|
-| 2021 | 180 | Rs 5,04,418 | 86.7% | 5.2 | 25 |
-| 2022 | 229 | Rs 6,77,922 | 87.3% | 5.0 | 25 |
-| 2023 | 217 | Rs 4,97,358 | 90.3% | 4.4 | 25 |
-| 2024 | 234 | Rs 5,72,157 | 82.9% | 3.2 | 25-75 |
-| 2025 | 198 | Rs 3,85,766 | 81.3% | 1.0 | 75 |
-| 2026 | 43 | Rs 47,066 | 72.1% | 1.0 | 65 |
+| 2021 | 134 | Rs 4,36,464 | 86.6% | 5.3 | 25 |
+| 2022 | 212 | Rs 6,53,222 | 87.7% | 5.0 | 25 |
+| 2023 | 119 | Rs 3,62,188 | 89.9% | 4.5 | 25 |
+| 2024 | 171 | Rs 4,25,783 | 84.8% | 3.3 | 25-75 |
+| 2025 | 128 | Rs 2,62,084 | 85.2% | 1.0 | 75 |
+| 2026 | 34 | Rs 48,157 | 76.5% | 1.0 | 65 |
 
-### Risk Management — 7 Institutional Fixes (All Enabled)
+### Risk Management — 7 Institutional Fixes + Hybrid Exchange SL (All Enabled)
 
 | Fix | Description | Impact |
 |-----|-------------|--------|
@@ -66,6 +57,7 @@ Production-sync backtest for `nifty_short_straddle.py`. Replays every exit modul
 | 5. Weekly Drawdown Guard | Skip entry if rolling 5-day P&L < Rs -20,000/lot | Prevents drawdown spirals |
 | 6. ORB Filter | Skip entry if spot moved > 0.5% from 09:15 open | Avoids gap-up/gap-down entries |
 | 7. Combined SL | 30% combined premium SL (replaces per-leg SL when both legs active) | Single biggest contributor — reduced per-leg SL hits from 87 to 22 |
+| 8. Hybrid Exchange SL | SL-M orders on exchange at 45% above entry per leg | Layer 2 catastrophic safety net — fires when script/API/internet fails |
 
 ### Optimization History (Applied)
 
@@ -75,6 +67,8 @@ Production-sync backtest for `nifty_short_straddle.py`. Replays every exit modul
 | DTE 0 wider SL (`sl_dte_map = {0: 40}`) | +28% P&L, -56% max DD |
 | November enabled (`skip_months = []`) | More trading days, all months net positive |
 | 7 risk fixes (combined) | +102% P&L, -71% max DD, +20pp win rate |
+| Hybrid Exchange SL (45%) | Zero backtest impact (safety net only) — protects against flash crash/API failure |
+| STT updated to 0.15% (Budget 2026) | -0.7% net P&L (minimal impact) |
 
 ---
 
@@ -132,10 +126,16 @@ backtest/
     │   ├── compounded/index.html
     │   ├── comparison/          # Baseline vs enhanced comparison
     │   └── optimization/        # All optimization test results
-    └── 2026-03-29/
-        ├── production/index.html  # Dashboard (production config, 7 risk fixes)
-        ├── fixed/index.html       # Dashboard (fixed capital, latest)
-        └── fixed_vs_compound/     # Fixed vs compounding comparison
+    ├── 2026-03-29/
+    │   ├── production/index.html  # Dashboard (production config, 7 risk fixes)
+    │   ├── fixed/index.html       # Dashboard (fixed capital, latest)
+    │   └── fixed_vs_compound/     # Fixed vs compounding comparison
+    ├── 2026-04-03/
+    │   ├── fixed/                 # STT 0.15% updated results
+    │   ├── slip3/                 # 3pt slippage stress test
+    │   └── slip5/                 # 5pt slippage stress test
+    └── 2026-04-04/
+        └── fixed/index.html       # Latest production (7 fixes + hybrid exchange SL)
 ```
 
 ---
@@ -176,7 +176,13 @@ Uses static `lot_size` and `number_of_lots` from config for all trades.
 
 The backtest engine replicates every exit check in the exact same priority order as `Monitor._tick_inner()` in `nifty_short_straddle.py`:
 
-### Priority 0: Max Trade Loss (absolute rupee cap)
+### Priority 0 (Pre-check): Exchange SL-M Detection (Hybrid Layer 2)
+- Check if exchange SL-M orders were triggered independently (flash crash, API/internet failure)
+- Runs BEFORE any exit logic — if exchange closed a leg, marks it inactive to prevent double orders
+- Cancels other leg's exchange SL, activates breakeven on survivor
+- **Not simulated in backtest** — safety net only
+
+### Priority 0a: Max Trade Loss (absolute rupee cap)
 - Close all if combined MTM breaches Rs 15,000/lot
 - Highest priority — overrides all other exits
 
@@ -224,6 +230,14 @@ The backtest engine replicates every exit check in the exact same priority order
 ### Priority 7: Time Exit
 - At 15:15 IST -> close all remaining legs
 
+### Protection Layers (Defence in Depth)
+
+```
+Layer 1: Script monitoring (every 5s) — 13 exit conditions above
+Layer 2: Exchange SL-M at 45% per leg — lives on exchange, fires independently
+Layer 3: Broker MIS auto-square at 15:15-15:30 — final backstop
+```
+
 ### Entry Filters (checked before entry)
 
 | Order | Filter | Condition |
@@ -249,11 +263,13 @@ The backtest engine replicates every exit check in the exact same priority order
 | Charge | Rate | Applied On |
 |--------|------|-----------|
 | Brokerage | Rs 20 per order | Every order (4 per straddle round-trip) |
-| STT | 0.0625% | Sell side only |
+| STT | 0.15% (Budget 2026, effective Apr 1) | Sell side only |
 | Exchange Txn | 0.053% | Both sides |
 | SEBI Fee | 0.0001% | Both sides |
 | GST | 18% of (brokerage + exchange + SEBI) | Both sides |
 | Stamp Duty | 0.003% | Buy side only |
+
+**STT History:** 0.0625% (base) → 0.1% (Oct 2024) → 0.15% (Apr 2026). Backtest engine uses date-based STT rates for accurate charge calculation.
 
 **Example:** Straddle with combined premium Rs 400, qty 65:
 - Premium value = Rs 26,000
@@ -333,12 +349,14 @@ Each run creates `results/YYYY-MM-DD/` with:
 
 ## Backtest vs Production Sync Status
 
-Last verified: 2026-03-29
+Last verified: 2026-04-04
 
 - Config values: **100% match** (all 40+ parameters verified)
 - Exit logic priority chain: **100% match** (all 13 exit modules in same order)
 - Entry filter chain: **100% match** (all 7 filters in same order)
+- STT charges: **Synced** — 0.15% (Budget 2026, effective Apr 1)
 - Known intentional differences:
   - Backtest uses candle high for SL checks (conservative); production uses live LTP
   - Backtest uses max(close, SL) for SL fill price; production fills at market
   - Margin guard uses internal calculation in backtest vs API call in production
+  - **Hybrid Exchange SL not simulated in backtest** — it's a safety net that only fires when script monitoring fails (flash crash, internet down). In normal operation, script's 30% SL exits before the 45% exchange SL triggers

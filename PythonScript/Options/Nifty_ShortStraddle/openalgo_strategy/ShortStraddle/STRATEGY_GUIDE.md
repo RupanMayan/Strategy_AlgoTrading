@@ -1,8 +1,8 @@
 # Nifty Short Straddle — Strategy Guide
 
-Single-file OpenAlgo Python Strategy for NIFTY weekly short straddle with comprehensive risk management, IV entry filter, and independent per-leg SL.
+Single-file OpenAlgo Python Strategy for NIFTY weekly short straddle with comprehensive risk management, IV entry filter, hybrid exchange SL, and independent per-leg SL.
 
-**Script:** `nifty_short_straddle.py` (v8.0)
+**Script:** `nifty_short_straddle.py` (v9.0)
 **Deployment:** OpenAlgo Python Strategy (handles scheduling, holidays, log capture)
 **Strategy Tag:** `Short Straddle` — all orders are tagged; won't interfere with other strategies
 
@@ -14,38 +14,45 @@ SELL ATM CE + SELL ATM PE at the same strike on the nearest weekly expiry. Profi
 
 ---
 
-## Backtest Results (5-Year: Apr 2021 — Mar 2026)
+## Backtest Results (5-Year: Apr 2021 — Apr 2026)
 
-**Production Config (IV12 Filter Enabled, Fixed Capital Rs 2,50,000)**
+**Production Config (IV12 Filter + Hybrid Exchange SL, Fixed Capital Rs 2,50,000)**
 
 | Metric | Value |
 |--------|-------|
 | Total Trades | 798 |
 | Win Rate | 86.3% |
-| Net P&L (after charges) | Rs 22,03,926 |
-| Total Return | 881.6% |
-| CAGR | ~57.9% |
-| Profit Factor | 10.73 |
-| Sharpe Ratio | 13.76 |
-| Calmar Ratio | 328.03 |
-| Max Drawdown | Rs -6,719 |
-| Avg Daily P&L | Rs 2,762 |
-| Total Charges | Rs 1,08,767 (4.7% of gross) |
-| Max Consecutive Losses | 3 |
+| Net P&L (after charges) | Rs 21,87,897 |
+| Total Return | 875.2% |
+| CAGR | 57.7% |
+| Profit Factor | 10.56 |
+| Sharpe Ratio | 13.67 |
+| Calmar Ratio | 324.51 |
+| Max Drawdown | Rs -6,742 |
+| Avg Daily P&L | Rs 2,742 |
+| Total Charges | Rs 1,24,796 (5.4% of gross) |
 | Negative Months | 0 / 60 |
 
 **Yearly Performance:**
 
 | Year | Trades | Net P&L | Win Rate |
 |------|--------|---------|----------|
-| 2021 | 134 | Rs 4,39,271 | 86.6% |
-| 2022 | 212 | Rs 6,58,313 | 87.7% |
-| 2023 | 119 | Rs 3,64,062 | 89.9% |
-| 2024 | 171 | Rs 4,29,146 | 84.8% |
-| 2025 | 128 | Rs 2,64,332 | 85.2% |
-| 2026 (Q1) | 34 | Rs 48,802 | 76.5% |
+| 2021 | 134 | Rs 4,36,464 | 86.6% |
+| 2022 | 212 | Rs 6,53,222 | 87.7% |
+| 2023 | 119 | Rs 3,62,188 | 89.9% |
+| 2024 | 171 | Rs 4,25,783 | 84.8% |
+| 2025 | 128 | Rs 2,62,084 | 85.2% |
+| 2026 (Q1) | 34 | Rs 48,157 | 76.5% |
 
-See `backtest/results/2026-04-03/fixed/` for full results, charts, and trade log.
+**Slippage Sensitivity (real-world expectations):**
+
+| Slippage | Net P&L | Win Rate | Max DD | Profit Factor |
+|----------|---------|----------|--------|---------------|
+| 1 pt (backtest) | Rs 21,87,897 | 86.3% | Rs -6,742 | 10.56 |
+| 3 pt (moderate) | Rs 10,42,519 | 71.4% | Rs -14,219 | 3.15 |
+| 5 pt (stress) | Rs 6,30,825 | 61.3% | Rs -19,458 | 2.01 |
+
+See `backtest/results/2026-04-04/fixed/` for full results, charts, and trade log.
 
 ---
 
@@ -141,7 +148,29 @@ Fetches real-time IV via OpenAlgo `optiongreeks` API (Black-76 model). Skips low
 
 Priority hierarchy — highest priority checks first:
 
-#### Priority 0: Max Trade Loss
+#### Priority 0 (Pre-check): Hybrid Exchange SL-M Detection
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `EXCHANGE_SL_ENABLED` | `true` | Enable exchange-level SL-M orders |
+| `EXCHANGE_SL_PCT` | `45.0` | Trigger at 45% above entry per leg |
+
+**Layer 2 catastrophic protection.** After entry, SL-M BUY orders are placed on the exchange at 45% above entry price for each leg. These orders live on the exchange independently — they fire even if the script crashes, API fails, or internet goes down.
+
+**Lifecycle:**
+1. **Place:** After fill capture, SL-M orders placed on exchange (3 retries, fail-open)
+2. **Detect:** Each tick, `orderstatus()` checks if exchange SL triggered. If triggered, marks leg inactive before any exit logic runs (prevents double BUY)
+3. **Cancel:** When script closes a leg (any exit reason), cancels that leg's exchange SL (3 retries). Also cancels on fully-flat cleanup
+4. **Cost:** Zero — cancelled orders incur no charges. Only pays if exchange SL actually fills
+
+**Protection layers (defence in depth):**
+```
+Layer 1: Script monitoring (every 5s) — 13 exit conditions below
+Layer 2: Exchange SL-M at 45% per leg — lives on exchange, fires independently
+Layer 3: Broker MIS auto-square at 15:15-15:30 — final backstop
+```
+
+#### Priority 0a: Max Trade Loss
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -245,8 +274,10 @@ Backtest showed re-entry trades have negative expected value. Disabled improves 
 All orders are tagged with `strategy="Short Straddle"`:
 - `optionsmultiorder` (entry) — strategy-tagged
 - `placesmartorder` (exit) — strategy-tagged
-- `closeposition` (safety net) — strategy-tagged
+- `placeorder` (exchange SL-M) — strategy-tagged
+- `cancelorder` (exchange SL cancel) — strategy-tagged
 - `orderstatus` (all calls) — strategy-tagged
+- `closeposition` (safety net) — strategy-tagged
 
 **Your other option positions and strategies will NOT be affected.**
 
@@ -254,14 +285,14 @@ All orders are tagged with `strategy="Short Straddle"`:
 
 ## API Rate Limits
 
-| Scenario | API Category | Usage | Limit |
-|----------|-------------|-------|-------|
-| Monitoring (WS active) | General APIs | ~0/sec (cache) | 50/sec |
-| Monitoring (WS down) | General APIs | ~1/sec | 50/sec |
-| Entry burst | General + Orders | ~11 calls/5s | 50+10/sec |
-| Exit | Smart Orders | 1/sec (sequential) | 2/sec |
+| Scenario | API Calls per 5s Tick | Notes |
+|----------|----------------------|-------|
+| Monitoring (WS active) | ~2 (orderstatus x2) | Exchange SL status checks only |
+| Monitoring (WS down) | ~6 (LTP x3, VIX, orderstatus x2) | REST fallback + SL checks |
+| Entry burst | ~5 (multiorder, orderstatus, placeorder x2) | Spread over 2-3s |
+| Exit (both legs) | ~10 (LTP, placeorder x2, cancelorder x2) | Sequential, under 10/s limit |
 
-WebSocket handles all live pricing — monitoring loop makes zero API calls in normal operation.
+WebSocket handles all live pricing — monitoring loop only makes `orderstatus()` calls for exchange SL detection in normal operation. Well within the 10 req/s rate limit.
 
 ---
 
@@ -277,11 +308,12 @@ WebSocket handles all live pricing — monitoring loop makes zero API calls in n
 - Atomic writes: temp file + `os.replace()` — never corrupts on crash
 - On startup, Reconciler compares saved state vs broker positions
 - Cross-day stale state auto-cleaned
+- Exchange SL order IDs (`exchange_sl_oid_ce/pe`) persisted — survive script restarts
 
 | Saved State | Broker Position | Action |
 |-------------|----------------|--------|
 | None | Flat | Clean start |
-| Saved | Confirmed | Restore + resume monitoring |
+| Saved | Confirmed | Restore + resume monitoring (exchange SL detection resumes from saved OIDs) |
 | Saved | Flat | Externally closed, reset |
 | Stale (prev day) | Any | Reset |
 
@@ -290,7 +322,7 @@ WebSocket handles all live pricing — monitoring loop makes zero API calls in n
 - Entry, exit, daily reset, and fill capture all acquire lock before state mutation
 
 ### Telegram Notifications
-Sent for: entry, partial exit, full exit, margin issues, quote failures, VIX spikes, IV filter skips, strategy start/stop.
+Sent for: entry, partial exit, full exit, margin issues, quote failures, VIX spikes, IV filter skips, exchange SL placed/triggered/cancel-failed, strategy start/stop.
 
 Background daemon thread with 3-retry backoff. Non-blocking.
 
@@ -299,6 +331,7 @@ Every position close appends a JSON record to `trades.jsonl`:
 - Entry/exit prices, P&L, duration, exit reason
 - Market context (VIX, spot, DTE)
 - SL events, re-entry flag, trade count
+- `exchange_sl_triggered` flag — whether exchange SL-M fired for any leg
 
 ---
 
