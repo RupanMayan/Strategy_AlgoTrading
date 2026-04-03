@@ -770,6 +770,32 @@ class OrderEngine:
                 if not pe_ok: failed.append(f"PE: {pe_result}")
                 plog(f"Multi-order partial failure: {', '.join(failed)}", "ERROR")
                 telegram.notify(f"❌ Multi-order partial failure\n{chr(10).join(failed)}")
+                # Close the leg that succeeded to avoid dangling position
+                if ce_ok and not pe_ok:
+                    filled_sym = ce_result.get("symbol", symbol_ce)
+                    plog(f"Closing orphan CE leg: {filled_sym}", "ERROR")
+                    try:
+                        broker.get().placesmartorder(
+                            symbol=filled_sym, exchange=OPTION_EXCH,
+                            action="BUY", quantity=qty(),
+                            price_type="MARKET", product=PRODUCT,
+                            position_size=0, strategy=STRATEGY_NAME,
+                        )
+                    except Exception as close_exc:
+                        plog(f"Orphan CE close failed: {close_exc}", "ERROR")
+                elif pe_ok and not ce_ok:
+                    filled_sym = pe_result.get("symbol", symbol_pe)
+                    plog(f"Closing orphan PE leg: {filled_sym}", "ERROR")
+                    try:
+                        broker.get().placesmartorder(
+                            symbol=filled_sym, exchange=OPTION_EXCH,
+                            action="BUY", quantity=qty(),
+                            price_type="MARKET", product=PRODUCT,
+                            position_size=0, strategy=STRATEGY_NAME,
+                        )
+                    except Exception as close_exc:
+                        plog(f"Orphan PE close failed: {close_exc}", "ERROR")
+                # Also call closeposition as a safety net
                 broker.get().closeposition(strategy=STRATEGY_NAME)
                 return False
 
@@ -899,6 +925,16 @@ class OrderEngine:
             if ce_px > 0 and pe_px > 0:
                 combined = ce_px + pe_px
                 plog(f"Combined premium: ₹{combined:.2f} (CE={ce_px:.2f} + PE={pe_px:.2f})")
+            else:
+                # LTP fallback if orderstatus didn't return fill prices
+                for leg_f, sym_f, px_f in [("CE", "symbol_ce", "entry_price_ce"),
+                                            ("PE", "symbol_pe", "entry_price_pe")]:
+                    if state[px_f] <= 0 and state[sym_f]:
+                        ltp = fetch_ltp(state[sym_f], OPTION_EXCH)
+                        if ltp > 0:
+                            state[px_f] = ltp
+                            plog(f"Fill capture {leg_f}: using LTP fallback ₹{ltp:.2f}", "WARNING")
+                            telegram.notify(f"⚠️ {leg_f} fill price from LTP fallback: ₹{ltp:.2f}")
             save_state()
 
     def close_one_leg(self, leg: str, reason: str, current_ltp: float = 0.0):
@@ -927,7 +963,7 @@ class OrderEngine:
                     symbol=symbol, exchange=OPTION_EXCH,
                     action="BUY", quantity=qty(),
                     price_type="MARKET", product=PRODUCT,
-                    position_size=0,
+                    position_size=0, strategy=STRATEGY_NAME,
                 )
                 if api_ok(resp):
                     order_sent = True
@@ -1634,7 +1670,8 @@ class NiftyShortStraddle:
             return
 
         dte = compute_dte(expiry)
-        state["current_dte"] = dte
+        with _monitor_lock:
+            state["current_dte"] = dte
 
         if not dte_filter_ok(dte):
             self._entry_done_today = True
@@ -1696,11 +1733,13 @@ class NiftyShortStraddle:
                 return
 
         is_reentry = state.get("last_close_time") is not None and state.get("trade_count", 0) > 0
-        state["is_reentry"] = is_reentry
+        with _monitor_lock:
+            state["is_reentry"] = is_reentry
         if is_reentry:
             if not reentry_ok():
                 return
-            state["reentry_count_today"] += 1
+            with _monitor_lock:
+                state["reentry_count_today"] += 1
             plog(f"Re-entry #{state['reentry_count_today']} — cumulative P&L ₹{state['cumulative_daily_pnl']:,.2f}")
 
         plog_sep()
@@ -1718,17 +1757,18 @@ class NiftyShortStraddle:
         self._daily_reset_date = today_date
         self._entry_done_today = False
         _reentry_block_alerted = False
-        if state["cumulative_daily_pnl"] != 0:
-            plog(f"Day end — cumulative P&L: ₹{state['cumulative_daily_pnl']:,.2f}")
-        state["reentry_count_today"] = 0
-        state["cumulative_daily_pnl"] = 0.0
-        state["trade_count"] = 0
-        state["last_close_time"] = None
-        state["last_trade_pnl"] = 0.0
-        # Capture opening spot for ORB filter
-        if ORB_FILTER_ENABLED:
-            open_spot = fetch_ltp(UNDERLYING, EXCHANGE)
-            state["_orb_open_spot"] = open_spot if open_spot > 0 else 0
+        with _monitor_lock:
+            if state["cumulative_daily_pnl"] != 0:
+                plog(f"Day end — cumulative P&L: ₹{state['cumulative_daily_pnl']:,.2f}")
+            state["reentry_count_today"] = 0
+            state["cumulative_daily_pnl"] = 0.0
+            state["trade_count"] = 0
+            state["last_close_time"] = None
+            state["last_trade_pnl"] = 0.0
+            # Capture opening spot for ORB filter
+            if ORB_FILTER_ENABLED:
+                open_spot = fetch_ltp(UNDERLYING, EXCHANGE)
+                state["_orb_open_spot"] = open_spot if open_spot > 0 else 0
         plog(f"Daily reset for {today_date}")
 
     def _handle_signal(self, signum, _frame):

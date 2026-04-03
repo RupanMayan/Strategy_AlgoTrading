@@ -1,15 +1,51 @@
 # Nifty Short Straddle — Strategy Guide
 
-Single-file OpenAlgo Python Strategy for NIFTY weekly short straddle with independent per-leg SL, intraday MIS.
+Single-file OpenAlgo Python Strategy for NIFTY weekly short straddle with comprehensive risk management, IV entry filter, and independent per-leg SL.
 
-**Script:** `nifty_short_straddle.py` (~750 lines)
+**Script:** `nifty_short_straddle.py` (v8.0)
 **Deployment:** OpenAlgo Python Strategy (handles scheduling, holidays, log capture)
+**Strategy Tag:** `Short Straddle` — all orders are tagged; won't interfere with other strategies
 
 ---
 
 ## How It Works
 
 SELL ATM CE + SELL ATM PE at the same strike on the nearest weekly expiry. Profit comes from theta decay when NIFTY stays range-bound. Each leg has an independent stop-loss — if one leg gets stopped out, the other continues running.
+
+---
+
+## Backtest Results (5-Year: Apr 2021 — Mar 2026)
+
+**Production Config (IV12 Filter Enabled, Fixed Capital Rs 2,50,000)**
+
+| Metric | Value |
+|--------|-------|
+| Total Trades | 798 |
+| Win Rate | 86.3% |
+| Net P&L (after charges) | Rs 22,03,926 |
+| Total Return | 881.6% |
+| CAGR | ~57.9% |
+| Profit Factor | 10.73 |
+| Sharpe Ratio | 13.76 |
+| Calmar Ratio | 328.03 |
+| Max Drawdown | Rs -6,719 |
+| Avg Daily P&L | Rs 2,762 |
+| Total Charges | Rs 1,08,767 (4.7% of gross) |
+| Max Consecutive Losses | 3 |
+| Negative Months | 0 / 60 |
+
+**Yearly Performance:**
+
+| Year | Trades | Net P&L | Win Rate |
+|------|--------|---------|----------|
+| 2021 | 134 | Rs 4,39,271 | 86.6% |
+| 2022 | 212 | Rs 6,58,313 | 87.7% |
+| 2023 | 119 | Rs 3,64,062 | 89.9% |
+| 2024 | 171 | Rs 4,29,146 | 84.8% |
+| 2025 | 128 | Rs 2,64,332 | 85.2% |
+| 2026 (Q1) | 34 | Rs 48,802 | 76.5% |
+
+See `backtest/results/2026-04-03/fixed/` for full results, charts, and trade log.
 
 ---
 
@@ -21,16 +57,17 @@ All parameters are defined as constants at the top of the script. No external co
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `OPENALGO_HOST` | `http://127.0.0.1:5000` | OpenAlgo server URL (env: `OPENALGO_HOST`) |
-| `OPENALGO_API_KEY` | `""` | API key (env: `OPENALGO_APIKEY`) |
-| `TELEGRAM_USER` | `""` | OpenAlgo username for Telegram (env: `OPENALGO_USERNAME`) |
+| `OPENALGO_HOST` | env `OPENALGO_HOST` | OpenAlgo server URL |
+| `OPENALGO_WS_URL` | env `OPENALGO_WS_URL` | WebSocket URL for live feed |
+| `OPENALGO_API_KEY` | env `OPENALGO_APIKEY` | API key |
+| `TELEGRAM_USER` | env `OPENALGO_USERNAME` | OpenAlgo username for Telegram |
 
 ### Instrument
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `UNDERLYING` | `NIFTY` | Index to trade |
-| `LOT_SIZE` | `65` | NIFTY lot size (verify current NSE lot size) |
+| `LOT_SIZE` | `65` | NIFTY lot size (current SEBI lot size) |
 | `NUMBER_OF_LOTS` | `1` | Lots per leg |
 | `PRODUCT` | `MIS` | MIS (intraday) or NRML (carry forward) |
 | `STRIKE_ROUNDING` | `50` | Strike interval for ATM calculation |
@@ -39,238 +76,207 @@ All parameters are defined as constants at the top of the script. No external co
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `ENTRY_TIME` | `09:17` | Fixed entry time for all DTEs. Captures maximum opening IV premium (15-25% inflated in first 2 min after open). Backtest-optimised: beats DTE-based entry by +29% P&L |
-| `EXIT_TIME` | `15:15` | Hard square-off — closes ALL legs. MIS auto-liquidation is at 15:30 |
+| `ENTRY_TIME` | `09:17` | Fixed entry time — captures opening IV premium |
+| `EXIT_TIME` | `15:15` | Hard square-off before MIS auto-liquidation at 15:30 |
 | `MONITOR_INTERVAL` | `5` | Seconds between monitor ticks |
 
 ### Filters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `TRADE_DTE` | `[0,1,2,3,4]` | Allowed DTEs. 0=expiry day (Tue), 4=Wed. All 5 trading days |
-| `SKIP_MONTHS` | `[]` | No months skipped — all months are net positive in 5-year backtest |
+| `TRADE_DTE` | `[0,1,2,3,4]` | Allowed DTEs. 0=expiry day (Tue), 4=Wed |
+| `SKIP_MONTHS` | `[]` | All months net positive in backtest |
 
 ---
 
 ## Risk Management Modules
 
-### 1. Per-Leg Independent SL
+### Entry Filters (checked before placing orders)
+
+#### 1. VIX Entry Filter
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `LEG_SL_PERCENT` | `30.0` | % of entry premium. CE and PE have independent SLs |
-| `LEG_SL_DTE_MAP` | `{0: 40.0}` | DTE-specific SL override — expiry day gets 40% SL |
+| `VIX_ENTRY_FILTER_ENABLED` | `true` | Skip entry if VIX outside safe range |
+| `VIX_ENTRY_MIN` | `11.0` | Minimum VIX to trade |
+| `VIX_ENTRY_MAX` | `25.0` | Maximum VIX to trade |
 
-**How it works:**
-- CE SL = `CE_entry_price x (1 + SL%/100)` — 130% on DTE 1-4, 140% on DTE 0
-- PE SL = `PE_entry_price x (1 + SL%/100)` — 130% on DTE 1-4, 140% on DTE 0
-- When one leg hits SL, only that leg closes. The other continues
-
-**Why 30% base:** Wider SL lets trades breathe for theta capture. At 25%, false SL hits nearly doubled and the strategy lost 60% of its edge. 30% reduces premature stops while daily loss limit (-6K) caps total risk.
-
-**Why 40% on DTE 0 (expiry day):** Expiry day has the highest gamma — small Nifty moves cause disproportionately large option price swings. The 30% SL gives only ~30-40 pts buffer on low-premium expiry days, which gets eaten by normal noise. 40% SL gives the trade room to survive these gamma spikes while theta decay (fastest on DTE 0) works in your favor. Backtest shows this avoids ~49 false SL exits, adding +28% P&L with -56% max drawdown.
-
-### 2. Daily Profit Target & Loss Limit
+#### 2. ORB (Opening Range Breakout) Filter
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `DAILY_TARGET` | `10000` | Per-lot Rs. profit target. Effective = per_lot x lots |
-| `DAILY_LOSS_LIMIT` | `-6000` | Per-lot Rs. loss limit (negative). Effective = per_lot x lots |
+| `ORB_FILTER_ENABLED` | `true` | Skip if market already moved sharply from open |
+| `ORB_THRESHOLD_PCT` | `0.5` | Max spot move % from 09:15 open |
 
-**How it works:** Every monitor tick, `combined_pnl = closed_leg_pnl + open_leg_mtm`. If it hits target or limit, ALL remaining legs close immediately.
-
-### 3. Breakeven SL After Partial Exit
+#### 3. IV Entry Filter (Black-76)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `BREAKEVEN_ENABLED` | `true` | Tighten surviving leg SL to combined breakeven |
-| `BREAKEVEN_GRACE_MIN` | `5` | Minutes to wait before arming breakeven SL |
-| `BREAKEVEN_BUFFER_PCT` | `5.0` | % buffer above mathematical breakeven price |
+| `IV_ENTRY_FILTER_ENABLED` | `true` | Skip entry if ATM implied volatility too low |
+| `IV_ENTRY_MIN` | `12.0` | Min avg(CE_IV, PE_IV) in % |
 
-**How it works:**
-After one leg hits SL (e.g., CE closes at loss of -Rs.1300):
-1. Calculate breakeven price for survivor: `be_sl = PE_entry + (closed_pnl / qty)`
-2. Apply buffer: `be_sl = be_sl x (1 + 5/100)`
-3. Wait grace period (5 min) before arming
-4. If surviving leg LTP hits breakeven SL → close to prevent net loss
+Fetches real-time IV via OpenAlgo `optiongreeks` API (Black-76 model). Skips low-IV days where premium is insufficient to absorb adverse moves. This filter removed 303 low-quality trades (27.5%) while improving:
+- Profit Factor: 9.38 -> 10.73
+- Max Drawdown: -Rs 9,516 -> -Rs 6,719 (29% better)
+- Calmar: 282 -> 328
 
-**Context-aware (FIX-XXIV):** If the surviving leg is already WINNING (LTP < entry for short), breakeven SL is SKIPPED. Only arms when survivor is LOSING — where it's genuinely needed.
-
-**SL Priority Chain:**
-1. Breakeven SL (if active, grace elapsed, AND tighter than fixed SL)
-2. Fixed SL (entry x 1.30)
-
-### 4. Combined Premium Decay Exit
+#### 4. Weekly Drawdown Guard
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `COMBINED_DECAY_ENABLED` | `true` | Exit when both legs have collectively decayed |
-| `COMBINED_DECAY_DEFAULT` | `60.0` | Default decay target % |
-| `COMBINED_DECAY_DTE_MAP` | `{0:60, 1:65, 2:60, 3:50, 4:50}` | DTE-specific targets |
+| `WEEKLY_DRAWDOWN_ENABLED` | `true` | Pause after sustained losses |
+| `WEEKLY_LOSS_LIMIT` | `-20000` | Per-lot rolling 5-day loss threshold |
 
-**How it works:**
-When BOTH legs are active:
-```
-decay_pct = (1 - (CE_ltp + PE_ltp) / (CE_entry + PE_entry)) x 100
-```
-If `decay_pct >= target` for current DTE → close all.
-
-**DTE-aware targets:**
-- DTE0 (Tue/expiry): 60% — captures most theta, avoids late gamma
-- DTE1 (Mon): 65% — strong theta, slightly higher target
-- DTE2 (Fri): 60% — standard
-- DTE3 (Thu): 50% — lower premium, exit earlier
-- DTE4 (Wed): 50% — thin premium, exit earlier
-
-### 5. Winner-Leg Early Booking
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `WINNER_BOOKING_ENABLED` | `true` | Book surviving leg when deeply decayed |
-| `WINNER_BOOKING_DECAY_PCT` | `30.0` | Book when LTP <= 30% of entry (70%+ profit) |
-
-**How it works:**
-After one leg closes (partial exit), the surviving "winner" leg often has large unrealised profit. If its LTP drops to 30% of entry (70% decay), book it immediately to lock profit and remove gamma risk.
-
-### 6. Asymmetric Leg Booking
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `ASYMMETRIC_ENABLED` | `true` | Book deeply decayed leg when other is intact |
-| `ASYMMETRIC_WINNER_DECAY_PCT` | `40.0` | Winner must be at/below 40% of entry |
-| `ASYMMETRIC_LOSER_INTACT_PCT` | `80.0` | Loser must be at/above 80% of entry |
-
-**How it works:**
-When both legs active but heavily diverged — one deeply profitable, other barely moved — the position is effectively a naked short on the losing side. Book the winner to lock profit and reduce gamma exposure.
-
-Example: CE at 35% of entry (deep profit), PE at 85% (barely moved) → Book CE.
-
-### 7. Combined Profit Trailing
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `COMBINED_TRAIL_ENABLED` | `true` | Trail combined decay, exit on retracement |
-| `COMBINED_TRAIL_ACTIVATE_PCT` | `30.0` | Start trailing at 30% combined decay |
-| `COMBINED_TRAIL_PCT` | `40.0` | Exit if decay retraces 40 points from peak |
-
-**How it works:**
-When both legs active:
-1. Once combined decay reaches 30%, start tracking the peak decay
-2. If decay retraces 40 points from peak → close all
-
-This protects combined gains before the decay target is reached. Example: decay peaks at 55%, then drops to 15% (40-point retrace) → exit.
-
-### 8. Re-Entry After Early Close (DISABLED)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `REENTRY_ENABLED` | `true` | Re-entry logic exists but is disabled via max_per_day = 0 |
-| `REENTRY_COOLDOWN_MIN` | `45` | Minutes to wait after close before re-entry |
-| `REENTRY_MAX_PER_DAY` | `0` | **DISABLED** — set to 0 to prevent all re-entries |
-| `REENTRY_MAX_LOSS` | `2000` | Per-lot Rs. — skip re-entry if previous loss exceeds this |
-
-**Status: DISABLED (backtest-optimised)**
-
-5-year backtest analysis showed re-entry trades have **negative expected value**:
-- 205 re-entry trades with 42% win rate (vs 62% for first trades)
-- Average P&L per re-entry: -Rs 428
-- Total re-entry losses: -Rs 87,743
-- 65% of re-entry losses came from afternoon sessions (13:00-14:00)
-
-**Why re-entry hurts:** After an SL exit, the market has already moved significantly. Afternoon re-entries have less time for theta decay, and premiums are already compressed. Disabling re-entry improved every single metric: +9% P&L, +17% win rate improvement, -17% max drawdown.
-
-### 9. VIX Spike Monitor
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `VIX_SPIKE_ENABLED` | `true` | Exit on mid-session VIX spike |
-| `VIX_SPIKE_THRESHOLD` | `15.0` | % rise from entry VIX triggers exit |
-| `VIX_SPIKE_ABS_FLOOR` | `18.0` | Minimum absolute VIX to confirm spike |
-| `VIX_SPIKE_INTERVAL_S` | `300` | Seconds between VIX checks (5 min) |
-
-**How it works:**
-Short straddle is short vega — rising VIX increases both legs' value even if NIFTY stays flat. Every 5 minutes, compares current VIX to entry VIX.
-
-**Dual condition (FIX-V):** Exit fires ONLY when BOTH:
-1. Relative spike >= 15% from entry VIX
-2. Current VIX >= 18 (absolute floor)
-
-This prevents false exits at low absolute VIX levels (e.g., 14→16.1 = 15% spike but VIX 16 is normal).
-
-### 10. Margin Guard
+#### 5. Margin Guard
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `MARGIN_GUARD_ENABLED` | `true` | Pre-trade margin check |
 | `MARGIN_BUFFER` | `1.20` | 20% headroom above required margin |
-| `MARGIN_FAIL_OPEN` | `true` | Allow trade if margin API fails |
+| `MARGIN_FAIL_OPEN` | `false` | Fail-closed: skip entry if margin API fails |
 
-**How it works:**
-Before entry: `(available_cash + collateral) >= required_margin x 1.20`. If insufficient, entry is blocked with a Telegram alert.
+---
 
-### 11. Net P&L Guard
+### Exit Monitors (checked every 5 seconds while in position)
+
+Priority hierarchy — highest priority checks first:
+
+#### Priority 0: Max Trade Loss
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `NET_PNL_GUARD_MAX_DEFER_MIN` | `15` | Max minutes to defer per-leg SL |
+| `MAX_TRADE_LOSS_ENABLED` | `true` | Absolute rupee cap per trade |
+| `MAX_TRADE_LOSS` | `15000` | Per-lot max loss in Rs |
 
-**How it works (FIX-XX):**
-After partial exit, if the surviving leg hits its SL BUT the net position P&L (closed_pnl + open_mtm) is still positive, the SL exit is deferred. The leg is allowed to continue as long as the net is positive, up to a maximum of 15 minutes. This prevents stopping out when the closed leg's loss is already covered by the survivor's profit.
+#### Priority 0b: Combined SL (both legs active)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `COMBINED_SL_ENABLED` | `true` | Combined premium SL when both legs active |
+| `COMBINED_SL_PCT` | `30.0` | Exit if combined premium rises 30% from entry |
+
+When both legs are active, Combined SL governs (per-leg SL is skipped). Per-leg SL only applies for single survivor after partial exit.
+
+#### Priority 1: Per-Leg SL (single survivor)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `LEG_SL_PERCENT` | `30.0` | % of entry premium |
+| `LEG_SL_DTE_MAP` | `{0: 40.0}` | Expiry day gets wider 40% SL (high gamma) |
+
+Includes **Net P&L Guard**: defers SL up to 15 min if net position (closed P&L + open MTM) is still positive.
+
+Includes **Breakeven SL**: after partial exit at a loss, tightens survivor SL to combined breakeven level (with 5% buffer and 5 min grace period).
+
+#### Priority 2: Combined Checks (both legs active)
+
+**2a. Combined Decay Exit**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `COMBINED_DECAY_ENABLED` | `true` | Exit when combined premium decayed enough |
+| `COMBINED_DECAY_DTE_MAP` | `{0:60, 1:65, 2:60, 3:50, 4:50}` | DTE-specific targets |
+
+**2b. Asymmetric Leg Booking**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ASYMMETRIC_ENABLED` | `true` | Book deeply decayed winner when loser is intact |
+| `ASYMMETRIC_WINNER_DECAY_PCT` | `40.0` | Winner at/below 40% of entry |
+| `ASYMMETRIC_LOSER_INTACT_PCT` | `80.0` | Loser at/above 80% of entry |
+
+**2c. Combined Profit Trailing**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `COMBINED_TRAIL_ENABLED` | `true` | Trail combined decay, exit on retracement |
+| `COMBINED_TRAIL_ACTIVATE_PCT` | `30.0` | Start trailing at 30% decay |
+| `COMBINED_TRAIL_PCT` | `40.0` | Exit if decay retraces 40 points from peak |
+
+#### Priority 3: Winner Booking (single survivor)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `WINNER_BOOKING_ENABLED` | `true` | Book surviving leg when deeply decayed |
+| `WINNER_BOOKING_DECAY_PCT` | `30.0` | Book when LTP <= 30% of entry |
+
+#### Priority 5: VIX Spike Exit
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `VIX_SPIKE_ENABLED` | `true` | Exit on mid-session VIX spike |
+| `VIX_SPIKE_THRESHOLD` | `15.0` | % rise from entry VIX |
+| `VIX_SPIKE_ABS_FLOOR` | `18.0` | Min absolute VIX to confirm spike |
+| `VIX_SPIKE_INTERVAL_S` | `300` | Check every 5 minutes |
+
+Dual condition: fires ONLY when relative spike >= 15% AND absolute VIX >= 18.
+
+#### Priority 5b: Spot Move Exit
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `SPOT_MOVE_EXIT_ENABLED` | `true` | Exit if underlying moved beyond premium collected |
+| `SPOT_MOVE_MULTIPLIER` | `1.0` | threshold = combined_premium x multiplier |
+
+#### Priority 6: Daily P&L Limits
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `DAILY_TARGET` | `10000` | Per-lot profit target |
+| `DAILY_LOSS_LIMIT` | `-6000` | Per-lot loss limit |
 
 ---
 
-## Disabled Modules
+### Re-Entry (DISABLED)
 
-These modules were tested in 5-year backtests and found to hurt more than help:
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `REENTRY_ENABLED` | `true` | Logic exists but disabled via max_per_day=0 |
+| `REENTRY_MAX_PER_DAY` | `0` | 0 = no re-entries allowed |
+| `REENTRY_COOLDOWN_MIN` | `45` | Cooldown between close and re-entry |
+| `REENTRY_MAX_LOSS` | `2000` | Skip re-entry if previous loss exceeds this |
 
-| Module | Why Disabled |
-|--------|-------------|
-| **Trailing SL** | Rarely activates (3/224 trades), cuts winners short |
-| **Dynamic SL** (time-of-day) | Creates false SL hits on afternoon bounces with 30% base SL |
-| **Spot-Move Exit** | 26% of exits were premature, positions naturally recover |
-| **Recovery Lock** | #1 exit reason (42%), cuts profits before theta completes |
-| **VIX Pre-Trade Filter** | No DD reduction, costs 47% net P&L |
-| **IVR/IVP Filter** | Skips 63% of profitable days |
-| **ORB Filter** | Costs Rs.65K/5yr for Rs.443 DD improvement |
-| **Momentum Filter** | Redundant with re-entry cooldown + loss cap + max/day |
+Backtest showed re-entry trades have negative expected value. Disabled improves all metrics.
 
 ---
 
-## Monitor Tick Execution Order
+## Strategy Isolation
 
-Every `MONITOR_INTERVAL` seconds (5s), the monitor runs this hierarchy:
+All orders are tagged with `strategy="Short Straddle"`:
+- `optionsmultiorder` (entry) — strategy-tagged
+- `placesmartorder` (exit) — strategy-tagged
+- `closeposition` (safety net) — strategy-tagged
+- `orderstatus` (all calls) — strategy-tagged
 
-```
-1. Per-leg SL check (each leg independently)
-   → Fetch LTP → check vs sl_level() → close if hit
-   → Net P&L guard defers SL when net position is positive
-
-2. Combined checks (both legs active):
-   a. Combined decay exit — both legs decayed enough?
-   b. Asymmetric booking — one deeply decayed, other intact?
-   c. Combined profit trailing — decay retracing from peak?
-
-3. Winner-leg booking (single survivor)
-   → Book if survivor decayed to 30% of entry
-
-4. Combined P&L update
-
-5. VIX spike check (every 5 min)
-   → Dual condition: relative + absolute
-
-6. Daily target / loss limit check
-```
+**Your other option positions and strategies will NOT be affected.**
 
 ---
 
-## State Persistence
+## API Rate Limits
 
-- **Atomic writes:** Write to temp file, then `os.replace()` — never corrupts on crash
-- **Crash recovery:** On startup, `Reconciler` compares saved state vs broker positions
-- **Type safety:** ISO datetime strings restored to IST-aware datetimes on load
-- **State file:** `strategy_state.json` — deleted after position fully closes
+| Scenario | API Category | Usage | Limit |
+|----------|-------------|-------|-------|
+| Monitoring (WS active) | General APIs | ~0/sec (cache) | 50/sec |
+| Monitoring (WS down) | General APIs | ~1/sec | 50/sec |
+| Entry burst | General + Orders | ~11 calls/5s | 50+10/sec |
+| Exit | Smart Orders | 1/sec (sequential) | 2/sec |
 
-### Reconciliation Cases
+WebSocket handles all live pricing — monitoring loop makes zero API calls in normal operation.
+
+---
+
+## Infrastructure
+
+### WebSocket Feed
+- Daemon thread with auto-reconnect (exponential backoff 1s -> 30s)
+- Subscribes to option legs + NIFTY spot + India VIX
+- LTP cache with 60s staleness threshold — falls back to REST API
+- Handles auth, subscribe, ping/pong
+
+### State Persistence
+- Atomic writes: temp file + `os.replace()` — never corrupts on crash
+- On startup, Reconciler compares saved state vs broker positions
+- Cross-day stale state auto-cleaned
 
 | Saved State | Broker Position | Action |
 |-------------|----------------|--------|
@@ -279,28 +285,16 @@ Every `MONITOR_INTERVAL` seconds (5s), the monitor runs this hierarchy:
 | Saved | Flat | Externally closed, reset |
 | Stale (prev day) | Any | Reset |
 
----
+### Thread Safety
+- `_monitor_lock` (RLock) protects all shared `state` dict writes
+- Entry, exit, daily reset, and fill capture all acquire lock before state mutation
 
-## WebSocket Feed
+### Telegram Notifications
+Sent for: entry, partial exit, full exit, margin issues, quote failures, VIX spikes, IV filter skips, strategy start/stop.
 
-- Daemon thread with auto-reconnect (exponential backoff 1s → 30s)
-- Subscribes to option legs + NIFTY spot + India VIX
-- Updates LTP cache with sub-second prices
-- Falls back to REST API if cache is stale (>60s) or WS disconnected
-- Telegram alert on persistent connection failures
+Background daemon thread with 3-retry backoff. Non-blocking.
 
----
-
-## Telegram Notifications
-
-Sent for: entry, partial exit, full exit, margin issues, quote failures, VIX spikes.
-
-Uses OpenAlgo's Telegram API. Messages are queued and delivered in a background daemon thread (non-blocking). 3 retry attempts with backoff.
-
----
-
-## Trade Logging
-
+### Trade Logging
 Every position close appends a JSON record to `trades.jsonl`:
 - Entry/exit prices, P&L, duration, exit reason
 - Market context (VIX, spot, DTE)
@@ -313,6 +307,7 @@ Every position close appends a JSON record to `trades.jsonl`:
 | Variable | Purpose |
 |----------|---------|
 | `OPENALGO_HOST` | OpenAlgo server URL |
+| `OPENALGO_WS_URL` | WebSocket URL for live feed |
 | `OPENALGO_APIKEY` | OpenAlgo API key |
 | `OPENALGO_USERNAME` | OpenAlgo username (for Telegram) |
 
@@ -321,7 +316,7 @@ Every position close appends a JSON record to `trades.jsonl`:
 ## Running
 
 ```bash
-# Production (via OpenAlgo Python Strategy)
+# Production
 python nifty_short_straddle.py
 
 # Manual utilities (uncomment in script)
@@ -331,40 +326,8 @@ python nifty_short_straddle.py
 # strategy.show_state()
 ```
 
----
-
-## Backtest Results (5-Year: Apr 2021 – Mar 2026)
-
-**Fixed Capital Mode** (Rs 2,50,000, 1 lot)
-
-| Metric | Value |
-|--------|-------|
-| Total Trades | 1,220 |
-| Net P&L (after charges) | Rs 13,31,475 |
-| ROI (5 year) | 533% |
-| Annual ROI | 106% |
-| Win Rate | 65.2% |
-| Profit Factor | 2.33 |
-| Sharpe Ratio | 4.91 |
-| Calmar Ratio | 40.47 |
-| Max Drawdown | Rs -32,897 (13% of capital) |
-| Total Charges | Rs 1,58,074 (10.6% of gross) |
-
-**Compounded Capital Mode** (Rs 2,50,000 start, profits reinvested)
-
-| Metric | Value |
-|--------|-------|
-| Total Trades | 1,220 |
-| Net P&L | Rs 2,49,14,096 (Rs 2.49 Cr) |
-| Win Rate | 66.1% |
-| Profit Factor | 2.27 |
-| Max Drawdown | Rs -9,84,350 |
-
-**Key Optimisations Applied:**
-1. Re-entry disabled (`REENTRY_MAX_PER_DAY = 0`) — saves Rs 88K, improves all metrics
-2. DTE 0 wider SL (`LEG_SL_DTE_MAP = {0: 40.0}`) — +28% P&L, -56% max drawdown
-3. November enabled (`SKIP_MONTHS = []`) — all months net positive
-
-**Backtest-to-Live Gap:** ~8% lower returns expected in production due to candle vs tick differences, real slippage, and broker execution delays.
-
-See `backtest/BACKTEST_REPORT.md` for full optimization history, rejected tests, and risk analysis.
+**Pre-deployment checklist:**
+1. Run in OpenAlgo Analyzer Mode (sandbox) for 1-2 days
+2. Monitor Telegram alerts for correct entry filter behavior
+3. Check `trades.jsonl` after sandbox day to verify P&L logging
+4. Confirm environment variables are set
