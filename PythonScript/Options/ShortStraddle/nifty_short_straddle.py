@@ -1634,19 +1634,239 @@ class Reconciler:
         pe_live = pe_sym in positions
 
         if ce_live or pe_live:
+            # Record which legs were active before vs now
+            ce_was_active = state["ce_active"]
+            pe_was_active = state["pe_active"]
+
             state["ce_active"] = ce_live
             state["pe_active"] = pe_live
             ws_feed.subscribe_position_symbols()
             plog(f"Reconciler: RESTORED — CE={ce_live}, PE={pe_live}")
             if state["entry_price_ce"] <= 0 or state["entry_price_pe"] <= 0:
                 self._refetch_fills()
+
+            # Account for legs closed during downtime
+            self._reconcile_closed_legs(ce_was_active, pe_was_active, ce_live, pe_live)
+
+            # Re-verify and re-place exchange SL orders
+            self._reconcile_exchange_sl()
+
             save_state()
             return "restored"
         else:
+            # Both legs flat — check if exchange SL triggered and record P&L
+            self._reconcile_exchange_sl_fully_flat()
+
+            # Treat this as a completed trade: add total closed_pnl to
+            # cumulative daily P&L and weekly tracking (mirrors _mark_fully_flat)
+            final_pnl = state["closed_pnl"]
+            if final_pnl != 0:
+                state["cumulative_daily_pnl"] += final_pnl
+                _record_daily_pnl(final_pnl)
+                state["trade_count"] += 1
+                plog(f"Reconciler: trade P&L ₹{final_pnl:,.2f} recorded (trade #{state['trade_count']})")
+
             plog("Reconciler: broker is flat — externally closed")
+            # Preserve cumulative P&L across reset so daily/weekly guards work
+            cum_pnl = state["cumulative_daily_pnl"]
+            tc = state["trade_count"]
             reset_state()
+            state["cumulative_daily_pnl"] = cum_pnl
+            state["trade_count"] = tc
             clear_state_file()
             return "externally_closed"
+
+    def _get_exchange_sl_fill(self, leg: str) -> float:
+        """Check if an exchange SL-M order was triggered during downtime.
+        Returns the fill price if triggered, 0.0 otherwise."""
+        leg_l = leg.lower()
+        oid = state.get(f"exchange_sl_oid_{leg_l}", "")
+        if not oid:
+            return 0.0
+        try:
+            resp = broker.get().orderstatus(order_id=oid, strategy=STRATEGY_NAME)
+            if api_ok(resp):
+                data = resp.get("data", {})
+                order_status = data.get("order_status", "").lower()
+                if order_status == "complete":
+                    fill_price = float(data.get("average_price", 0) or 0)
+                    plog(f"Reconciler: exchange SL {leg} TRIGGERED during downtime — fill ₹{fill_price:.2f}", "WARNING")
+                    return fill_price
+                elif order_status in ("rejected", "cancelled"):
+                    plog(f"Reconciler: exchange SL {leg} order was {order_status}")
+                    state[f"exchange_sl_oid_{leg_l}"] = ""
+                else:
+                    plog(f"Reconciler: exchange SL {leg} order status: {order_status}")
+        except Exception as exc:
+            plog(f"Reconciler: exchange SL {leg} status check error: {exc}", "WARNING")
+        return 0.0
+
+    def _reconcile_closed_legs(self, ce_was_active: bool, pe_was_active: bool,
+                                ce_live: bool, pe_live: bool):
+        """Account for P&L of legs that were active before shutdown but are now flat."""
+        for leg, was_active, is_live in [("CE", ce_was_active, ce_live),
+                                          ("PE", pe_was_active, pe_live)]:
+            if not was_active or is_live:
+                continue  # Leg wasn't active before, or still active — nothing to reconcile
+
+            leg_l = leg.lower()
+            entry_px = state[f"entry_price_{leg_l}"]
+            if entry_px <= 0:
+                plog(f"Reconciler: {leg} closed during downtime but no entry price — cannot compute P&L", "WARNING")
+                continue
+
+            # Try to get fill price from exchange SL order
+            fill_price = self._get_exchange_sl_fill(leg)
+
+            # If exchange SL didn't trigger, use LTP as best estimate
+            if fill_price <= 0:
+                fill_price = fetch_ltp(state[f"symbol_{leg_l}"], OPTION_EXCH)
+                if fill_price > 0:
+                    plog(f"Reconciler: {leg} closed during downtime — using LTP ₹{fill_price:.2f} as exit estimate", "WARNING")
+
+            if fill_price <= 0:
+                plog(f"Reconciler: {leg} closed during downtime — cannot determine exit price", "ERROR")
+                continue
+
+            leg_pnl = (entry_px - fill_price) * qty()
+            state[f"exit_price_{leg_l}"] = fill_price
+            state["closed_pnl"] += leg_pnl
+            state[f"exchange_sl_oid_{leg_l}"] = ""
+            state["sl_events"].append({
+                "leg": leg, "reason": "Closed during downtime (reconciled)",
+                "entry": entry_px, "exit": fill_price,
+                "pnl": round(leg_pnl, 2),
+                "time": now_ist().isoformat(),
+            })
+
+            plog(f"Reconciler: {leg} P&L accounted — entry ₹{entry_px:.2f}, exit ₹{fill_price:.2f}, P&L ₹{leg_pnl:,.2f}")
+            telegram.notify(
+                f"⚠️ Reconciler: {leg} was closed during downtime\n"
+                f"Entry: ₹{entry_px:.2f} → Exit: ₹{fill_price:.2f}\n"
+                f"Leg P&L: ₹{leg_pnl:,.2f}\n"
+                f"Closed P&L: ₹{state['closed_pnl']:,.2f}"
+            )
+
+        # Activate breakeven on survivor if a leg was lost
+        survivor = None
+        if ce_was_active and not ce_live and pe_live:
+            survivor = "pe"
+        elif pe_was_active and not pe_live and ce_live:
+            survivor = "ce"
+
+        if survivor:
+            plog(f"Reconciler: activating breakeven on survivor {survivor.upper()}")
+            self.engine._activate_breakeven_if_needed(survivor)
+
+    def _reconcile_exchange_sl(self):
+        """Re-verify exchange SL orders after restart. Re-place if expired/cancelled."""
+        if not EXCHANGE_SL_ENABLED:
+            return
+
+        for leg in ["CE", "PE"]:
+            leg_l = leg.lower()
+            if not state[f"{leg_l}_active"]:
+                # Leg is not active — cancel any stale exchange SL
+                oid = state.get(f"exchange_sl_oid_{leg_l}", "")
+                if oid:
+                    self.engine._cancel_exchange_sl(leg)
+                continue
+
+            oid = state.get(f"exchange_sl_oid_{leg_l}", "")
+            entry_price = state[f"entry_price_{leg_l}"]
+
+            if oid:
+                # Verify the order is still active at broker
+                still_active = False
+                try:
+                    resp = broker.get().orderstatus(order_id=oid, strategy=STRATEGY_NAME)
+                    if api_ok(resp):
+                        order_status = resp.get("data", {}).get("order_status", "").lower()
+                        if order_status in ("open", "pending", "trigger pending", "after market order req received"):
+                            still_active = True
+                            plog(f"Reconciler: exchange SL {leg} order {oid} still active ({order_status})")
+                        else:
+                            plog(f"Reconciler: exchange SL {leg} order {oid} is {order_status} — will re-place")
+                            state[f"exchange_sl_oid_{leg_l}"] = ""
+                except Exception as exc:
+                    plog(f"Reconciler: exchange SL {leg} verify error: {exc} — will re-place", "WARNING")
+                    state[f"exchange_sl_oid_{leg_l}"] = ""
+
+                if still_active:
+                    continue
+
+            # Re-place exchange SL for this leg
+            if entry_price > 0:
+                trigger = round(entry_price * (1 + EXCHANGE_SL_PCT / 100), 1)
+                symbol = state[f"symbol_{leg_l}"]
+                plog(f"Reconciler: re-placing exchange SL {leg} at trigger ₹{trigger:.1f}")
+                for attempt in range(3):
+                    try:
+                        resp = broker.get().placeorder(
+                            strategy=STRATEGY_NAME,
+                            symbol=symbol,
+                            exchange=OPTION_EXCH,
+                            action="BUY",
+                            quantity=str(qty()),
+                            price_type="SL-M",
+                            product=PRODUCT,
+                            trigger_price=str(trigger),
+                        )
+                        if api_ok(resp):
+                            new_oid = str(resp.get("orderid", ""))
+                            state[f"exchange_sl_oid_{leg_l}"] = new_oid
+                            plog(f"Reconciler: exchange SL {leg} re-placed — order {new_oid}, trigger ₹{trigger:.1f}")
+                            telegram.notify(
+                                f"🛡️ Exchange SL {leg} re-placed after restart\n"
+                                f"Trigger: ₹{trigger:.1f} | Order: {new_oid}"
+                            )
+                            break
+                        else:
+                            plog(f"Reconciler: exchange SL {leg} re-place attempt {attempt+1}: {api_err(resp)}", "WARNING")
+                    except Exception as exc:
+                        plog(f"Reconciler: exchange SL {leg} re-place attempt {attempt+1} error: {exc}", "WARNING")
+                    time.sleep(1)
+                else:
+                    plog(f"Reconciler: exchange SL {leg} re-place FAILED after 3 attempts", "ERROR")
+                    telegram.notify(f"🚨 Exchange SL {leg} re-place failed after restart — no Layer 2 protection!")
+
+    def _reconcile_exchange_sl_fully_flat(self):
+        """When both legs are flat at broker, check if exchange SL triggered and
+        record P&L to closed_pnl, weekly P&L, and cumulative daily P&L so that
+        daily loss limit and weekly drawdown guard work correctly."""
+        total_reconciled_pnl = 0.0
+
+        for leg in ["CE", "PE"]:
+            leg_l = leg.lower()
+            if not state.get(f"{leg_l}_active", False):
+                continue  # Already marked inactive before shutdown
+
+            fill_price = self._get_exchange_sl_fill(leg)
+
+            # If exchange SL didn't trigger, try LTP as fallback (position may
+            # have been closed manually or by broker square-off)
+            if fill_price <= 0:
+                fill_price = fetch_ltp(state[f"symbol_{leg_l}"], OPTION_EXCH)
+
+            if fill_price <= 0:
+                plog(f"Reconciler: {leg} closed while fully down — cannot determine exit price", "WARNING")
+                continue
+
+            entry_px = state[f"entry_price_{leg_l}"]
+            if entry_px > 0:
+                leg_pnl = (entry_px - fill_price) * qty()
+                total_reconciled_pnl += leg_pnl
+                state["closed_pnl"] += leg_pnl
+                state[f"exit_price_{leg_l}"] = fill_price
+                plog(f"Reconciler: {leg} closed while fully down — P&L ₹{leg_pnl:,.2f}")
+                telegram.notify(
+                    f"⚠️ {leg} closed while script was down\n"
+                    f"Entry: ₹{entry_px:.2f} → Exit: ₹{fill_price:.2f}\n"
+                    f"Leg P&L: ₹{leg_pnl:,.2f}"
+                )
+
+        if total_reconciled_pnl != 0:
+            plog(f"Reconciler: total reconciled P&L from downtime: ₹{total_reconciled_pnl:,.2f}")
 
     def _fetch_broker_positions(self) -> set[str]:
         try:
