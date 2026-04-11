@@ -3,6 +3,8 @@ Nifty Short Straddle — OpenAlgo Python Strategy (Single File)
 SELL ATM CE + PE | Weekly Expiry | Intraday MIS | Independent Per-Leg SL
 """
 
+__version__ = "10.0"  # v10: Autoresearch Exp F — aggressive growth config
+
 from __future__ import annotations
 import os, json, threading, time, signal
 from datetime import datetime, timedelta
@@ -29,15 +31,15 @@ STRATEGY_NAME    = "Short Straddle"
 STRIKE_ROUNDING  = 50
 
 ENTRY_TIME       = "09:17"
-EXIT_TIME        = "15:15"
+EXIT_TIME        = "15:25"
 MONITOR_INTERVAL = 5
 
 TRADE_DTE        = [0, 1, 2, 3, 4]
 SKIP_MONTHS      = []
 
-LEG_SL_PERCENT   = 30.0
-LEG_SL_DTE_MAP   = {0: 40.0}  # DTE-specific SL override (expiry day gets wider SL)
-DAILY_TARGET     = 10000
+LEG_SL_PERCENT   = 50.0
+LEG_SL_DTE_MAP   = {0: 60.0}  # DTE-specific SL override (expiry day gets wider SL)
+DAILY_TARGET     = 50000
 DAILY_LOSS_LIMIT = -6000
 NET_PNL_GUARD_MAX_DEFER_MIN = 15
 
@@ -52,7 +54,7 @@ VIX_SPIKE_INTERVAL_S   = 300
 
 COMBINED_DECAY_ENABLED = True
 COMBINED_DECAY_DEFAULT = 60.0
-COMBINED_DECAY_DTE_MAP = {0: 60.0, 1: 65.0, 2: 60.0, 3: 50.0, 4: 50.0}
+COMBINED_DECAY_DTE_MAP = {0: 70.0, 1: 80.0, 2: 70.0, 3: 60.0, 4: 60.0}
 
 WINNER_BOOKING_ENABLED       = True
 WINNER_BOOKING_DECAY_PCT     = 30.0
@@ -82,8 +84,8 @@ MAX_TRADE_LOSS               = 15000  # Per lot, Rs
 
 # Fix 3: VIX entry filter — skip entry outside safe range
 VIX_ENTRY_FILTER_ENABLED     = True
-VIX_ENTRY_MIN                = 11.0
-VIX_ENTRY_MAX                = 25.0
+VIX_ENTRY_MIN                = 8.0
+VIX_ENTRY_MAX                = 28.0
 
 # Fix 4: Spot-move exit — close if underlying moves beyond premium collected
 SPOT_MOVE_EXIT_ENABLED       = True
@@ -96,24 +98,24 @@ WEEKLY_PNL_FILE              = "weekly_pnl.json"
 
 # Fix 6: ORB filter — skip entry if market already moved sharply
 ORB_FILTER_ENABLED           = True
-ORB_THRESHOLD_PCT            = 0.5  # %
+ORB_THRESHOLD_PCT            = 0.7  # %
 
 # Fix 8: IV entry filter — skip entry if ATM implied volatility too low
 # Uses OpenAlgo optiongreeks API (Black-76 model) to compute real-time IV
 # Backtest validated: Calmar 328 vs 282 (production), max DD -6,719 vs -9,516
 IV_ENTRY_FILTER_ENABLED  = True
-IV_ENTRY_MIN             = 12.0  # Skip if avg(CE_IV, PE_IV) < this %
+IV_ENTRY_MIN             = 8.0  # Skip if avg(CE_IV, PE_IV) < this %
 
 # Fix 7: Combined SL — use combined premium SL when both legs active
 COMBINED_SL_ENABLED          = True
-COMBINED_SL_PCT              = 30.0
+COMBINED_SL_PCT              = 15.0
 
 # ── Hybrid Exchange SL (Layer 2 catastrophic protection) ───────────────
 # Places SL-M BUY orders on exchange after entry. Acts as safety net for
-# flash crashes and API/internet failures. Script's own 30% SL handles
-# normal exits; exchange SL at 45% only fires when script can't.
+# flash crashes and API/internet failures. Script's own 40% SL handles
+# normal exits; exchange SL at 55% only fires when script can't.
 EXCHANGE_SL_ENABLED          = True
-EXCHANGE_SL_PCT              = 45.0    # SL-M trigger at 45% above entry per leg
+EXCHANGE_SL_PCT              = 55.0    # SL-M trigger at 55% above entry per leg
 
 WS_ENABLED             = True
 WS_STALENESS_S         = 60
